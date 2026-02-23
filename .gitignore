@@ -16,10 +16,11 @@ env/
 data/raw/
 data/processed/
 
-# ML artifacts (large – not tracked)
+# ML artifacts – track JSON metadata, ignore large binaries
 artifacts/models/
 artifacts/scalers/
-artifacts/reports/
+# reports and schema are small JSON – tracked
+
 
 # IDE
 .vscode/

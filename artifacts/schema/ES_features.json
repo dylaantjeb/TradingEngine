@@ -1,0 +1,36 @@
+{
+  "symbol": "ES",
+  "feature_names": [
+    "ret_1",
+    "ret_5",
+    "ret_10",
+    "ret_20",
+    "hl_spread",
+    "overnight_gap",
+    "rsi_14",
+    "rsi_slope",
+    "atr_14",
+    "vol_regime_20_60",
+    "vol_z",
+    "vol_ratio",
+    "vwap_dev",
+    "hour_sin",
+    "hour_cos",
+    "dow_sin",
+    "dow_cos"
+  ],
+  "n_features": 17,
+  "label_map": {
+    "-1": 0,
+    "0": 1,
+    "1": 2
+  },
+  "inv_label_map": {
+    "0": -1,
+    "1": 0,
+    "2": 1
+  },
+  "best_val_f1": 0.48117616846430405,
+  "n_trials": 5,
+  "train_rows": 3942
+}
