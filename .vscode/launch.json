@@ -1,0 +1,102 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    // ─── CLI commands ─────────────────────────────────────────────────────────
+    {
+      "name": "CLI: build-dataset (ES)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "src.cli",
+      "args": ["build-dataset", "--symbol", "ES", "--input", "data/raw/ES_M1.csv"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "CLI: train (ES, 5 trials)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "src.cli",
+      "args": ["train", "--symbol", "ES", "--trials", "5"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "CLI: backtest",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "src.cli",
+      "args": ["backtest", "--universe", "config/universe.yaml"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "CLI: live-paper (ES)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "src.cli",
+      "args": ["live-paper", "--symbol", "ES", "--input", "data/raw/ES_M1.csv"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "CLI: fetch (ES, 10 days)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "src.cli",
+      "args": ["fetch", "--symbol", "ES", "--days", "10"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    // ─── API Server ───────────────────────────────────────────────────────────
+    {
+      "name": "API: uvicorn (port 8000)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": ["src.api.app:app", "--host", "0.0.0.0", "--port", "8000", "--reload"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "env": {
+        "PYTHONDONTWRITEBYTECODE": "1"
+      }
+    },
+    // ─── Tests ────────────────────────────────────────────────────────────────
+    {
+      "name": "Pytest: all tests",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["tests/", "-v", "--tb=short"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    // ─── Current file ─────────────────────────────────────────────────────────
+    {
+      "name": "Run current file",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    // ─── Generate synthetic data ──────────────────────────────────────────────
+    {
+      "name": "Generate synthetic data (ES, 5000 bars)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/generate_synthetic_data.py",
+      "args": ["--symbol", "ES", "--bars", "5000"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ]
+}

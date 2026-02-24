@@ -13,6 +13,8 @@ Label:
 
 daily_vol is a rolling estimate of daily returns volatility,
 scaled from the minute bar returns.
+
+OPTIMISED: inner scan uses numpy array slicing (no Python inner loop).
 """
 
 from __future__ import annotations
@@ -46,52 +48,64 @@ def label_triple_barrier(
 
     Returns
     -------
-    DataFrame with columns: label (-1/0/+1), hold_bars, ret_at_exit.
+    DataFrame with columns: label (-1/0/+1), hold_bars, ret_at_exit, daily_vol.
     Index aligned with df.
     """
     _validate_input(df)
-    close = df["close"].values
+    close = df["close"].values.astype(np.float64)
     n = len(close)
 
-    # Rolling volatility of log-returns (annualised then scaled to per-bar)
-    log_ret = np.log(close[1:] / close[:-1])
-    vol_series = pd.Series(log_ret).rolling(vol_lookback, min_periods=5).std()
-    vol_series = vol_series.reindex(range(n - 1)).shift(1)  # lag by 1 to avoid look-ahead
-    vol_arr = np.full(n, np.nan)
-    vol_arr[1:] = vol_series.values
-    vol_arr = np.nan_to_num(vol_arr, nan=np.nanmedian(vol_arr[~np.isnan(vol_arr)]) if np.any(~np.isnan(vol_arr)) else 0.001)
-    vol_arr = np.clip(vol_arr, min_vol, None)
+    # ── Rolling volatility (lagged by 1 to avoid look-ahead) ─────────────────
+    log_ret = np.empty(n, dtype=np.float64)
+    log_ret[0] = 0.0
+    log_ret[1:] = np.log(close[1:] / close[:-1])
+
+    vol_raw = pd.Series(log_ret).rolling(vol_lookback, min_periods=5).std().values
+    vol_arr = np.empty(n, dtype=np.float64)
+    vol_arr[0] = np.nan
+    vol_arr[1:] = vol_raw[:-1]  # lag by 1
+
+    finite = vol_arr[np.isfinite(vol_arr)]
+    fill_val = np.median(finite) if len(finite) > 0 else 0.001
+    vol_arr = np.where(np.isfinite(vol_arr), vol_arr, fill_val)
+    np.maximum(vol_arr, min_vol, out=vol_arr)
+
+    # ── Pre-compute barrier levels ────────────────────────────────────────────
+    upper_px = close * (1.0 + pt * vol_arr)
+    lower_px = close * (1.0 - sl * vol_arr)
 
     labels = np.zeros(n, dtype=np.int8)
-    hold_bars = np.full(n, max_hold, dtype=np.int32)
+    hold_bars = np.zeros(n, dtype=np.int32)
     ret_at_exit = np.zeros(n, dtype=np.float64)
 
+    # Vectorised inner scan: numpy slicing replaces Python inner loop
     for i in range(n - 1):
-        entry = close[i]
-        daily_vol = vol_arr[i]
-        upper = entry * (1 + pt * daily_vol)
-        lower = entry * (1 - sl * daily_vol)
-        end_idx = min(i + max_hold, n - 1)
+        end = min(i + max_hold, n - 1)
+        fwd = close[i + 1 : end + 1]              # forward price window
+        hit_up = fwd >= upper_px[i]
+        hit_dn = fwd <= lower_px[i]
 
-        for j in range(i + 1, end_idx + 1):
-            price = close[j]
-            if price >= upper:
-                labels[i] = 1
-                hold_bars[i] = j - i
-                ret_at_exit[i] = np.log(price / entry)
-                break
-            if price <= lower:
-                labels[i] = -1
-                hold_bars[i] = j - i
-                ret_at_exit[i] = np.log(price / entry)
-                break
+        first_up = hit_up.argmax() if hit_up.any() else len(fwd)
+        first_dn = hit_dn.argmax() if hit_dn.any() else len(fwd)
+
+        if first_up < first_dn and hit_up.any():
+            j = first_up + 1
+            labels[i] = 1
+        elif first_dn < first_up and hit_dn.any():
+            j = first_dn + 1
+            labels[i] = -1
+        elif first_up == first_dn and hit_up.any():
+            j = first_up + 1
+            labels[i] = 1 if close[i + j] >= close[i] else -1
         else:
-            # Time barrier hit
+            j = end - i
             labels[i] = 0
-            hold_bars[i] = end_idx - i
-            ret_at_exit[i] = np.log(close[end_idx] / entry)
 
-    # Last bar has no forward path – mark as unknown (0) and hold=0
+        hold_bars[i] = j
+        exit_idx = min(i + j, n - 1)
+        ret_at_exit[i] = np.log(close[exit_idx] / close[i])
+
+    # Last bar has no forward path
     labels[-1] = 0
     hold_bars[-1] = 0
 

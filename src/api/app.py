@@ -346,11 +346,27 @@ def _run_paper_thread(symbol: str, csv_path: Path) -> None:
     raw_df = pd.read_csv(csv_path, parse_dates=["timestamp"], index_col="timestamp")
     raw_df.sort_index(inplace=True)
 
-    bar_buffer: deque = deque(maxlen=WARMUP + 200)
+    # Pre-compute ALL features + predictions at once (fast)
+    try:
+        all_features = build_features(raw_df, min_rows=1)
+    except Exception:
+        raise RuntimeError("Feature computation failed on input CSV")
+
+    X_all = all_features[feature_names].values
+    X_scaled_all = scaler.transform(X_all)
+    proba_all = model.predict_proba(X_scaled_all)
+    pred_enc_all = np.argmax(proba_all, axis=1)
+    conf_all = np.max(proba_all, axis=1)
+    signal_all = np.array([inv_label_map[str(e)] for e in pred_enc_all])
+    signal_all[conf_all < CONFIDENCE_THRESHOLD] = 0
+
+    feat_ts_set = set(all_features.index)
+
     position = 0
     entry_price = 0.0
     equity = 0.0
     bar_count = 0
+    feat_cursor = 0
 
     for ts, row in raw_df.iterrows():
         # Check stop signal from API
@@ -359,31 +375,13 @@ def _run_paper_thread(symbol: str, csv_path: Path) -> None:
                 break
 
         bar_count += 1
-        bar_buffer.append(row)
 
-        if bar_count < WARMUP:
+        if ts not in feat_ts_set:
             continue
 
-        buf_df = pd.DataFrame(list(bar_buffer))
-        buf_df.index = raw_df.index[bar_count - len(bar_buffer): bar_count]
-
-        try:
-            feat = build_features(buf_df, min_rows=1)
-        except Exception:
-            continue
-
-        if len(feat) == 0:
-            continue
-
-        last_features = feat.iloc[[-1]][feature_names]
-        X_scaled = scaler.transform(last_features)
-        proba = model.predict_proba(X_scaled)[0]
-        pred_enc = int(np.argmax(proba))
-        confidence = float(proba[pred_enc])
-        signal = inv_label_map[str(pred_enc)]
-
-        if confidence < CONFIDENCE_THRESHOLD:
-            signal = 0
+        signal = int(signal_all[feat_cursor])
+        confidence = float(conf_all[feat_cursor])
+        feat_cursor += 1
 
         px = float(row["close"])
 
