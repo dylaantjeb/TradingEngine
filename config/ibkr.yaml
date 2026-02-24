@@ -1,0 +1,36 @@
+# IBKR TWS / IB Gateway connection settings
+# Paper trading port: 7497 (TWS) or 4002 (Gateway)
+# Live trading port:  7496 (TWS) or 4001 (Gateway)
+#
+# To enable API access in TWS:
+#   Edit → Global Configuration → API → Settings
+#   Check "Enable ActiveX and Socket Clients"
+#   Check "Allow connections from localhost only" (or set trusted IPs)
+#   Uncheck "Read-Only API" if you need order submission (not used here)
+
+host: "127.0.0.1"
+port: 7497       # paper TWS port
+client_id: 1
+
+# Per-symbol contract overrides.
+# Leave `lastTradeDateOrContractMonth` blank to auto-resolve front month.
+contracts:
+  ES:
+    exchange: "CME"
+    currency: "USD"
+    lastTradeDateOrContractMonth: ""  # "" = auto front-month
+
+  NQ:
+    exchange: "CME"
+    currency: "USD"
+    lastTradeDateOrContractMonth: ""
+
+  MES:   # micro ES
+    exchange: "CME"
+    currency: "USD"
+    lastTradeDateOrContractMonth: ""
+
+  MNQ:   # micro NQ
+    exchange: "CME"
+    currency: "USD"
+    lastTradeDateOrContractMonth: ""

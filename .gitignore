@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Data (large files – download locally)
+data/raw/
+data/processed/
+
+# ML artifacts – track JSON metadata, ignore large binaries
+artifacts/models/
+artifacts/scalers/
+# reports and schema are small JSON – tracked
+
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Pytest cache
+.pytest_cache/

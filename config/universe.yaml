@@ -1,0 +1,36 @@
+# Trading universe configuration.
+# The backtest command iterates over all symbols listed here.
+# Each symbol must have:
+#   - data/raw/<SYM>_M1.csv            (from `fetch`)
+#   - data/processed/<SYM>_features.parquet  (from `build-dataset`)
+#   - data/processed/<SYM>_labels.parquet    (from `build-dataset`)
+#   - artifacts/models/<SYM>_xgb_best.joblib (from `train`)
+#   - artifacts/scalers/<SYM>_scaler.joblib  (from `train`)
+#   - artifacts/schema/<SYM>_features.json   (from `train`)
+
+symbols:
+  - ES
+
+# Cost model (used by backtest + paper engine)
+cost_model:
+  commission_per_side_usd: 2.05   # IB retail rate per contract per side
+  slippage_ticks: 1               # 1 tick per fill (ES tick = 0.25 pts = $12.50)
+
+# Contract specs (for P&L calculation)
+contract_specs:
+  ES:
+    multiplier: 50        # $50 per point
+    tick_size: 0.25
+    tick_value: 12.50
+  NQ:
+    multiplier: 20        # $20 per point
+    tick_size: 0.25
+    tick_value: 5.00
+  MES:
+    multiplier: 5
+    tick_size: 0.25
+    tick_value: 1.25
+  MNQ:
+    multiplier: 2
+    tick_size: 0.25
+    tick_value: 0.50
