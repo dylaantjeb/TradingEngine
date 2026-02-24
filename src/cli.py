@@ -27,15 +27,25 @@ def cmd_fetch(args: argparse.Namespace) -> None:
     """Fetch minute bars from IBKR and save to data/raw/<SYMBOL>_M1.csv."""
     from src.data_engine.ibkr_fetch import IBKRFetcher
 
-    out_dir = Path("data/raw")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{args.symbol}_M1.csv"
+    if args.out:
+        out_path = Path(args.out)
+    else:
+        out_dir = Path("data/raw")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{args.symbol}_M1.csv"
+
+    # --use-rth: accept "true"/"false" strings or leave None for config default
+    use_rth: bool | None = None
+    if args.use_rth is not None:
+        use_rth = args.use_rth.lower() in ("1", "true", "yes")
 
     fetcher = IBKRFetcher()
     fetcher.fetch(
         symbol=args.symbol,
         days=args.days,
         out_path=out_path,
+        bar_size=args.bar_size,
+        use_rth=use_rth,
     )
     log.info("Saved %s", out_path)
 
@@ -126,7 +136,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_fetch = sub.add_parser("fetch", help="Fetch IBKR minute bars")
     p_fetch.add_argument("--symbol", required=True, help="Root symbol, e.g. ES")
     p_fetch.add_argument(
-        "--days", type=int, default=10, help="Calendar days of history to fetch (default 10)"
+        "--days", type=int, default=10,
+        help="Calendar days of history to fetch (default 10)",
+    )
+    p_fetch.add_argument(
+        "--out", default=None,
+        help="Output CSV path (default: data/raw/<SYMBOL>_M1.csv)",
+    )
+    p_fetch.add_argument(
+        "--bar-size", dest="bar_size", default="1 min",
+        help='IBKR bar size string (default "1 min")',
+    )
+    p_fetch.add_argument(
+        "--use-rth", dest="use_rth", default=None,
+        metavar="true|false",
+        help="Regular trading hours only? (default: from config, usually false for futures)",
     )
     p_fetch.set_defaults(func=cmd_fetch)
 
