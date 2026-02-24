@@ -57,62 +57,82 @@ def build_features(
     min_rows : Raise ValueError if result has fewer rows than this.
     """
     _validate_input(df)
-    feat = pd.DataFrame(index=df.index)
 
-    c = df["close"]
-    h = df["high"]
-    l = df["low"]
-    o = df["open"]
-    v = df["volume"].replace(0, np.nan)
+    # Work with numpy arrays directly for speed
+    c_arr = df["close"].values.astype(np.float64)
+    h_arr = df["high"].values.astype(np.float64)
+    l_arr = df["low"].values.astype(np.float64)
+    o_arr = df["open"].values.astype(np.float64)
+    v_arr = df["volume"].values.astype(np.float64)
+    v_arr = np.where(v_arr == 0, np.nan, v_arr)
+    n_rows = len(c_arr)
+    idx = df.index
+
+    # Pre-allocate all feature columns as a dict of arrays (one-shot DataFrame)
+    cols: dict[str, np.ndarray] = {}
 
     # ── Log returns ──────────────────────────────────────────────────────────
-    log_c = np.log(c)
-    for n in (1, 5, 10, 20):
-        feat[f"ret_{n}"] = log_c.diff(n)
+    log_c = np.log(c_arr)
+    for lag in (1, 5, 10, 20):
+        ret = np.empty(n_rows)
+        ret[:lag] = np.nan
+        ret[lag:] = log_c[lag:] - log_c[:-lag]
+        cols[f"ret_{lag}"] = ret
 
     # ── HL spread ─────────────────────────────────────────────────────────────
-    feat["hl_spread"] = (h - l) / c
+    cols["hl_spread"] = (h_arr - l_arr) / c_arr
 
     # ── Overnight gap ─────────────────────────────────────────────────────────
-    feat["overnight_gap"] = np.log(o) - log_c.shift(1)
+    gap = np.empty(n_rows)
+    gap[0] = np.nan
+    gap[1:] = np.log(o_arr[1:]) - log_c[:-1]
+    cols["overnight_gap"] = gap
 
-    # ── RSI ───────────────────────────────────────────────────────────────────
-    rsi = _rsi(c, period=14)
-    feat["rsi_14"] = rsi / 100.0  # scale to [0,1]
-    feat["rsi_slope"] = rsi.diff(5) / 100.0
+    # ── RSI (Wilder, using pandas ewm for correctness) ───────────────────────
+    c_series = df["close"]
+    rsi = _rsi(c_series, period=14)
+    rsi_vals = rsi.values / 100.0
+    rsi_slope = np.empty(n_rows)
+    rsi_slope[:5] = np.nan
+    rsi_slope[5:] = rsi_vals[5:] - rsi_vals[:-5]
+    cols["rsi_14"] = rsi_vals
+    cols["rsi_slope"] = rsi_slope
 
     # ── ATR normalised ────────────────────────────────────────────────────────
-    atr = _atr(h, l, c, period=14)
-    feat["atr_14"] = atr / c
+    atr = _atr(df["high"], df["low"], c_series, period=14)
+    cols["atr_14"] = atr.values / c_arr
 
     # ── Volatility regime ─────────────────────────────────────────────────────
-    ret_1 = feat["ret_1"]
+    ret_1 = pd.Series(cols["ret_1"])
     vol_20 = ret_1.rolling(20).std()
     vol_60 = ret_1.rolling(60).std()
-    feat["vol_regime_20_60"] = vol_20 / vol_60.replace(0, np.nan)
+    vol_60_safe = vol_60.values.copy()
+    vol_60_safe[vol_60_safe == 0] = np.nan
+    cols["vol_regime_20_60"] = vol_20.values / vol_60_safe
 
-    # z-score of 20-bar vol relative to its own 60-bar rolling distribution
-    feat["vol_z"] = (vol_20 - vol_20.rolling(60).mean()) / (
-        vol_20.rolling(60).std().replace(0, np.nan)
-    )
+    vol_20_mean_60 = vol_20.rolling(60).mean().values
+    vol_20_std_60 = vol_20.rolling(60).std().values.copy()
+    vol_20_std_60[vol_20_std_60 == 0] = np.nan
+    cols["vol_z"] = (vol_20.values - vol_20_mean_60) / vol_20_std_60
 
     # ── Volume features ───────────────────────────────────────────────────────
-    vol_mean = v.rolling(20, min_periods=5).mean()
-    feat["vol_ratio"] = v / vol_mean.replace(0, np.nan)
+    vol_mean = pd.Series(v_arr).rolling(20, min_periods=5).mean().values.copy()
+    vol_mean[vol_mean == 0] = np.nan
+    cols["vol_ratio"] = v_arr / vol_mean
 
-    # VWAP – session (calendar day) reset
-    feat["vwap_dev"] = _vwap_deviation(df)
+    # ── VWAP deviation (optimised: avoids groupby for single-date buffers) ────
+    cols["vwap_dev"] = _vwap_deviation_fast(h_arr, l_arr, c_arr, v_arr, idx)
 
-    # ── Time features ─────────────────────────────────────────────────────────
-    idx = df.index
+    # ── Time features (pure numpy, no pandas) ─────────────────────────────────
     hour = idx.hour + idx.minute / 60.0
-    feat["hour_sin"] = np.sin(2 * np.pi * hour / 24)
-    feat["hour_cos"] = np.cos(2 * np.pi * hour / 24)
-    dow = idx.dayofweek.astype(float)
-    feat["dow_sin"] = np.sin(2 * np.pi * dow / 5)
-    feat["dow_cos"] = np.cos(2 * np.pi * dow / 5)
+    cols["hour_sin"] = np.sin(2 * np.pi * hour / 24)
+    cols["hour_cos"] = np.cos(2 * np.pi * hour / 24)
+    dow = idx.dayofweek.astype(np.float64)
+    cols["dow_sin"] = np.sin(2 * np.pi * dow / 5)
+    cols["dow_cos"] = np.cos(2 * np.pi * dow / 5)
 
-    # ── Drop NaN rows from lead/lag calculations ───────────────────────────────
+    # ── Build DataFrame in one shot (faster than column-by-column) ────────────
+    feat = pd.DataFrame(cols, index=idx)
     feat.dropna(inplace=True)
     log.debug("Feature matrix: %s rows × %s columns (after dropna)", *feat.shape)
 
@@ -161,18 +181,47 @@ def _atr(
     return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 
-def _vwap_deviation(df: pd.DataFrame) -> pd.Series:
+def _vwap_deviation_fast(
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    volume: np.ndarray,
+    idx: pd.DatetimeIndex,
+) -> np.ndarray:
     """
     Intraday VWAP that resets each calendar day.
-    Returns (close - vwap) / vwap.
-    """
-    c = df["close"]
-    v = df["volume"].replace(0, np.nan)
-    typical = (df["high"] + df["low"] + df["close"]) / 3.0
+    Returns (close - vwap) / vwap as a numpy array.
 
-    # Group by date for daily reset
-    date_key = df.index.date
-    cum_tv = (typical * v).groupby(date_key).transform("cumsum")
-    cum_v = v.groupby(date_key).transform("cumsum")
+    Optimised: uses numpy cumsum with day-boundary resets instead of
+    pandas groupby().transform(), which is the main bottleneck.
+    """
+    n = len(close)
+    typical = (high + low + close) / 3.0
+    tv = typical * volume
+
+    # Detect day boundaries (where date changes)
+    dates = idx.date
+    day_change = np.empty(n, dtype=bool)
+    day_change[0] = True
+    for i in range(1, n):
+        day_change[i] = dates[i] != dates[i - 1]
+
+    # Cumsum with resets at day boundaries
+    cum_tv = np.empty(n, dtype=np.float64)
+    cum_v = np.empty(n, dtype=np.float64)
+    running_tv = 0.0
+    running_v = 0.0
+
+    for i in range(n):
+        if day_change[i]:
+            running_tv = 0.0
+            running_v = 0.0
+        running_tv += tv[i] if np.isfinite(tv[i]) else 0.0
+        running_v += volume[i] if np.isfinite(volume[i]) else 0.0
+        cum_tv[i] = running_tv
+        cum_v[i] = running_v
+
+    cum_v[cum_v == 0] = np.nan
     vwap = cum_tv / cum_v
-    return (c - vwap) / vwap.replace(0, np.nan)
+    vwap[vwap == 0] = np.nan
+    return (close - vwap) / vwap

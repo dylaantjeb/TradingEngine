@@ -71,13 +71,41 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
     raw_df.sort_index(inplace=True)
     log.info("Loaded %d bars from %s to %s", len(raw_df), raw_df.index[0], raw_df.index[-1])
 
+    # ── Pre-compute ALL features at once (huge speedup vs per-bar rebuild) ────
+    log.info("Pre-computing features on %d bars …", len(raw_df))
+    try:
+        all_features = build_features(raw_df, min_rows=1)
+    except ValueError as e:
+        log.error("Feature computation failed: %s", e)
+        sys.exit(1)
+
+    # Align features with raw_df and keep only rows with valid features
+    feat_idx = all_features.index
+    log.info("Features ready: %d rows", len(all_features))
+
+    # Pre-scale all features at once
+    X_all = all_features[feature_names].values
+    X_scaled_all = scaler.transform(X_all)
+
+    # Pre-compute all predictions at once
+    proba_all = model.predict_proba(X_scaled_all)
+    pred_enc_all = np.argmax(proba_all, axis=1)
+    conf_all = np.max(proba_all, axis=1)
+    signal_all = np.array([inv_label_map[str(e)] for e in pred_enc_all])
+
+    # Apply confidence filter
+    signal_all[conf_all < CONFIDENCE_THRESHOLD] = 0
+
+    # Build lookup: timestamp → (signal, confidence, close_price)
+    feat_ts_set = set(feat_idx)
+
     # ── State ──────────────────────────────────────────────────────────────────
-    bar_buffer: Deque[pd.Series] = deque(maxlen=WARMUP_BARS + 200)
     position = 0         # -1, 0, +1
     entry_price = 0.0
     equity = 0.0
     trades: list[dict] = []
     bar_count = 0
+    feat_cursor = 0  # index into all_features
 
     slippage_pts = SLIPPAGE_TICKS * DEFAULT_TICK_SIZE
 
@@ -89,36 +117,17 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
     try:
         for ts, row in raw_df.iterrows():
             bar_count += 1
-            bar_buffer.append(row)
 
-            if bar_count < WARMUP_BARS:
-                continue  # not enough history for features
+            if ts not in feat_ts_set:
+                continue  # no features for this bar (warmup period)
 
-            # Build feature vector from buffer
-            buf_df = pd.DataFrame(list(bar_buffer))
-            buf_df.index = raw_df.index[bar_count - len(bar_buffer): bar_count]
-
-            try:
-                feat = build_features(buf_df, min_rows=1)
-            except Exception:
-                continue  # not enough clean rows yet
-
-            if len(feat) == 0:
-                continue
-
-            last_features = feat.iloc[[-1]][feature_names]
-            X_scaled = scaler.transform(last_features)
-
-            proba = model.predict_proba(X_scaled)[0]  # [short_prob, flat_prob, long_prob]
-            pred_enc = int(np.argmax(proba))
-            confidence = float(proba[pred_enc])
-            signal = inv_label_map[str(pred_enc)]
-
-            # Apply confidence filter
-            if confidence < CONFIDENCE_THRESHOLD:
-                signal = 0
+            # Look up pre-computed signal
+            signal = int(signal_all[feat_cursor])
+            confidence = float(conf_all[feat_cursor])
+            feat_cursor += 1
 
             px = float(row["close"])
+            X_scaled = None  # not needed; already pre-computed
 
             # ── Fill logic ─────────────────────────────────────────────────────
             if position == 0 and signal != 0:

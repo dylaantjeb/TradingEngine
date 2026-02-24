@@ -94,8 +94,9 @@ def run_backtest(
     # ── Generate predictions ───────────────────────────────────────────────────
     proba = model.predict_proba(X_scaled)  # shape (n, 3): [short, flat, long]
     pred_encoded = np.argmax(proba, axis=1)
-    # Map encoded labels back to {-1, 0, 1}
-    signal = np.vectorize(lambda x: inv_label_map[str(x)])(pred_encoded)
+    # Map encoded labels back to {-1, 0, 1} using fast array lookup
+    lookup = np.array([inv_label_map[str(k)] for k in range(3)], dtype=np.int8)
+    signal = lookup[pred_encoded]
 
     # ── Align with price series ────────────────────────────────────────────────
     if raw_path.exists():
@@ -164,43 +165,48 @@ def _simulate_trades(
     tick_size: float,
 ) -> tuple[list[dict], pd.Series]:
     """
-    Simple bar-by-bar simulation.
+    Bar-by-bar simulation using numpy arrays for speed.
     Position sizing: 1 contract per signal.
     Signal +1 → long, -1 → short, 0 → flat.
     """
     slippage_pts = slippage_ticks * tick_size
+    cost_rt = 2 * commission  # round-trip commission
+
+    sig_arr = signals.values.astype(np.int8)
+    px_arr = prices.reindex(signals.index).values.astype(np.float64)
+    ts_arr = signals.index
+    n = len(sig_arr)
+
+    # Pre-allocate
+    equity_arr = np.zeros(n, dtype=np.float64)
+    trades: list[dict] = []
+
     position = 0
     entry_price = 0.0
-    entry_time = None
+    entry_idx = 0
     equity = 0.0
-    trades: list[dict] = []
-    equity_points: list[float] = []
 
-    for ts, sig in signals.items():
-        px = prices.get(ts, np.nan) if hasattr(prices, "get") else np.nan
+    for i in range(n):
+        px = px_arr[i]
         if np.isnan(px):
-            equity_points.append(equity)
+            equity_arr[i] = equity
             continue
 
-        sig_int = int(sig)
+        sig = int(sig_arr[i])
 
-        if position == 0 and sig_int != 0:
-            # Enter
-            fill_px = px + sig_int * slippage_pts
-            position = sig_int
-            entry_price = fill_px
-            entry_time = ts
-        elif position != 0 and (sig_int != position or sig_int == 0):
-            # Exit
-            fill_px = px - position * slippage_pts  # exit slippage vs position direction
+        if position == 0 and sig != 0:
+            entry_price = px + sig * slippage_pts
+            position = sig
+            entry_idx = i
+        elif position != 0 and (sig != position or sig == 0):
+            fill_px = px - position * slippage_pts
             raw_pnl = position * (fill_px - entry_price) * multiplier
-            cost = 2 * commission  # round-trip
-            net_pnl = raw_pnl - cost
+            net_pnl = raw_pnl - cost_rt
             equity += net_pnl
             trades.append(
                 {
-                    "entry_time": str(entry_time),
-                    "exit_time": str(ts),
+                    "entry_time": str(ts_arr[entry_idx]),
+                    "exit_time": str(ts_arr[i]),
                     "direction": position,
                     "entry_price": round(entry_price, 4),
                     "exit_price": round(fill_px, 4),
@@ -209,20 +215,17 @@ def _simulate_trades(
                     "equity": round(equity, 2),
                 }
             )
-            # Possibly re-enter same bar
-            if sig_int != 0:
-                fill_px2 = px + sig_int * slippage_pts
-                position = sig_int
-                entry_price = fill_px2
-                entry_time = ts
+            if sig != 0:
+                entry_price = px + sig * slippage_pts
+                position = sig
+                entry_idx = i
             else:
                 position = 0
                 entry_price = 0.0
-                entry_time = None
 
-        equity_points.append(equity)
+        equity_arr[i] = equity
 
-    equity_series = pd.Series(equity_points, index=signals.index, name="equity")
+    equity_series = pd.Series(equity_arr, index=signals.index, name="equity")
     return trades, equity_series
 
 

@@ -23,8 +23,13 @@ artifacts/scalers/
 
 
 # IDE
-.vscode/
 .idea/
+# VS Code – track shared configs, ignore user-local files
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/settings.json
+!.vscode/extensions.json
 *.swp
 
 # OS

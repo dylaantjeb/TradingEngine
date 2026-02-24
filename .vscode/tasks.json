@@ -1,0 +1,52 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Install requirements",
+      "type": "shell",
+      "command": "python -m pip install -r requirements.txt",
+      "group": "build",
+      "presentation": { "reveal": "always", "panel": "shared" }
+    },
+    {
+      "label": "Generate synthetic data",
+      "type": "shell",
+      "command": "python scripts/generate_synthetic_data.py --symbol ES --bars 5000",
+      "group": "build",
+      "presentation": { "reveal": "always" }
+    },
+    {
+      "label": "Full pipeline (build → train → backtest)",
+      "type": "shell",
+      "command": "python -m src.cli build-dataset --symbol ES --input data/raw/ES_M1.csv && python -m src.cli train --symbol ES --trials 5 && python -m src.cli backtest --universe config/universe.yaml",
+      "group": { "kind": "build", "isDefault": true },
+      "presentation": { "reveal": "always", "panel": "dedicated" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Run API server",
+      "type": "shell",
+      "command": "uvicorn src.api.app:app --host 0.0.0.0 --port 8000 --reload",
+      "group": "none",
+      "isBackground": true,
+      "presentation": { "reveal": "always", "panel": "dedicated" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Run tests",
+      "type": "shell",
+      "command": "python -m pytest tests/ -v --tb=short",
+      "group": { "kind": "test", "isDefault": true },
+      "presentation": { "reveal": "always" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Run paper engine (ES)",
+      "type": "shell",
+      "command": "python -m src.cli live-paper --symbol ES --input data/raw/ES_M1.csv",
+      "group": "none",
+      "presentation": { "reveal": "always", "panel": "dedicated" },
+      "problemMatcher": []
+    }
+  ]
+}
