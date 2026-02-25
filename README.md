@@ -147,14 +147,16 @@ TradingEngine/
 ├── src/
 │   ├── cli.py              # Main CLI entry point
 │   ├── api/app.py          # FastAPI REST API
-│   ├── backtest/engine.py  # Vectorised backtest
-│   ├── data_engine/ibkr_fetch.py  # IBKR data fetch
+│   ├── backtest/engine.py  # Vectorised backtest (hardened)
+│   ├── data_engine/ibkr_fetch.py  # IBKR data fetch (robust)
 │   ├── features/builder.py # Feature engineering
 │   ├── labels/triple_barrier.py   # Triple-barrier labels
-│   ├── live/paper_engine.py       # Paper trading simulation
-│   └── training/train.py   # Optuna + XGBoost training
+│   ├── live/paper_engine.py       # Paper trading simulation (hardened)
+│   ├── training/train.py   # Optuna + XGBoost training
+│   └── utils/alignment.py  # Label/feature alignment guardrails
 ├── tests/
-│   └── test_labeler.py     # Unit tests
+│   ├── test_labeler.py     # Labeler unit tests
+│   └── test_hardening.py   # Backtest hardening tests
 ├── requirements.txt
 └── README.md
 ```
@@ -172,11 +174,85 @@ For IB Gateway (headless), paper port is **4002** – update `config/ibkr.yaml`.
 
 ---
 
+## Realistic Backtest Mode
+
+The backtest engine is hardened by default against common sources of
+inflated performance (lookahead, over-trading, underestimated costs).
+
+### Execution delay
+
+Signals are generated at bar `t` close and filled at bar `t+1` **open**
+(`execution_delay_bars: 1` in `config/universe.yaml`).  Setting it to `0`
+re-enables same-bar fills (leaky — only for debugging).
+
+### Cost model (per round trip, 1 contract)
+
+```
+friction_per_side = slippage_ticks_per_side × tick_size
+                  + spread_ticks × 0.5 × tick_size
+
+entry_fill = next_open + direction × friction_per_side   ← adverse
+exit_fill  = next_open − direction × friction_per_side   ← adverse
+commission = 2 × commission_per_side_usd
+```
+
+ES defaults → **≈ $28 total round-trip cost**:
+
+| Item                      | Default        | ES value     |
+|---------------------------|----------------|--------------|
+| commission_per_side_usd   | $1.50          | $3.00 RT     |
+| slippage_ticks_per_side   | 0.5 ticks      | $6.25 / side |
+| spread_ticks              | 1.0 tick       | $6.25 / side |
+| Total RT                  |                | **≈ $28.00** |
+
+### Filters and throttles
+
+| Parameter                | Default | Purpose                                 |
+|--------------------------|---------|-----------------------------------------|
+| session_start_utc_hour   | 9       | Ignore signals outside NY session       |
+| session_end_utc_hour     | 22      |                                         |
+| atr_min_ticks            | 4       | Skip flatline / pre-market bars         |
+| atr_max_ticks            | 200     | Skip circuit-breaker volatility         |
+| max_trades_per_day       | 20      | Cap on new entries per calendar day     |
+| min_holding_bars         | 3       | Minimum hold before exit allowed        |
+| cooldown_bars_after_exit | 2       | Pause after close before next entry     |
+
+All parameters live in `config/universe.yaml` and can be overridden per-run:
+
+```bash
+python -m src.cli backtest \
+    --universe config/universe.yaml \
+    --execution-delay 1 \
+    --slippage-ticks 0.5 \
+    --commission 1.50 \
+    --max-trades-per-day 10
+```
+
+### Expected output shape (plausible, not synthetic)
+
+```
+============================================================
+  ES backtest results  (hardened: 1-bar delay)
+============================================================
+  Net P&L ($)                       : <positive or negative>
+  Gross P&L ($)                     : <higher than net>
+  Total costs ($)                   : <non-zero>
+  Sharpe (annualised)               : < 3  (not ~50)
+  Max DD (%)                        : < -5 (not near zero)
+  Trades / day                      : < 20
+  Avg hold (bars)                   : >= 3
+============================================================
+```
+
+---
+
 ## Cost Model
 
-| Item           | Value       |
-|----------------|-------------|
-| Commission     | $2.05 / contract / side |
-| Slippage       | 1 tick / fill (0.25 pts = $12.50 for ES) |
-| Tick size (ES) | 0.25 points |
-| Multiplier (ES)| $50 / point |
+| Item                     | Default           | ES example              |
+|--------------------------|-------------------|-------------------------|
+| Commission               | $1.50 / side      | $3.00 round trip        |
+| Slippage                 | 0.5 tick / side   | $6.25 / side            |
+| Spread                   | 1 tick (half/side)| $6.25 / side            |
+| Total RT cost            |                   | **≈ $28.00**            |
+| Tick size (ES)           | 0.25 points       |                         |
+| Multiplier (ES)          | $50 / point       |                         |
