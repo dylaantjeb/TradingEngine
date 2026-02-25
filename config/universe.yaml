@@ -1,22 +1,60 @@
 # Trading universe configuration.
 # The backtest command iterates over all symbols listed here.
-# Each symbol must have:
-#   - data/raw/<SYM>_M1.csv            (from `fetch`)
-#   - data/processed/<SYM>_features.parquet  (from `build-dataset`)
-#   - data/processed/<SYM>_labels.parquet    (from `build-dataset`)
-#   - artifacts/models/<SYM>_xgb_best.joblib (from `train`)
-#   - artifacts/scalers/<SYM>_scaler.joblib  (from `train`)
-#   - artifacts/schema/<SYM>_features.json   (from `train`)
 
 symbols:
   - ES
 
-# Cost model (used by backtest + paper engine)
-cost_model:
-  commission_per_side_usd: 2.05   # IB retail rate per contract per side
-  slippage_ticks: 1               # 1 tick per fill (ES tick = 0.25 pts = $12.50)
+# ── Execution hardening ────────────────────────────────────────────────────────
+execution:
+  # Signal at bar t fills at bar t+N open.  1 = standard next-bar fill.
+  # 0 would be same-bar (ONLY for debugging – produces lookahead).
+  execution_delay_bars: 1
 
-# Contract specs (for P&L calculation)
+# ── Cost model ─────────────────────────────────────────────────────────────────
+# Round-trip cost formula (per contract):
+#   friction_pts_per_side = slippage_ticks_per_side * tick_size
+#                         + spread_ticks * 0.5 * tick_size
+#   entry_fill = open + direction * friction_pts_per_side
+#   exit_fill  = open - direction * friction_pts_per_side
+#   commission = 2 * commission_per_side_usd
+#   net_pnl    = direction * (exit_fill - entry_fill) * multiplier - commission
+#
+# ES example (defaults):
+#   friction_per_side = 0.5 * 0.25 + 1.0 * 0.5 * 0.25 = 0.125 + 0.125 = 0.25 pts
+#   round-trip friction = 2 * 0.25 * $50 = $25.00
+#   commission RT       = 2 * $1.50 = $3.00
+#   total RT cost       = $28.00 per contract
+cost_model:
+  commission_per_side_usd: 1.50       # IB Lite/Pro rate per contract per side
+  slippage_ticks_per_side: 0.5        # adverse slippage on entry & exit
+  spread_ticks: 1.0                   # bid/ask spread (half applied each side)
+
+# ── Filters ────────────────────────────────────────────────────────────────────
+filters:
+  # NY session (UTC hours, inclusive).  Adjust for DST / other sessions.
+  # 14:30–21:00 UTC = 09:30–16:00 ET (winter).
+  # Set to 0 / 24 to disable session filter.
+  session_start_utc_hour: 9    # broad window covering synthetic + live data
+  session_end_utc_hour: 22
+
+  # ATR filter (ATR expressed in ticks = atr_pts / tick_size).
+  # Skip bars with ATR below min (too quiet) or above max (news spike).
+  atr_min_ticks: 4             # below = pre-market flatline / bad data
+  atr_max_ticks: 200           # above = circuit-breaker / limit-move territory
+
+  # Optional news-blackout windows (UTC HH:MM).  Pairs of [start, end].
+  # No external data required; acts as a time-of-day block.
+  # Example:  [["13:25", "13:35"], ["20:55", "21:05"]]
+  news_blackout_windows: []
+
+# ── Trade frequency throttles ──────────────────────────────────────────────────
+throttles:
+  max_trades_per_day: 20          # hard ceiling on round-trips initiated per day
+  min_holding_bars: 3             # must hold a position at least N bars before exit
+  cooldown_bars_after_exit: 2     # must wait N bars after an exit before re-entering
+  max_concurrent_positions: 1     # always 1 for single-symbol runs
+
+# ── Contract specs ─────────────────────────────────────────────────────────────
 contract_specs:
   ES:
     multiplier: 50        # $50 per point

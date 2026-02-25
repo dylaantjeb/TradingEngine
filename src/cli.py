@@ -104,13 +104,13 @@ def cmd_backtest(args: argparse.Namespace) -> None:
 
     for symbol in universe_cfg.get("symbols", []):
         log.info("Backtesting %s …", symbol)
-        metrics = run_backtest(symbol=symbol)
-        print(f"\n{'='*60}")
-        print(f"  {symbol} backtest results")
-        print(f"{'='*60}")
-        for k, v in metrics.items():
-            print(f"  {k:30s}: {v}")
-        print()
+        run_backtest(
+            symbol=symbol,
+            execution_delay_bars=args.execution_delay,
+            max_trades_per_day=args.max_trades_per_day,
+            slippage_ticks_per_side=args.slippage_ticks,
+            commission_per_side_usd=args.commission,
+        )
 
 
 def cmd_live_paper(args: argparse.Namespace) -> None:
@@ -180,6 +180,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--universe",
         default="config/universe.yaml",
         help="Path to universe YAML (default config/universe.yaml)",
+    )
+    p_bt.add_argument(
+        "--execution-delay", dest="execution_delay", type=int, default=None,
+        help="Fill delay in bars (default from config, usually 1)",
+    )
+    p_bt.add_argument(
+        "--max-trades-per-day", dest="max_trades_per_day", type=int, default=None,
+        help="Daily trade cap (default from config, usually 20)",
+    )
+    p_bt.add_argument(
+        "--slippage-ticks", dest="slippage_ticks", type=float, default=None,
+        help="Slippage ticks per side (default from config, usually 0.5)",
+    )
+    p_bt.add_argument(
+        "--commission", dest="commission", type=float, default=None,
+        help="Commission per contract per side USD (default from config, usually 1.50)",
     )
     p_bt.set_defaults(func=cmd_backtest)
 
