@@ -305,35 +305,36 @@ def trigger_backtest(req: BacktestRequest, background_tasks: BackgroundTasks):
 def _run_paper_thread(symbol: str, csv_path: Path) -> None:
     """
     Inline paper engine that updates shared state as it runs.
-    This is a simplified version of run_paper() that pushes
-    equity + trades into the EngineState for the API.
+
+    Uses the same hardened execution model as src/live/paper_engine.py:
+    - 1-bar execution delay (signal at bar t → fill at bar t+1 open)
+    - Realistic cost model loaded from config/universe.yaml
+    - Session + ATR filters
+    - Trade throttles (max_trades_per_day, cooldown, min_hold)
     """
     import json as _json
-    from collections import deque
     import numpy as np
     import pandas as pd
+    import yaml
+    from pathlib import Path as _Path
+
     from src.features.builder import build_features, MIN_ROWS
-    from src.backtest.engine import (
-        COMMISSION_PER_SIDE,
-        DEFAULT_CONTRACT_MULTIPLIER,
-        DEFAULT_TICK_SIZE,
-    )
+    from src.config import get_config
+    from src.utils.time_utils import in_session, in_blackout
 
     CONFIDENCE_THRESHOLD = 0.50
-    WARMUP = MIN_ROWS + 10
-    SLIPPAGE_PTS = 1 * DEFAULT_TICK_SIZE
 
     import joblib
 
-    model_path = Path(f"artifacts/models/{symbol}_xgb_best.joblib")
-    scaler_path = Path(f"artifacts/scalers/{symbol}_scaler.joblib")
-    schema_path = Path(f"artifacts/schema/{symbol}_features.json")
+    model_path  = _Path(f"artifacts/models/{symbol}_xgb_best.joblib")
+    scaler_path = _Path(f"artifacts/scalers/{symbol}_scaler.joblib")
+    schema_path = _Path(f"artifacts/schema/{symbol}_features.json")
 
     for p in (model_path, scaler_path, schema_path):
         if not p.exists():
             raise FileNotFoundError(f"Artifact not found: {p}")
 
-    model = joblib.load(model_path)
+    model  = joblib.load(model_path)
     scaler = joblib.load(scaler_path)
     with open(schema_path) as f:
         schema = _json.load(f)
@@ -346,71 +347,145 @@ def _run_paper_thread(symbol: str, csv_path: Path) -> None:
     raw_df = pd.read_csv(csv_path, parse_dates=["timestamp"], index_col="timestamp")
     raw_df.sort_index(inplace=True)
 
-    # Pre-compute ALL features + predictions at once (fast)
+    # ── Load config ─────────────────────────────────────────────────────────────
+    cfg      = get_config()
+    contract = cfg.get_contract(symbol)
+
+    tick_size         = contract.tick_size
+    multiplier        = contract.multiplier
+    commission_rt     = 2.0 * cfg.cost.commission_per_side_usd
+    slippage_pts      = cfg.cost.slippage_ticks_per_side * tick_size
+    half_spread_pts   = cfg.cost.spread_ticks * 0.5 * tick_size
+    friction_per_side = slippage_pts + half_spread_pts
+
+    sess_start   = cfg.filters.session_start_utc_hour
+    sess_end     = cfg.filters.session_end_utc_hour
+    atr_min      = cfg.filters.atr_min_ticks
+    atr_max      = cfg.filters.atr_max_ticks
+    blackouts    = cfg.filters.news_blackout_windows
+    max_tpd      = cfg.throttles.max_trades_per_day
+    min_hold     = cfg.throttles.min_holding_bars
+    cooldown_cfg = cfg.throttles.cooldown_bars_after_exit
+
+    # ── Pre-compute features + predictions ─────────────────────────────────────
     try:
         all_features = build_features(raw_df, min_rows=1)
-    except Exception:
-        raise RuntimeError("Feature computation failed on input CSV")
+    except Exception as exc:
+        raise RuntimeError(f"Feature computation failed on input CSV: {exc}")
 
-    X_all = all_features[feature_names].values
+    X_all        = all_features[feature_names].values
     X_scaled_all = scaler.transform(X_all)
-    proba_all = model.predict_proba(X_scaled_all)
+    proba_all    = model.predict_proba(X_scaled_all)
     pred_enc_all = np.argmax(proba_all, axis=1)
-    conf_all = np.max(proba_all, axis=1)
-    signal_all = np.array([inv_label_map[str(e)] for e in pred_enc_all])
+    conf_all     = np.max(proba_all, axis=1)
+    signal_all   = np.array([inv_label_map[str(e)] for e in pred_enc_all])
     signal_all[conf_all < CONFIDENCE_THRESHOLD] = 0
 
+    atr_14_all        = all_features["atr_14"].values
+    raw_close_aligned = raw_df["close"].reindex(all_features.index)
+    atr_ticks_all     = (atr_14_all * raw_close_aligned.values) / tick_size
+
     feat_ts_set = set(all_features.index)
+    raw_list    = list(raw_df.iterrows())
+    n_raw       = len(raw_list)
 
-    position = 0
-    entry_price = 0.0
-    equity = 0.0
-    bar_count = 0
-    feat_cursor = 0
+    # ── State ──────────────────────────────────────────────────────────────────
+    position         = 0
+    entry_price      = 0.0
+    entry_bar_num    = 0
+    equity           = 0.0
+    bar_count        = 0
+    feat_cursor      = 0
+    pending_target   = None
 
-    for ts, row in raw_df.iterrows():
+    cooldown_left     = 0
+    daily_trade_count = 0
+    last_trade_date   = None
+
+    for raw_i, (ts, row) in enumerate(raw_list):
         # Check stop signal from API
         with _state_lock:
             if not _engine_state.running:
                 break
 
         bar_count += 1
+        today = ts.date()
 
-        if ts not in feat_ts_set:
-            continue
+        if today != last_trade_date:
+            daily_trade_count = 0
+            last_trade_date   = today
 
-        signal = int(signal_all[feat_cursor])
-        confidence = float(conf_all[feat_cursor])
-        feat_cursor += 1
+        has_open = "open" in row and not pd.isna(row["open"])
+        open_px  = float(row["open"]) if has_open else float(row["close"])
 
-        px = float(row["close"])
-
-        if position == 0 and signal != 0:
-            position = signal
-            entry_price = px + signal * SLIPPAGE_PTS
-        elif position != 0 and (signal != position or signal == 0):
-            fill_px = px - position * SLIPPAGE_PTS
-            raw_pnl = position * (fill_px - entry_price) * DEFAULT_CONTRACT_MULTIPLIER
-            net_pnl = raw_pnl - 2 * COMMISSION_PER_SIDE
-            equity += net_pnl
-            with _state_lock:
-                _engine_state.equity.append(round(equity, 2))
-                _engine_state.trades.append(
-                    {
-                        "time": str(ts),
-                        "dir": "L" if position > 0 else "S",
-                        "entry": round(entry_price, 2),
-                        "exit": round(fill_px, 2),
-                        "pnl": round(net_pnl, 2),
+        # ── STEP 1: Execute pending order at this bar's open ───────────────────
+        if pending_target is not None:
+            o = open_px
+            if position != 0 and pending_target != position:
+                exit_fill = o - position * friction_per_side
+                raw_pnl   = position * (exit_fill - entry_price) * multiplier
+                net_pnl   = raw_pnl - commission_rt
+                equity   += net_pnl
+                with _state_lock:
+                    _engine_state.equity.append(round(equity, 2))
+                    _engine_state.trades.append({
+                        "time":   str(ts),
+                        "dir":    "L" if position > 0 else "S",
+                        "entry":  round(entry_price, 2),
+                        "exit":   round(exit_fill, 2),
+                        "pnl":    round(net_pnl, 2),
                         "equity": round(equity, 2),
-                    }
-                )
-            position = 0
-            if signal != 0:
-                position = signal
-                entry_price = px + signal * SLIPPAGE_PTS
+                    })
+                position = 0
+                if cooldown_cfg > 0:
+                    cooldown_left = cooldown_cfg
+                if pending_target != 0:
+                    entry_price   = o + pending_target * friction_per_side
+                    position      = pending_target
+                    entry_bar_num = bar_count
+            elif position == 0 and pending_target != 0:
+                entry_price   = o + pending_target * friction_per_side
+                position      = pending_target
+                entry_bar_num = bar_count
+            pending_target = None
+
+        # ── STEP 2: Get signal for this bar ────────────────────────────────────
+        if ts in feat_ts_set:
+            raw_sig    = int(signal_all[feat_cursor])
+            confidence = float(conf_all[feat_cursor])
+            atr_ticks  = float(atr_ticks_all[feat_cursor])
+            feat_cursor += 1
+        else:
+            raw_sig    = 0
+            confidence = 0.0
+            atr_ticks  = 0.0
+
+        sig = raw_sig
+
+        # Filters
+        if not in_session(ts, sess_start, sess_end):
+            sig = 0
+        if in_blackout(ts, blackouts):
+            sig = 0
+        if not (atr_min <= atr_ticks <= atr_max):
+            sig = 0
+        if cooldown_left > 0:
+            cooldown_left -= 1
+            if position == 0:
+                sig = 0
+        if position != 0 and (bar_count - entry_bar_num) < min_hold:
+            sig = position
+        if sig != 0 and sig != position and daily_trade_count >= max_tpd:
+            sig = 0 if position == 0 else position
+
+        target = int(sig)
+
+        if target != position and raw_i < n_raw - 1:
+            pending_target = target
+            if target != 0:
+                daily_trade_count += 1
 
         with _state_lock:
-            _engine_state.bar_count = bar_count
-            _engine_state.last_signal = signal
+            _engine_state.bar_count    = bar_count
+            _engine_state.last_signal  = raw_sig
             _engine_state.last_confidence = round(confidence, 4)

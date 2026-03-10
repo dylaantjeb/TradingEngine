@@ -18,9 +18,13 @@ uvicorn[standard]>=0.22.0
 pydantic>=2.0.0
 sse-starlette>=1.6.0
 
+# Free market data (no IBKR required)
+yfinance>=0.2.18
+
 # Utils
 pyyaml>=6.0
 python-multipart>=0.0.6
+python-dotenv>=1.0.0
 
 # Testing
 pytest>=7.0.0

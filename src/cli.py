@@ -10,11 +10,9 @@ import logging
 import sys
 from pathlib import Path
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s – %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
-)
+from src.utils.logger import configure_logging
+
+configure_logging()
 log = logging.getLogger("cli")
 
 
@@ -34,7 +32,6 @@ def cmd_fetch(args: argparse.Namespace) -> None:
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"{args.symbol}_M1.csv"
 
-    # --use-rth: accept "true"/"false" strings or leave None for config default
     use_rth: bool | None = None
     if args.use_rth is not None:
         use_rth = args.use_rth.lower() in ("1", "true", "yes")
@@ -48,6 +45,25 @@ def cmd_fetch(args: argparse.Namespace) -> None:
         use_rth=use_rth,
     )
     log.info("Saved %s", out_path)
+
+
+def cmd_yahoo_fetch(args: argparse.Namespace) -> None:
+    """Fetch bars from Yahoo Finance (free, no IBKR required)."""
+    from src.data.brokers.yahoo_adapter import fetch_yahoo
+
+    if args.out:
+        out_path = Path(args.out)
+    else:
+        out_dir = Path("data/raw")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{args.symbol}_M1.csv"
+
+    fetch_yahoo(
+        symbol=args.symbol,
+        days=args.days,
+        bar_size=args.bar_size,
+        out_path=out_path,
+    )
 
 
 def cmd_build_dataset(args: argparse.Namespace) -> None:
@@ -69,7 +85,7 @@ def cmd_build_dataset(args: argparse.Namespace) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     feat_path = out_dir / f"{args.symbol}_features.parquet"
-    lbl_path = out_dir / f"{args.symbol}_labels.parquet"
+    lbl_path  = out_dir / f"{args.symbol}_labels.parquet"
 
     try:
         features = build_features(df)
@@ -120,6 +136,67 @@ def cmd_live_paper(args: argparse.Namespace) -> None:
     run_paper(symbol=args.symbol, csv_path=Path(args.input))
 
 
+def cmd_walk_forward(args: argparse.Namespace) -> None:
+    """Run walk-forward validation (rolling train/test windows)."""
+    from src.backtest.walk_forward import run_walk_forward
+
+    run_walk_forward(
+        symbol=args.symbol,
+        train_bars=args.train_bars,
+        test_bars=args.test_bars,
+        step_bars=args.step_bars,
+        n_trials=args.trials,
+        save_report=True,
+    )
+
+
+def cmd_explain_signal(args: argparse.Namespace) -> None:
+    """Explain the signal for the most recent bar in a CSV file."""
+    import pandas as pd
+    import json
+    from src.strategy.signal_engine import SignalEngine
+    from src.features.builder import MIN_ROWS
+
+    log.info("Loading %s …", args.input)
+    try:
+        df = pd.read_csv(args.input, parse_dates=["timestamp"], index_col="timestamp")
+    except FileNotFoundError:
+        log.error("Input file not found: %s", args.input)
+        sys.exit(1)
+
+    df.sort_index(inplace=True)
+
+    engine = SignalEngine(symbol=args.symbol)
+
+    # Use the last (MIN_ROWS + buffer) bars as the window
+    window_size = MIN_ROWS + 50
+    window = df.iloc[-window_size:] if len(df) >= window_size else df
+
+    output = engine.generate(window, account_equity=args.equity)
+
+    print(f"\n{'='*60}")
+    print(f"  Signal Explanation – {args.symbol}")
+    print(f"{'='*60}")
+    print(f"  Signal        : {output.signal:+d}  ({['SHORT','FLAT','LONG'][output.signal+1]})")
+    print(f"  Confidence    : {output.confidence:.1%}")
+    print(f"  Regime        : {output.regime}")
+    print(f"  ATR           : {output.atr_pts:.4f} pts")
+    print(f"  Rec. SL       : {output.recommended_sl_pts:.4f} pts")
+    print(f"  Rec. TP       : {output.recommended_tp_pts:.4f} pts")
+    print(f"  Rec. Size     : {output.recommended_size} contract(s)")
+    print()
+    print(f"  Filters passed: {', '.join(output.filters_passed) or 'none'}")
+    print(f"  Filters failed: {', '.join(output.filters_failed) or 'none'}")
+    print()
+    print("  Top feature contributions:")
+    for fc in output.top_features[:5]:
+        bar = "▲" if fc["contribution"] > 0 else "▼"
+        print(f"    {bar} {fc['name']:30s}  val={fc['value']:+.3f}  contrib={fc['contribution']:+.4f}")
+    print()
+    print(f"  Rationale: {output.rationale}")
+    print(f"{'='*60}\n")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Parser
 # ──────────────────────────────────────────────────────────────────────────────
@@ -150,9 +227,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_fetch.add_argument(
         "--use-rth", dest="use_rth", default=None,
         metavar="true|false",
-        help="Regular trading hours only? (default: from config, usually false for futures)",
+        help="Regular trading hours only? (default: from config)",
     )
     p_fetch.set_defaults(func=cmd_fetch)
+
+    # ── yahoo-fetch ────────────────────────────────────────────────────────────
+    p_yf = sub.add_parser(
+        "yahoo-fetch",
+        help="Fetch bars from Yahoo Finance (free, no IBKR required)",
+    )
+    p_yf.add_argument("--symbol", required=True,
+                      help="Symbol (ES/NQ → SPY/QQQ proxy) or any Yahoo ticker")
+    p_yf.add_argument(
+        "--days", type=int, default=7,
+        help="Days of history (1-min bars limited to last 7 days; default 7)",
+    )
+    p_yf.add_argument(
+        "--bar-size", dest="bar_size", default="1 min",
+        help='Bar size: "1 min", "5 min", "15 min", "1 hour", "1 day" (default "1 min")',
+    )
+    p_yf.add_argument(
+        "--out", default=None,
+        help="Output CSV path (default: data/raw/<SYMBOL>_M1.csv)",
+    )
+    p_yf.set_defaults(func=cmd_yahoo_fetch)
 
     # ── build-dataset ──────────────────────────────────────────────────────────
     p_build = sub.add_parser("build-dataset", help="Engineer features + labels from raw CSV")
@@ -204,6 +302,40 @@ def build_parser() -> argparse.ArgumentParser:
     p_live.add_argument("--symbol", required=True)
     p_live.add_argument("--input", required=True, help="Path to CSV to stream")
     p_live.set_defaults(func=cmd_live_paper)
+
+    # ── walk-forward ───────────────────────────────────────────────────────────
+    p_wf = sub.add_parser("walk-forward", help="Walk-forward validation (rolling train/test)")
+    p_wf.add_argument("--symbol", required=True)
+    p_wf.add_argument(
+        "--train-bars", dest="train_bars", type=int, default=10_000,
+        help="Bars in each training window (default 10000)",
+    )
+    p_wf.add_argument(
+        "--test-bars", dest="test_bars", type=int, default=2_000,
+        help="Bars in each test window (default 2000)",
+    )
+    p_wf.add_argument(
+        "--step-bars", dest="step_bars", type=int, default=None,
+        help="Step between windows (default = test_bars → non-overlapping)",
+    )
+    p_wf.add_argument(
+        "--trials", type=int, default=10,
+        help="Optuna trials per window (default 10)",
+    )
+    p_wf.set_defaults(func=cmd_walk_forward)
+
+    # ── explain-signal ─────────────────────────────────────────────────────────
+    p_exp = sub.add_parser(
+        "explain-signal",
+        help="Explain why the model fired its signal on the most recent bar",
+    )
+    p_exp.add_argument("--symbol", required=True)
+    p_exp.add_argument("--input", required=True, help="Path to OHLCV CSV")
+    p_exp.add_argument(
+        "--equity", type=float, default=100_000.0,
+        help="Account equity for position-size calculation (default $100,000)",
+    )
+    p_exp.set_defaults(func=cmd_explain_signal)
 
     return parser
 
