@@ -6,62 +6,76 @@ symbols:
 
 # ── Execution hardening ────────────────────────────────────────────────────────
 execution:
-  # Signal at bar t fills at bar t+N open.  1 = standard next-bar fill.
-  # 0 would be same-bar (ONLY for debugging – produces lookahead).
-  execution_delay_bars: 1
+  execution_delay_bars: 1       # 0 = same-bar (leaky, debug only); 1 = next-bar fill
 
 # ── Cost model ─────────────────────────────────────────────────────────────────
-# Round-trip cost formula (per contract):
-#   friction_pts_per_side = slippage_ticks_per_side * tick_size
-#                         + spread_ticks * 0.5 * tick_size
-#   entry_fill = open + direction * friction_pts_per_side
-#   exit_fill  = open - direction * friction_pts_per_side
-#   commission = 2 * commission_per_side_usd
-#   net_pnl    = direction * (exit_fill - entry_fill) * multiplier - commission
-#
-# ES example (defaults):
-#   friction_per_side = 0.5 * 0.25 + 1.0 * 0.5 * 0.25 = 0.125 + 0.125 = 0.25 pts
-#   round-trip friction = 2 * 0.25 * $50 = $25.00
-#   commission RT       = 2 * $1.50 = $3.00
-#   total RT cost       = $28.00 per contract
 cost_model:
-  commission_per_side_usd: 1.50       # IB Lite/Pro rate per contract per side
-  slippage_ticks_per_side: 0.5        # adverse slippage on entry & exit
-  spread_ticks: 1.0                   # bid/ask spread (half applied each side)
+  commission_per_side_usd: 1.50
+  slippage_ticks_per_side: 0.5
+  spread_ticks: 1.0
 
 # ── Filters ────────────────────────────────────────────────────────────────────
 filters:
-  # NY session (UTC hours, inclusive).  Adjust for DST / other sessions.
-  # 14:30–21:00 UTC = 09:30–16:00 ET (winter).
-  # Set to 0 / 24 to disable session filter.
-  session_start_utc_hour: 9    # broad window covering synthetic + live data
-  session_end_utc_hour: 22
-
-  # ATR filter (ATR expressed in ticks = atr_pts / tick_size).
-  # Skip bars with ATR below min (too quiet) or above max (news spike).
-  atr_min_ticks: 4             # below = pre-market flatline / bad data
-  atr_max_ticks: 200           # above = circuit-breaker / limit-move territory
-
-  # Optional news-blackout windows (UTC HH:MM).  Pairs of [start, end].
-  # No external data required; acts as a time-of-day block.
-  # Example:  [["13:25", "13:35"], ["20:55", "21:05"]]
+  # NY regular session: 14:30-21:00 UTC = 09:30-16:00 ET (winter)
+  session_start_utc_hour: 14
+  session_end_utc_hour: 21
+  atr_min_ticks: 4
+  atr_max_ticks: 150
   news_blackout_windows: []
+
+# ── Signal confidence gating ────────────────────────────────────────────────────
+# Only act when model confidence meets the minimum threshold.
+# Higher values -> fewer but higher-quality trades -> lower drawdown.
+confidence:
+  min_long_confidence: 0.60
+  min_short_confidence: 0.60
+
+# ── Structural trend filter ─────────────────────────────────────────────────────
+# Long signals blocked when close < EMA(ema_period).
+# Short signals blocked when close > EMA(ema_period).
+trend_filter:
+  enabled: true
+  ema_period: 200
+
+# ── Prop-firm style risk limits ─────────────────────────────────────────────────
+# Daily halt: triggered by daily loss limit OR max_consecutive_losses.
+#   No new positions for the rest of that calendar day.
+# Kill switch: triggered by total drawdown limit.
+#   No new positions until manually reset.
+risk_limits:
+  starting_equity: 100000.0
+  max_daily_loss_usd: 1000.0
+  max_daily_loss_pct: 0.02
+  max_total_drawdown_usd: 3000.0
+  max_total_drawdown_pct: 0.06
+  max_consecutive_losses: 3
+  cooldown_bars_after_loss: 10
 
 # ── Trade frequency throttles ──────────────────────────────────────────────────
 throttles:
-  max_trades_per_day: 20          # hard ceiling on round-trips initiated per day
-  min_holding_bars: 3             # must hold a position at least N bars before exit
-  cooldown_bars_after_exit: 2     # must wait N bars after an exit before re-entering
-  max_concurrent_positions: 1     # always 1 for single-symbol runs
+  max_trades_per_day: 6
+  min_holding_bars: 5
+  cooldown_bars_after_exit: 5
+  max_concurrent_positions: 1
+
+# ── Position sizing ─────────────────────────────────────────────────────────────
+# method: fixed | fixed_dollar_risk | fixed_pct_risk
+position_sizing:
+  method: fixed
+  fixed_contracts: 1
+  risk_per_trade_usd: 500.0
+  risk_per_trade_pct: 0.01
+  atr_stop_multiplier: 1.5
+  max_contracts: 3
 
 # ── Contract specs ─────────────────────────────────────────────────────────────
 contract_specs:
   ES:
-    multiplier: 50        # $50 per point
+    multiplier: 50
     tick_size: 0.25
     tick_value: 12.50
   NQ:
-    multiplier: 20        # $20 per point
+    multiplier: 20
     tick_size: 0.25
     tick_value: 5.00
   MES:

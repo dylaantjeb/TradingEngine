@@ -52,10 +52,43 @@ class FilterConfig:
 
 @dataclass
 class ThrottleConfig:
-    max_trades_per_day: int = 20
-    min_holding_bars: int = 3
-    cooldown_bars_after_exit: int = 2
+    max_trades_per_day: int = 6
+    min_holding_bars: int = 5
+    cooldown_bars_after_exit: int = 5
     max_concurrent_positions: int = 1
+
+
+@dataclass
+class ConfidenceConfig:
+    min_long_confidence: float = 0.60
+    min_short_confidence: float = 0.60
+
+
+@dataclass
+class TrendFilterConfig:
+    enabled: bool = True
+    ema_period: int = 200
+
+
+@dataclass
+class RiskLimitsConfig:
+    starting_equity: float = 100_000.0
+    max_daily_loss_usd: float = 1_000.0
+    max_daily_loss_pct: float = 0.02
+    max_total_drawdown_usd: float = 3_000.0
+    max_total_drawdown_pct: float = 0.06
+    max_consecutive_losses: int = 3
+    cooldown_bars_after_loss: int = 10
+
+
+@dataclass
+class PositionSizingConfig:
+    method: str = "fixed"             # fixed | fixed_dollar_risk | fixed_pct_risk
+    fixed_contracts: int = 1
+    risk_per_trade_usd: float = 500.0
+    risk_per_trade_pct: float = 0.01
+    atr_stop_multiplier: float = 1.5
+    max_contracts: int = 3
 
 
 @dataclass
@@ -87,6 +120,10 @@ class AppConfig:
     cost: CostConfig = field(default_factory=CostConfig)
     filters: FilterConfig = field(default_factory=FilterConfig)
     throttles: ThrottleConfig = field(default_factory=ThrottleConfig)
+    confidence: ConfidenceConfig = field(default_factory=ConfidenceConfig)
+    trend_filter: TrendFilterConfig = field(default_factory=TrendFilterConfig)
+    risk_limits: RiskLimitsConfig = field(default_factory=RiskLimitsConfig)
+    position_sizing: PositionSizingConfig = field(default_factory=PositionSizingConfig)
     contract_specs: Dict[str, ContractSpec] = field(default_factory=dict)
     ibkr: IBKRConfig = field(default_factory=IBKRConfig)
 
@@ -204,6 +241,76 @@ def _build_contracts(u: dict) -> Dict[str, ContractSpec]:
     return specs
 
 
+def _build_confidence(u: dict) -> ConfidenceConfig:
+    sec = u.get("confidence", {})
+    return ConfidenceConfig(
+        min_long_confidence=_env(
+            "min_long_confidence", float(sec.get("min_long_confidence", 0.60))
+        ),
+        min_short_confidence=_env(
+            "min_short_confidence", float(sec.get("min_short_confidence", 0.60))
+        ),
+    )
+
+
+def _build_trend_filter(u: dict) -> TrendFilterConfig:
+    sec = u.get("trend_filter", {})
+    return TrendFilterConfig(
+        enabled=_env("trend_filter_enabled", bool(sec.get("enabled", True))),
+        ema_period=_env("trend_filter_ema_period", int(sec.get("ema_period", 200))),
+    )
+
+
+def _build_risk_limits(u: dict) -> RiskLimitsConfig:
+    sec = u.get("risk_limits", {})
+    return RiskLimitsConfig(
+        starting_equity=_env(
+            "starting_equity", float(sec.get("starting_equity", 100_000.0))
+        ),
+        max_daily_loss_usd=_env(
+            "max_daily_loss_usd", float(sec.get("max_daily_loss_usd", 1_000.0))
+        ),
+        max_daily_loss_pct=_env(
+            "max_daily_loss_pct", float(sec.get("max_daily_loss_pct", 0.02))
+        ),
+        max_total_drawdown_usd=_env(
+            "max_total_drawdown_usd",
+            float(sec.get("max_total_drawdown_usd", 3_000.0)),
+        ),
+        max_total_drawdown_pct=_env(
+            "max_total_drawdown_pct",
+            float(sec.get("max_total_drawdown_pct", 0.06)),
+        ),
+        max_consecutive_losses=_env(
+            "max_consecutive_losses", int(sec.get("max_consecutive_losses", 3))
+        ),
+        cooldown_bars_after_loss=_env(
+            "cooldown_bars_after_loss",
+            int(sec.get("cooldown_bars_after_loss", 10)),
+        ),
+    )
+
+
+def _build_position_sizing(u: dict) -> PositionSizingConfig:
+    sec = u.get("position_sizing", {})
+    return PositionSizingConfig(
+        method=_env("position_sizing_method", str(sec.get("method", "fixed"))),
+        fixed_contracts=_env(
+            "fixed_contracts", int(sec.get("fixed_contracts", 1))
+        ),
+        risk_per_trade_usd=_env(
+            "risk_per_trade_usd", float(sec.get("risk_per_trade_usd", 500.0))
+        ),
+        risk_per_trade_pct=_env(
+            "risk_per_trade_pct", float(sec.get("risk_per_trade_pct", 0.01))
+        ),
+        atr_stop_multiplier=_env(
+            "atr_stop_multiplier", float(sec.get("atr_stop_multiplier", 1.5))
+        ),
+        max_contracts=_env("max_contracts", int(sec.get("max_contracts", 3))),
+    )
+
+
 def _build_ibkr(ib: dict) -> IBKRConfig:
     conn = ib.get("connection", {})
     fetch = ib.get("fetch", {})
@@ -247,6 +354,10 @@ def get_config(
         cost=_build_cost(u),
         filters=_build_filters(u),
         throttles=_build_throttles(u),
+        confidence=_build_confidence(u),
+        trend_filter=_build_trend_filter(u),
+        risk_limits=_build_risk_limits(u),
+        position_sizing=_build_position_sizing(u),
         contract_specs=_build_contracts(u),
         ibkr=_build_ibkr(ib),
     )

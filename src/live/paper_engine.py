@@ -1,11 +1,12 @@
 """
-Paper trading engine – CSV stream simulation (hardened).
+Paper trading engine – CSV stream simulation (hardened, prop-firm rules).
 
 Execution model (identical to backtest):
   Signal generated at bar t close → filled at bar t+1 OPEN.
 
-Cost model, session filter, ATR filter, and throttles are loaded from
-config/universe.yaml and applied identically to the backtest.
+Cost model, session filter, ATR filter, trend filter, confidence gating,
+risk limits, and throttles are loaded from config/universe.yaml and applied
+identically to the backtest.
 
 PAPER TRADING ONLY – no live order placement.
 """
@@ -27,9 +28,8 @@ from src.features.builder import build_features, MIN_ROWS
 
 log = logging.getLogger(__name__)
 
-SUMMARY_INTERVAL     = 50
-CONFIDENCE_THRESHOLD = 0.50
-WARMUP_BARS          = MIN_ROWS + 10
+SUMMARY_INTERVAL = 50
+WARMUP_BARS      = MIN_ROWS + 10
 
 _UNIVERSE_CFG_PATH = Path("config/universe.yaml")
 
@@ -43,14 +43,36 @@ _DEFAULTS = {
     "atr_min_ticks": 4,
     "atr_max_ticks": 200,
     "news_blackout_windows": [],
-    "max_trades_per_day": 20,
-    "min_holding_bars": 3,
-    "cooldown_bars_after_exit": 2,
+    "max_trades_per_day": 6,
+    "min_holding_bars": 5,
+    "cooldown_bars_after_exit": 5,
+    # Confidence gating
+    "min_long_confidence": 0.60,
+    "min_short_confidence": 0.60,
+    # Trend filter
+    "trend_filter_enabled": True,
+    "trend_filter_ema_period": 200,
+    # Risk limits
+    "starting_equity": 100_000.0,
+    "max_daily_loss_usd": 1_000.0,
+    "max_daily_loss_pct": 0.02,
+    "max_total_drawdown_usd": 3_000.0,
+    "max_total_drawdown_pct": 0.06,
+    "max_consecutive_losses": 3,
+    "cooldown_bars_after_loss": 10,
+    # Position sizing
+    "position_sizing_method": "fixed",
+    "fixed_contracts": 1,
+    "risk_per_trade_usd": 500.0,
+    "risk_per_trade_pct": 0.01,
+    "atr_stop_multiplier": 1.5,
+    "max_contracts": 3,
+    "tick_size": 0.25,
 }
 
 
 def _load_cfg(symbol: str) -> tuple[dict, dict]:
-    """Return (run_cfg, contract_specs)."""
+    """Return (run_cfg, contract_specs_for_symbol)."""
     if not _UNIVERSE_CFG_PATH.exists():
         return dict(_DEFAULTS), {}
     with open(_UNIVERSE_CFG_PATH) as f:
@@ -61,6 +83,19 @@ def _load_cfg(symbol: str) -> tuple[dict, dict]:
     cfg.update(u.get("cost_model", {}))
     cfg.update(u.get("filters", {}))
     cfg.update(u.get("throttles", {}))
+    cfg.update(u.get("confidence", {}))
+    tf = u.get("trend_filter", {})
+    if "enabled" in tf:
+        cfg["trend_filter_enabled"] = tf["enabled"]
+    if "ema_period" in tf:
+        cfg["trend_filter_ema_period"] = tf["ema_period"]
+    cfg.update(u.get("risk_limits", {}))
+    ps = u.get("position_sizing", {})
+    if "method" in ps:
+        cfg["position_sizing_method"] = ps["method"]
+    for k, v in ps.items():
+        if k != "method":
+            cfg[k] = v
     specs = u.get("contract_specs", {}).get(symbol, {})
     return cfg, specs
 
@@ -98,25 +133,49 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
     bar_delay : Optional sleep between bars in seconds (0 = max speed).
     """
     model, scaler, feature_names, inv_label_map = _load_artifacts(symbol)
-
     cfg, specs = _load_cfg(symbol)
 
-    tick_size   = float(specs.get("tick_size", 0.25))
-    multiplier  = float(specs.get("multiplier", 50))
+    tick_size         = float(specs.get("tick_size", cfg.get("tick_size", 0.25)))
+    multiplier        = float(specs.get("multiplier", cfg.get("multiplier", 50)))
     commission_rt     = 2.0 * float(cfg["commission_per_side_usd"])
     slippage_pts      = float(cfg["slippage_ticks_per_side"]) * tick_size
     half_spread_pts   = float(cfg["spread_ticks"]) * 0.5 * tick_size
     friction_per_side = slippage_pts + half_spread_pts
 
-    delay        = int(cfg.get("execution_delay_bars", 1))
-    sess_start   = int(cfg.get("session_start_utc_hour", 0))
-    sess_end     = int(cfg.get("session_end_utc_hour", 24))
-    atr_min      = float(cfg.get("atr_min_ticks", 0))
-    atr_max      = float(cfg.get("atr_max_ticks", 1e9))
-    blackouts    = cfg.get("news_blackout_windows", [])
-    max_tpd      = int(cfg.get("max_trades_per_day", 9999))
-    min_hold     = int(cfg.get("min_holding_bars", 1))
-    cooldown_cfg = int(cfg.get("cooldown_bars_after_exit", 0))
+    delay          = int(cfg.get("execution_delay_bars", 1))
+    sess_start     = int(cfg.get("session_start_utc_hour", 0))
+    sess_end       = int(cfg.get("session_end_utc_hour", 24))
+    atr_min        = float(cfg.get("atr_min_ticks", 0))
+    atr_max        = float(cfg.get("atr_max_ticks", 1e9))
+    blackouts      = cfg.get("news_blackout_windows", [])
+    max_tpd        = int(cfg.get("max_trades_per_day", 9999))
+    min_hold       = int(cfg.get("min_holding_bars", 1))
+    cooldown_cfg   = int(cfg.get("cooldown_bars_after_exit", 0))
+
+    # Confidence thresholds (from config)
+    min_long_conf  = float(cfg.get("min_long_confidence", 0.0))
+    min_short_conf = float(cfg.get("min_short_confidence", 0.0))
+
+    # Trend filter
+    trend_filter_on  = bool(cfg.get("trend_filter_enabled", False))
+    trend_ema_period = int(cfg.get("trend_filter_ema_period", 200))
+
+    # Risk limits
+    starting_equity    = float(cfg.get("starting_equity", 100_000.0))
+    max_daily_loss_usd = float(cfg.get("max_daily_loss_usd", 1e15))
+    max_daily_loss_pct = float(cfg.get("max_daily_loss_pct", 1.0))
+    max_total_dd_usd   = float(cfg.get("max_total_drawdown_usd", 1e15))
+    max_total_dd_pct   = float(cfg.get("max_total_drawdown_pct", 1.0))
+    max_consec_losses  = int(cfg.get("max_consecutive_losses", 9999))
+    loss_cooldown_cfg  = int(cfg.get("cooldown_bars_after_loss", 0))
+
+    # Position sizing
+    ps_method      = str(cfg.get("position_sizing_method", "fixed"))
+    fixed_contracts = int(cfg.get("fixed_contracts", 1))
+    risk_usd       = float(cfg.get("risk_per_trade_usd", 500.0))
+    risk_pct       = float(cfg.get("risk_per_trade_pct", 0.01))
+    atr_stop_mult  = float(cfg.get("atr_stop_multiplier", 1.5))
+    max_contracts  = int(cfg.get("max_contracts", 3))
 
     if delay == 0:
         log.warning("execution_delay_bars=0 → same-bar fills (leaky mode).")
@@ -128,10 +187,7 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
     log.info("Loading CSV %s …", csv_path)
     raw_df = pd.read_csv(csv_path, parse_dates=["timestamp"], index_col="timestamp")
     raw_df.sort_index(inplace=True)
-    log.info(
-        "Loaded %d bars from %s to %s",
-        len(raw_df), raw_df.index[0], raw_df.index[-1],
-    )
+    log.info("Loaded %d bars from %s to %s", len(raw_df), raw_df.index[0], raw_df.index[-1])
 
     # ── Pre-compute all features + predictions at startup ─────────────────────
     log.info("Pre-computing features on %d bars …", len(raw_df))
@@ -140,39 +196,53 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
     except ValueError as exc:
         log.error("Feature computation failed: %s", exc)
         sys.exit(1)
-
     log.info("Features ready: %d rows", len(all_features))
 
-    X_all        = all_features[feature_names].values
-    X_scaled_all = scaler.transform(X_all)
+    # Pass DataFrame (not .values) to preserve feature_names_in_ → no warning
+    X_df         = all_features[feature_names]
+    X_scaled_all = scaler.transform(X_df)
     proba_all    = model.predict_proba(X_scaled_all)
     pred_enc_all = np.argmax(proba_all, axis=1)
     conf_all     = np.max(proba_all, axis=1)
     signal_all   = np.array([inv_label_map[str(e)] for e in pred_enc_all])
 
-    # Confidence filter
-    signal_all[conf_all < CONFIDENCE_THRESHOLD] = 0
-
-    # ATR in ticks (for filter)
-    atr_14_all = all_features["atr_14"].values          # atr_pts / close
-    close_vals = all_features.get("close", pd.Series(dtype=float))
-    # We need close from raw_df aligned to all_features index
+    # ATR in ticks
     raw_close_aligned = raw_df["close"].reindex(all_features.index)
-    atr_ticks_all = (atr_14_all * raw_close_aligned.values) / tick_size
+    atr_ticks_all = (all_features["atr_14"].values * raw_close_aligned.values) / tick_size
+
+    # EMA for trend filter
+    ema_all = None
+    if trend_filter_on:
+        ema_all = raw_close_aligned.ewm(span=trend_ema_period, adjust=False).mean().values
+        log.info("Trend filter enabled: EMA(%d)", trend_ema_period)
 
     feat_idx    = all_features.index
     feat_ts_set = set(feat_idx)
 
-    # Build a position-lookup from feat_idx into raw_df index
-    raw_idx_pos = {ts: i for i, ts in enumerate(raw_df.index)}
+    # ── Position sizing helper ─────────────────────────────────────────────────
+    def _size(atr_t: float) -> int:
+        if ps_method == "fixed_dollar_risk":
+            atr_pts  = atr_t * tick_size
+            stop_pts = atr_pts * atr_stop_mult
+            n_c = int(risk_usd / (stop_pts * multiplier)) if stop_pts > 0 else 1
+        elif ps_method == "fixed_pct_risk":
+            total_eq = starting_equity + equity
+            r_usd    = total_eq * risk_pct
+            atr_pts  = atr_t * tick_size
+            stop_pts = atr_pts * atr_stop_mult
+            n_c = int(r_usd / (stop_pts * multiplier)) if stop_pts > 0 else 1
+        else:
+            n_c = fixed_contracts
+        return max(1, min(n_c, max_contracts))
 
     # ── State ──────────────────────────────────────────────────────────────────
     position         = 0
     entry_price      = 0.0
     entry_bar_num    = 0
+    entry_contracts  = 1
     equity           = 0.0
     gross_pnl_total  = 0.0
-    total_cost       = 0.0
+    total_cost_total = 0.0
     trades: list[dict] = []
     bar_count        = 0
     feat_cursor      = 0
@@ -181,7 +251,16 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
     cooldown_left     = 0
     daily_trade_count = 0
     last_trade_date   = None
-    pending_target    = None   # signal queued for next-bar fill
+    pending_target    = None
+    pending_contracts = 1
+
+    # Risk state
+    daily_pnl          = 0.0
+    peak_equity        = 0.0
+    consecutive_losses = 0
+    daily_halt         = False
+    kill_switch_active = False
+    loss_cooldown_left = 0
 
     last_signal     = 0
     last_confidence = 0.0
@@ -191,12 +270,57 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
     print(f"{'='*60}")
     print(f"  Streaming {len(raw_df)} bars …  Ctrl-C to stop")
     log.info(
-        "Cost: commission RT=$%.2f | friction/side=%.4f pts | "
-        "total RT cost ≈ $%.2f",
+        "Cost: commission RT=$%.2f | friction/side=%.4f pts | total RT ≈ $%.2f",
         commission_rt, friction_per_side,
         2 * friction_per_side * multiplier + commission_rt,
     )
+    if trend_filter_on:
+        log.info("Trend filter: EMA(%d)", trend_ema_period)
+    log.info(
+        "Risk limits: daily_loss=$%.0f (%.1f%%) | total_dd=$%.0f (%.1f%%) | max_consec=%d",
+        max_daily_loss_usd, max_daily_loss_pct * 100,
+        max_total_dd_usd, max_total_dd_pct * 100,
+        max_consec_losses,
+    )
     print()
+
+    def _update_risk(net_pnl: float, ts) -> None:
+        nonlocal equity, daily_pnl, peak_equity, consecutive_losses
+        nonlocal daily_halt, kill_switch_active, loss_cooldown_left
+
+        equity    += net_pnl
+        daily_pnl += net_pnl
+        peak_equity = max(peak_equity, equity)
+
+        if net_pnl < 0:
+            consecutive_losses += 1
+            if loss_cooldown_cfg > 0:
+                loss_cooldown_left = loss_cooldown_cfg
+        else:
+            consecutive_losses = 0
+
+        if not daily_halt:
+            total_eq_before = starting_equity + equity - net_pnl
+            daily_loss = -daily_pnl
+            if (daily_loss >= max_daily_loss_usd
+                    or (total_eq_before > 0 and daily_loss / total_eq_before >= max_daily_loss_pct)
+                    or consecutive_losses >= max_consec_losses):
+                daily_halt = True
+                log.warning(
+                    "[%s] Daily halt triggered — daily_pnl=%.2f consec_losses=%d",
+                    ts, daily_pnl, consecutive_losses,
+                )
+
+        if not kill_switch_active:
+            drawdown = equity - peak_equity
+            dd_base  = starting_equity + peak_equity
+            if (-drawdown >= max_total_dd_usd
+                    or (dd_base > 0 and -drawdown / dd_base >= max_total_dd_pct)):
+                kill_switch_active = True
+                log.warning(
+                    "[%s] Kill switch activated — drawdown=%.2f",
+                    ts, drawdown,
+                )
 
     try:
         raw_list = list(raw_df.iterrows())
@@ -206,9 +330,14 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
             bar_count += 1
             today = ts.date()
 
+            # Daily reset
             if today != last_trade_date:
                 daily_trade_count = 0
                 last_trade_date   = today
+                if daily_halt and not kill_switch_active:
+                    daily_halt = False
+                    log.info("[%s] Daily halt cleared (new trading day)", ts)
+                daily_pnl = 0.0
 
             has_open = "open" in row and not pd.isna(row["open"])
             open_px  = float(row["open"]) if has_open else float(row["close"])
@@ -216,129 +345,219 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
 
             # ── STEP 1: Execute pending order at this bar's open ───────────────
             if pending_target is not None and delay > 0:
-                o = open_px
+                o   = open_px
+                n_c = pending_contracts
                 if position != 0 and pending_target != position:
                     exit_fill = o - position * friction_per_side
-                    raw_pnl   = position * (exit_fill - entry_price) * multiplier
-                    cost      = commission_rt
+                    raw_pnl   = position * (exit_fill - entry_price) * multiplier * entry_contracts
+                    cost      = commission_rt * entry_contracts
                     net_pnl   = raw_pnl - cost
-                    equity   += net_pnl
-                    gross_pnl_total += raw_pnl
-                    total_cost      += cost
+                    gross_pnl_total  += raw_pnl
+                    total_cost_total += cost
                     trades.append({
-                        "time":   str(ts),
-                        "dir":    "L" if position > 0 else "S",
-                        "entry":  round(entry_price, 2),
-                        "exit":   round(exit_fill, 2),
+                        "time":      str(ts),
+                        "dir":       "L" if position > 0 else "S",
+                        "entry":     round(entry_price, 2),
+                        "exit":      round(exit_fill, 2),
                         "hold_bars": bar_count - entry_bar_num,
-                        "gross":  round(raw_pnl, 2),
-                        "cost":   round(cost, 2),
-                        "pnl":    round(net_pnl, 2),
-                        "equity": round(equity, 2),
+                        "n_contr":   entry_contracts,
+                        "gross":     round(raw_pnl, 2),
+                        "cost":      round(cost, 2),
+                        "pnl":       round(net_pnl, 2),
+                        "equity":    round(equity + net_pnl, 2),
                     })
                     log.debug(
                         "[%s] EXIT %s @ %.2f  gross=%.2f cost=%.2f net=%.2f  eq=%.2f",
                         ts, "L" if position > 0 else "S", exit_fill,
-                        raw_pnl, cost, net_pnl, equity,
+                        raw_pnl, cost, net_pnl, equity + net_pnl,
                     )
-                    position    = 0
+                    _update_risk(net_pnl, ts)
                     if cooldown_cfg > 0:
                         cooldown_left = cooldown_cfg
+                    position = 0
 
                     if pending_target != 0:
-                        entry_price   = o + pending_target * friction_per_side
-                        position      = pending_target
-                        entry_bar_num = bar_count
+                        entry_price     = o + pending_target * friction_per_side
+                        position        = pending_target
+                        entry_bar_num   = bar_count
+                        entry_contracts = n_c
                         log.debug(
-                            "[%s] ENTER %s @ %.2f (reversal)",
-                            ts, "L" if position > 0 else "S", entry_price,
+                            "[%s] ENTER %s @ %.2f (reversal, %d contracts)",
+                            ts, "L" if position > 0 else "S", entry_price, n_c,
                         )
 
                 elif position == 0 and pending_target != 0:
-                    entry_price   = o + pending_target * friction_per_side
-                    position      = pending_target
-                    entry_bar_num = bar_count
+                    entry_price     = o + pending_target * friction_per_side
+                    position        = pending_target
+                    entry_bar_num   = bar_count
+                    entry_contracts = n_c
                     log.debug(
-                        "[%s] ENTER %s @ %.2f",
-                        ts, "L" if position > 0 else "S", entry_price,
+                        "[%s] ENTER %s @ %.2f (%d contracts)",
+                        ts, "L" if position > 0 else "S", entry_price, n_c,
                     )
 
                 pending_target = None
 
-            # ── STEP 2: Get signal for this bar (execute at next bar) ──────────
+            # ── STEP 2: Get signal + apply 10-filter pipeline ─────────────────
             if ts in feat_ts_set:
                 raw_sig    = int(signal_all[feat_cursor])
                 confidence = float(conf_all[feat_cursor])
                 atr_ticks  = float(atr_ticks_all[feat_cursor])
+                ema_val    = float(ema_all[feat_cursor]) if ema_all is not None else float("nan")
                 feat_cursor += 1
             else:
                 raw_sig    = 0
                 confidence = 0.0
                 atr_ticks  = 0.0
+                ema_val    = float("nan")
 
             sig = raw_sig
 
-            # Filters
-            if not _in_session(ts, sess_start, sess_end):
+            # Diagnostics dict for this bar
+            filters_passed: list[str] = []
+            filters_failed: list[str] = []
+
+            def _check(name: str, passed: bool) -> None:
+                (filters_passed if passed else filters_failed).append(name)
+
+            # Filter 1: Confidence gating
+            conf_ok = True
+            if sig == 1 and confidence < min_long_conf:
+                conf_ok = False
+            elif sig == -1 and confidence < min_short_conf:
+                conf_ok = False
+            _check(f"confidence({confidence:.2f})", conf_ok)
+            if not conf_ok:
                 sig = 0
-            if _in_blackout(ts, blackouts):
+
+            # Filter 2: Session
+            sess_ok = _in_session(ts, sess_start, sess_end)
+            _check("session", sess_ok)
+            if not sess_ok:
                 sig = 0
-            if not (atr_min <= atr_ticks <= atr_max):
+
+            # Filter 3: Blackout
+            bo_ok = not _in_blackout(ts, blackouts)
+            _check("blackout", bo_ok)
+            if not bo_ok:
                 sig = 0
+
+            # Filter 4: ATR
+            atr_ok = (atr_min <= atr_ticks <= atr_max)
+            _check(f"atr({atr_ticks:.1f})", atr_ok)
+            if not atr_ok:
+                sig = 0
+
+            # Filter 5: Trend filter
+            if trend_filter_on and not np.isnan(ema_val):
+                trend_ok = True
+                if sig == 1 and close_px < ema_val:
+                    trend_ok = False
+                elif sig == -1 and close_px > ema_val:
+                    trend_ok = False
+                _check(f"trend_ema(close={close_px:.1f},ema={ema_val:.1f})", trend_ok)
+                if not trend_ok:
+                    sig = 0
+
+            # Filter 6: Risk gate
+            risk_blocked = False
+            if kill_switch_active or daily_halt:
+                if position == 0:
+                    risk_blocked = True
+                    sig = 0
+                elif sig * position < 0:  # reversal
+                    risk_blocked = True
+                    sig = 0
+            _check("risk_gate", not risk_blocked)
+
+            # Filter 7: Loss cooldown
+            lc_ok = True
+            if loss_cooldown_left > 0:
+                loss_cooldown_left -= 1
+                if position == 0:
+                    lc_ok = False
+                    sig = 0
+            _check("loss_cooldown", lc_ok)
+
+            # Filter 8: Exit cooldown
+            ec_ok = True
             if cooldown_left > 0:
                 cooldown_left -= 1
                 if position == 0:
+                    ec_ok = False
                     sig = 0
+            _check("exit_cooldown", ec_ok)
+
+            # Filter 9: Min hold
             if position != 0 and (bar_count - entry_bar_num) < min_hold:
-                sig = position   # force hold minimum
+                sig = position
+
+            # Filter 10: Daily trade cap
             if sig != 0 and sig != position and daily_trade_count >= max_tpd:
-                sig = 0 if position == 0 else position  # block entry/reversal
+                sig = 0 if position == 0 else position
 
             target = int(sig)
             last_signal     = raw_sig
             last_confidence = confidence
 
             if delay == 0:
-                # Same-bar fill (leaky, debug only)
                 if target != position:
                     o = open_px
                     if position != 0:
                         exit_fill = o - position * friction_per_side
-                        raw_pnl   = position * (exit_fill - entry_price) * multiplier
-                        cost      = commission_rt
+                        raw_pnl   = position * (exit_fill - entry_price) * multiplier * entry_contracts
+                        cost      = commission_rt * entry_contracts
                         net_pnl   = raw_pnl - cost
-                        equity   += net_pnl
-                        gross_pnl_total += raw_pnl
-                        total_cost      += cost
+                        gross_pnl_total  += raw_pnl
+                        total_cost_total += cost
                         trades.append({
                             "time": str(ts), "dir": "L" if position > 0 else "S",
                             "entry": round(entry_price, 2), "exit": round(exit_fill, 2),
                             "hold_bars": bar_count - entry_bar_num,
+                            "n_contr": entry_contracts,
                             "gross": round(raw_pnl, 2), "cost": round(cost, 2),
-                            "pnl": round(net_pnl, 2), "equity": round(equity, 2),
+                            "pnl": round(net_pnl, 2), "equity": round(equity + net_pnl, 2),
                         })
+                        _update_risk(net_pnl, ts)
                         position = 0
                     if target != 0:
-                        entry_price   = o + target * friction_per_side
-                        position      = target
-                        entry_bar_num = bar_count
+                        n_c         = _size(atr_ticks)
+                        entry_price     = o + target * friction_per_side
+                        position        = target
+                        entry_bar_num   = bar_count
+                        entry_contracts = n_c
             else:
-                # Queue for next bar
                 if target != position and raw_i < n_raw - 1:
-                    pending_target = target
-                    if target != 0:   # count entries AND reversals
+                    pending_target    = target
+                    pending_contracts = _size(atr_ticks) if target != 0 else entry_contracts
+                    if target != 0:
                         daily_trade_count += 1
+
+            # ── Per-bar diagnostics (debug level) ─────────────────────────────
+            if log.isEnabledFor(logging.DEBUG):
+                status = f"pos={position:+d}"
+                if kill_switch_active:
+                    status += " KILL_SWITCH"
+                elif daily_halt:
+                    status += " DAILY_HALT"
+                log.debug(
+                    "[%s] raw=%+d conf=%.2f target=%+d | %s | pass=%s fail=%s",
+                    ts, raw_sig, confidence, target, status,
+                    ",".join(filters_passed) or "none",
+                    ",".join(filters_failed) or "none",
+                )
 
             # ── Periodic summary ───────────────────────────────────────────────
             if bar_count % SUMMARY_INTERVAL == 0:
                 n_t  = len(trades)
                 wins = sum(1 for t in trades if t["pnl"] > 0)
                 wr   = wins / n_t if n_t else 0.0
+                halt_str = " [KILL_SWITCH]" if kill_switch_active else (" [HALT]" if daily_halt else "")
                 print(
                     f"  bar {bar_count:6d} | pos={position:+d} | "
                     f"equity={equity:+.2f} | trades={n_t} | "
-                    f"winrate={wr:.1%} | last_signal={last_signal:+d} "
-                    f"conf={last_confidence:.2f}"
+                    f"winrate={wr:.1%} | sig={last_signal:+d} "
+                    f"conf={last_confidence:.2f}{halt_str}"
                 )
 
             if bar_delay > 0:
@@ -347,7 +566,7 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
     except KeyboardInterrupt:
         print("\n  Stopped by user.")
 
-    _print_summary(symbol, trades, equity, gross_pnl_total, total_cost, bar_count)
+    _print_summary(symbol, trades, equity, gross_pnl_total, total_cost_total, bar_count)
 
 
 def _print_summary(
@@ -406,8 +625,8 @@ def _load_artifacts(symbol: str):
     with open(schema_path) as f:
         schema = json.load(f)
 
-    feature_names: list[str]       = schema["feature_names"]
-    inv_label_map: dict[str, int]  = {k: int(v) for k, v in schema["inv_label_map"].items()}
+    feature_names: list[str]      = schema["feature_names"]
+    inv_label_map: dict[str, int] = {k: int(v) for k, v in schema["inv_label_map"].items()}
 
-    log.info("Loaded model (%s features) and scaler for %s", len(feature_names), symbol)
+    log.info("Loaded model (%d features) and scaler for %s", len(feature_names), symbol)
     return model, scaler, feature_names, inv_label_map
