@@ -298,7 +298,10 @@ def run_backtest(
     )
 
     # ── Metrics ─────────────────────────────────────────────────────────────────
-    metrics = _compute_metrics(equity_curve, trades, cost_summary)
+    metrics = _compute_metrics(
+        equity_curve, trades, cost_summary,
+        starting_equity=float(cfg.get("starting_equity", 100_000.0)),
+    )
     metrics["symbol"]  = symbol
     metrics["n_bars"]  = len(features)
     metrics["n_trades"] = len(trades)
@@ -713,8 +716,23 @@ def _simulate_trades(
 
 
 def _compute_metrics(
-    equity: pd.Series, trades: list[dict], cost_summary: dict
+    equity: pd.Series,
+    trades: list[dict],
+    cost_summary: dict,
+    starting_equity: float = 100_000.0,
 ) -> dict[str, Any]:
+    """
+    Compute performance metrics from an equity curve and trade list.
+
+    Parameters
+    ----------
+    equity          : Cumulative P&L series (starts at 0, not at starting_equity).
+    trades          : List of closed-trade dicts from _simulate_trades.
+    cost_summary    : Dict with gross_pnl, total_costs, etc.
+    starting_equity : Account starting capital — used as the denominator for
+                      max_drawdown_pct so the % is always meaningful (e.g. -5%
+                      means 5% of starting capital was lost at the trough).
+    """
     if len(trades) == 0:
         return {
             "sharpe": 0.0, "sortino": 0.0, "max_drawdown_pct": 0.0,
@@ -751,7 +769,12 @@ def _compute_metrics(
     cummax = equity.cummax()
     dd     = equity - cummax
     max_dd = float(dd.min())
-    max_dd_pct = float((max_dd / (cummax.max() + 1e-9)) * 100) if cummax.max() > 0 else 0.0
+    # Percentage relative to starting_equity — stable denominator for all regimes.
+    # Avoids the exploding-% bug that occurs when cummax is 0 or very small
+    # (e.g. a strategy that never became profitable gives cummax ≈ 0, so dividing
+    # by cummax produces values like -50000%).
+    # Interpretation: -5% means 5% of starting capital was lost at the worst point.
+    max_dd_pct = float(max_dd / starting_equity * 100) if starting_equity > 0 else 0.0
 
     # Trades per day
     if len(trades) >= 2:

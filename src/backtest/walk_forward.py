@@ -22,10 +22,20 @@ Leakage guarantees
 Stability metrics reported
 --------------------------
   pct_profitable_folds : fraction of folds with net_pnl > 0
+  avg_profit_factor    : mean profit factor across folds
   pnl_cv               : coeff. of variation of fold PnLs (lower = more stable)
   std_sharpe           : std of fold Sharpe ratios        (lower = more stable)
   t_stat_pnl           : t-statistic of fold PnLs         (>1.65 → 95% sig.)
-  stability            : STABLE | PROMISING | MIXED | UNSTABLE
+  funded_ready         : FUNDED-READY | PROMISING | MARGINAL | NOT READY
+
+Stability thresholds (stricter than industry-standard for funded-account safety)
+---------------------------------------------------------------------------------
+  FUNDED-READY  : pct_profitable ≥ 0.70  AND  avg_pf ≥ 1.50  AND
+                  pnl_cv ≤ 1.0           AND  t_stat ≥ 1.65
+  PROMISING     : pct_profitable ≥ 0.60  AND  avg_pf ≥ 1.30  AND
+                  pnl_cv ≤ 1.5           AND  total_pnl > 0
+  MARGINAL      : pct_profitable ≥ 0.40  AND  avg_pf ≥ 1.10
+  NOT READY     : anything else
 
 Usage
 -----
@@ -60,6 +70,19 @@ log = logging.getLogger(__name__)
 
 _ARTS = Path("artifacts")
 _UNIVERSE_CFG = Path("config/universe.yaml")
+
+# Funded-account readiness thresholds
+_FUNDED_MIN_PCT_PROF   = 0.70   # ≥ 70% of folds profitable
+_FUNDED_MIN_PF         = 1.50   # avg profit factor ≥ 1.5
+_FUNDED_MAX_CV         = 1.00   # PnL CV ≤ 1.0  (tight consistency)
+_FUNDED_MIN_TSTAT      = 1.65   # t-statistic ≥ 1.65 (95% one-sided)
+
+_PROMISING_MIN_PCT_PROF = 0.60
+_PROMISING_MIN_PF       = 1.30
+_PROMISING_MAX_CV       = 1.50
+
+_MARGINAL_MIN_PCT_PROF  = 0.40
+_MARGINAL_MIN_PF        = 1.10
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -182,6 +205,7 @@ def run_walk_forward(
     from src.backtest.engine import _load_cfg
     cfg   = _load_cfg(symbol)
     specs = _load_specs(symbol)
+    starting_equity = float(cfg.get("starting_equity", 100_000.0))
 
     # ── Build fold index tuples ────────────────────────────────────────────
     if mode == "rolling":
@@ -237,6 +261,7 @@ def run_walk_forward(
                 full_ema=full_ema,
                 cfg=cfg,
                 specs=specs,
+                starting_equity=starting_equity,
             )
         except Exception as exc:
             log.warning("Fold %d  backtest failed: %s — skipping", fold_idx, exc)
@@ -370,6 +395,9 @@ def _train_on_slice(
     """
     Train XGBoost + RobustScaler on train_df in memory.
 
+    Hyperparameters are tuned for OOS robustness (shallower trees,
+    stronger regularisation) rather than in-sample accuracy.
+
     Parameters
     ----------
     train_df      : DataFrame with feature columns + "label" column.
@@ -415,13 +443,21 @@ def _train_on_slice(
     if n_trials > 0:
         model = _optuna_train(X_scaled, y_enc, n_trials)
     else:
-        # Sensible fixed hyperparameters — fast, good for M1 bar data
+        # Conservative fixed hyperparameters designed for OOS robustness:
+        # - shallow trees (max_depth=3) → less overfitting
+        # - strong L2 regularisation (reg_lambda=3)
+        # - high min_child_weight → each leaf needs many samples
+        # - slower learning rate → generalises across regimes
         model = xgb.XGBClassifier(
-            n_estimators=300,
-            max_depth=4,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
+            n_estimators=200,
+            max_depth=3,
+            learning_rate=0.03,
+            subsample=0.7,
+            colsample_bytree=0.7,
+            min_child_weight=10,
+            reg_alpha=0.5,
+            reg_lambda=3.0,
+            gamma=1.0,
             eval_metric="mlogloss",
             random_state=42,
             verbosity=0,
@@ -437,9 +473,10 @@ def _optuna_train(
     n_trials: int,
 ):
     """
-    Quick Optuna hyperparameter search within a training slice.
+    Optuna hyperparameter search within a training slice.
 
     Inner validation: last 20% of the training slice (time-ordered, no shuffle).
+    Search space is biased towards conservative / generalisable models.
     """
     import optuna
     import xgboost as xgb
@@ -453,11 +490,16 @@ def _optuna_train(
 
     def objective(trial: optuna.Trial) -> float:
         params = {
-            "n_estimators":     trial.suggest_int("n_estimators", 100, 500),
-            "max_depth":        trial.suggest_int("max_depth", 3, 6),
-            "learning_rate":    trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
-            "subsample":        trial.suggest_float("subsample", 0.6, 1.0),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+            # Conservative ranges — prefer depth ≤ 5 and higher regularisation
+            "n_estimators":     trial.suggest_int("n_estimators", 100, 400),
+            "max_depth":        trial.suggest_int("max_depth", 2, 5),
+            "learning_rate":    trial.suggest_float("learning_rate", 0.01, 0.10, log=True),
+            "subsample":        trial.suggest_float("subsample", 0.5, 0.9),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 0.9),
+            "min_child_weight": trial.suggest_int("min_child_weight", 5, 20),
+            "gamma":            trial.suggest_float("gamma", 0.5, 5.0),
+            "reg_alpha":        trial.suggest_float("reg_alpha", 0.1, 5.0, log=True),
+            "reg_lambda":       trial.suggest_float("reg_lambda", 1.0, 10.0, log=True),
             "eval_metric":      "mlogloss",
             "random_state":     42,
             "verbosity":        0,
@@ -495,6 +537,7 @@ def _backtest_on_slice(
     full_ema: Optional[pd.Series],
     cfg: dict,
     specs: dict,
+    starting_equity: float = 100_000.0,
 ) -> dict:
     """
     Run backtest on a test-window DataFrame.
@@ -571,7 +614,10 @@ def _backtest_on_slice(
         ema_series   = ema_series,
     )
 
-    metrics = _compute_metrics(equity_curve, trades, cost_summary)
+    metrics = _compute_metrics(
+        equity_curve, trades, cost_summary,
+        starting_equity=starting_equity,
+    )
     metrics["n_trades"] = len(trades)
     return metrics
 
@@ -585,17 +631,23 @@ def _aggregate(folds: list[FoldResult]) -> dict:
     """
     Compute aggregate + stability metrics across all completed folds.
 
+    Funded-account readiness thresholds (stricter than old STABLE/PROMISING)
+    -------------------------------------------------------------------------
+    FUNDED-READY : pct_profitable ≥ 70%  AND  avg_pf ≥ 1.5   AND
+                   pnl_cv ≤ 1.0          AND  t_stat ≥ 1.65
+    PROMISING    : pct_profitable ≥ 60%  AND  avg_pf ≥ 1.3   AND
+                   pnl_cv ≤ 1.5          AND  total_pnl > 0
+    MARGINAL     : pct_profitable ≥ 40%  AND  avg_pf ≥ 1.1
+    NOT READY    : anything else (avg_pf < 1.1, majority losing, or high variance)
+
     Stability metrics
     -----------------
     pnl_cv       : std(pnl) / |mean(pnl)|  — coefficient of variation.
-                   Lower is more stable. Reported as None when mean_pnl ≤ 0
-                   (not meaningful for losing strategies).
+                   Lower is more stable. Reported as None when mean_pnl ≤ 0.
     std_sharpe   : std of fold Sharpe ratios across folds.
-                   Lower means more consistent risk-adjusted performance.
     t_stat_pnl   : mean_pnl / (std_pnl / √n_folds).
                    Tests H₀: mean = 0. > 1.65 → one-sided 95% significance.
                    Reported as None when n_folds < 2 or std_pnl = 0.
-    stability    : STABLE | PROMISING | MIXED | UNSTABLE — qualitative verdict.
     """
     if not folds:
         return {}
@@ -618,12 +670,14 @@ def _aggregate(folds: list[FoldResult]) -> dict:
     std_pnl     = float(np.std(net_pnls, ddof=1)) if n > 1 else 0.0
     mean_sharpe = float(np.mean(sharpes))
     std_sharpe  = float(np.std(sharpes, ddof=1)) if n > 1 else 0.0
+    avg_pf      = float(np.mean(pfs))
     pct_prof    = profitable / n
 
     # Coefficient of variation (meaningful only when mean_pnl > 0)
     pnl_cv: Optional[float] = (
         round(std_pnl / mean_pnl, 4) if mean_pnl > 0 else None
     )
+    pnl_cv_val = pnl_cv if pnl_cv is not None else float("inf")
 
     # t-statistic of fold PnLs
     t_stat: Optional[float] = (
@@ -631,16 +685,32 @@ def _aggregate(folds: list[FoldResult]) -> dict:
         if (n > 1 and std_pnl > 0)
         else None
     )
+    t_stat_val = t_stat if t_stat is not None else 0.0
 
-    # Stability verdict
-    if pct_prof >= 0.70 and (t_stat or 0.0) >= 1.65:
-        verdict = "STABLE"
-    elif pct_prof >= 0.60 and total_pnl > 0:
+    # ── Funded-account readiness verdict ─────────────────────────────────
+    # Rules listed in decreasing order of strictness.
+    # A strategy must pass ALL conditions for each tier.
+    if (
+        pct_prof >= _FUNDED_MIN_PCT_PROF
+        and avg_pf >= _FUNDED_MIN_PF
+        and pnl_cv_val <= _FUNDED_MAX_CV
+        and t_stat_val >= _FUNDED_MIN_TSTAT
+    ):
+        verdict = "FUNDED-READY"
+    elif (
+        pct_prof >= _PROMISING_MIN_PCT_PROF
+        and avg_pf >= _PROMISING_MIN_PF
+        and pnl_cv_val <= _PROMISING_MAX_CV
+        and total_pnl > 0
+    ):
         verdict = "PROMISING"
-    elif pct_prof >= 0.40:
-        verdict = "MIXED"
+    elif (
+        pct_prof >= _MARGINAL_MIN_PCT_PROF
+        and avg_pf >= _MARGINAL_MIN_PF
+    ):
+        verdict = "MARGINAL"
     else:
-        verdict = "UNSTABLE"
+        verdict = "NOT READY"
 
     return {
         # Returns
@@ -655,22 +725,24 @@ def _aggregate(folds: list[FoldResult]) -> dict:
         "avg_win_rate":           round(float(np.mean(win_rates)), 4),
         "median_win_rate":        round(float(np.median(win_rates)), 4),
         # Profit factor
-        "avg_profit_factor":      round(float(np.mean(pfs)), 4),
+        "avg_profit_factor":      round(avg_pf, 4),
         "median_profit_factor":   round(float(np.median(pfs)), 4),
         # Risk-adjusted returns
         "avg_sharpe":             round(mean_sharpe, 4),
         "std_sharpe":             round(std_sharpe, 4),
         "avg_sortino":            round(float(np.mean(sortinos)), 4),
-        # Drawdown
+        # Drawdown (% is always relative to starting_equity — no exploding values)
         "avg_max_drawdown_usd":   round(float(np.mean(mdd_usd)), 2),
         "avg_max_drawdown_pct":   round(float(np.mean(mdd_pct)), 4),
         "worst_drawdown_pct":     round(float(min(mdd_pct)), 4),
         # Activity
         "avg_expectancy_usd":     round(float(np.mean(expectancy)), 2),
         "avg_trades_per_day":     round(float(np.mean(tpd)), 2),
-        # Stability
+        # Stability / robustness
         "pnl_cv":                 pnl_cv,
         "t_stat_pnl":             t_stat,
+        "funded_ready":           verdict,
+        # Legacy alias so old JSON reports / tests still work
         "stability":              verdict,
         "n_folds":                n,
     }
@@ -680,15 +752,23 @@ def _aggregate(folds: list[FoldResult]) -> dict:
 # Display helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Emoji-free verdict labels and their one-line assessment
+_VERDICT_LINES = {
+    "FUNDED-READY": "FUNDED-READY  — Passes all funded-account robustness criteria.",
+    "PROMISING":    "PROMISING     — Positive OOS expectancy; tighten further before live.",
+    "MARGINAL":     "MARGINAL      — Marginally profitable; not ready for funded trading.",
+    "NOT READY":    "NOT READY     — Fails minimum robustness criteria. Do not trade live.",
+}
+
 
 def _print_summary(result: WalkForwardSummary) -> None:
-    W = 90
-    bar = "═" * W
+    W = 92
+    bar = "=" * W
 
     print(f"\n{bar}")
     print(
-        f"  WALK-FORWARD VALIDATION – {result.symbol}"
-        f"   mode={result.mode}   n_folds={result.n_folds}"
+        f"  WALK-FORWARD VALIDATION  |  {result.symbol}"
+        f"  |  mode={result.mode}  |  n_folds={result.n_folds}"
     )
     print(bar)
 
@@ -697,19 +777,20 @@ def _print_summary(result: WalkForwardSummary) -> None:
     hdr = (
         f"  {'Fold':>4}  {'Test period':<{col_w}}  {'Bars':>5}  "
         f"{'Trd':>4}  {'Net PnL ($)':>11}  {'WR%':>5}  "
-        f"{'PF':>5}  {'Sharpe':>6}  {'MaxDD%':>7}  "
+        f"{'PF':>5}  {'Sharpe':>6}  {'MaxDD%':>7}  {'MaxDD($)':>10}"
     )
-    sep = "  " + "─" * (len(hdr) - 2)
+    sep = "  " + "-" * (len(hdr) - 2)
     print(hdr)
     print(sep)
 
     for f in result.folds:
-        period = f"{f.test_start[:10]}→{f.test_end[:10]}"
-        ok     = "✓" if f.profitable else "✗"
+        period = f"{f.test_start[:10]}>{f.test_end[:10]}"
+        ok     = "[+]" if f.profitable else "[-]"
         print(
             f"  {f.fold_idx:>4}  {period:<{col_w}}  {f.test_bars:>5}  "
             f"{f.n_trades:>4}  {f.net_pnl:>+11.2f}  {f.win_rate:>5.1%}  "
-            f"{f.profit_factor:>5.2f}  {f.sharpe:>6.3f}  {f.max_drawdown_pct:>7.2f}  "
+            f"{f.profit_factor:>5.2f}  {f.sharpe:>6.3f}  "
+            f"{f.max_drawdown_pct:>6.2f}%  {f.max_drawdown_usd:>+10.2f}  "
             f"{ok}"
         )
 
@@ -728,48 +809,74 @@ def _print_summary(result: WalkForwardSummary) -> None:
         f"{agg['avg_win_rate']:>5.1%}  "
         f"{agg['avg_profit_factor']:>5.2f}  "
         f"{agg['avg_sharpe']:>6.3f}  "
-        f"{agg['avg_max_drawdown_pct']:>7.2f}  "
+        f"{agg['avg_max_drawdown_pct']:>6.2f}%  "
+        f"{agg['avg_max_drawdown_usd']:>+10.2f}"
     )
 
     # Aggregate block
-    lbl = 34
-    print(f"\n  {'AGGREGATE PERFORMANCE':─<{W - 4}}")
+    lbl = 36
+    print(f"\n  {'AGGREGATE PERFORMANCE':-<{W - 4}}")
     print(f"  {'Profitable folds':{lbl}}: "
           f"{agg['n_profitable_folds']} / {agg['n_folds']}  "
           f"({agg['pct_profitable_folds']:.0%})")
     print(f"  {'Total net P&L':{lbl}}: ${agg['total_net_pnl']:>+,.2f}")
     print(f"  {'Avg net P&L / fold':{lbl}}: ${agg['avg_net_pnl_per_fold']:>+,.2f}"
-          f"  ± ${agg['std_net_pnl']:,.2f}")
+          f"  +/- ${agg['std_net_pnl']:,.2f}")
     print(f"  {'Avg profit factor':{lbl}}: {agg['avg_profit_factor']:.3f}"
-          f"  (median {agg['median_profit_factor']:.3f})")
+          f"  (median {agg['median_profit_factor']:.3f})"
+          f"  [funded-account target >= 1.50]")
     print(f"  {'Avg win rate':{lbl}}: {agg['avg_win_rate']:.1%}"
           f"  (median {agg['median_win_rate']:.1%})")
-    print(f"  {'Avg Sharpe':{lbl}}: {agg['avg_sharpe']:.3f}"
+    print(f"  {'Avg Sharpe (annualised)':{lbl}}: {agg['avg_sharpe']:.3f}"
           f"  (std {agg['std_sharpe']:.3f})")
     print(f"  {'Avg Sortino':{lbl}}: {agg['avg_sortino']:.3f}")
     print(f"  {'Avg max drawdown':{lbl}}: {agg['avg_max_drawdown_pct']:.2f}%"
+          f"  / ${agg['avg_max_drawdown_usd']:+,.2f}"
           f"  (worst {agg['worst_drawdown_pct']:.2f}%)")
     print(f"  {'Avg trades / day':{lbl}}: {agg['avg_trades_per_day']:.2f}")
     print(f"  {'Avg expectancy / trade':{lbl}}: ${agg['avg_expectancy_usd']:+.2f}")
 
     # Stability block
-    pnl_cv_str  = (f"{agg['pnl_cv']:.3f}"
-                   if agg.get("pnl_cv") is not None
-                   else "n/a (mean PnL ≤ 0)")
-    t_stat_str  = (f"{agg['t_stat_pnl']:.2f}"
-                   if agg.get("t_stat_pnl") is not None
-                   else "n/a (< 2 folds)")
-    verdict     = agg["stability"]
+    pnl_cv_str = (f"{agg['pnl_cv']:.3f}"
+                  if agg.get("pnl_cv") is not None
+                  else "n/a (mean PnL <= 0)")
+    t_stat_str = (f"{agg['t_stat_pnl']:.2f}"
+                  if agg.get("t_stat_pnl") is not None
+                  else "n/a (< 2 folds)")
+    verdict    = agg.get("funded_ready", agg.get("stability", "UNKNOWN"))
 
-    print(f"\n  {'STABILITY':─<{W - 4}}")
-    print(f"  {'PnL coeff. of variation':{lbl}}: {pnl_cv_str}"
-          f"  [target < 1.5]")
+    print(f"\n  {'ROBUSTNESS / STABILITY':-<{W - 4}}")
+    print(f"  {'PnL coeff. of variation (CV)':{lbl}}: {pnl_cv_str}"
+          f"  [funded-account target <= 1.0]")
     print(f"  {'Sharpe std across folds':{lbl}}: {agg['std_sharpe']:.3f}"
           f"  [target < 0.40]")
     print(f"  {'PnL t-statistic':{lbl}}: {t_stat_str}"
-          f"  [> 1.65 → 95% significance]")
-    print(f"  {'Stability assessment':{lbl}}: {verdict}")
+          f"  [>= 1.65 -> 95% significance]")
+
+    # Funded-readiness verdict box
+    verdict_line = _VERDICT_LINES.get(verdict, f"UNKNOWN ({verdict})")
+    print(f"\n  {'FUNDED-ACCOUNT READINESS':-<{W - 4}}")
+    print(f"\n    >> {verdict_line}\n")
+    print(f"  {'Criteria (all must pass for FUNDED-READY)':{lbl}}")
+    pct_ok  = agg['pct_profitable_folds'] >= _FUNDED_MIN_PCT_PROF
+    pf_ok   = agg['avg_profit_factor'] >= _FUNDED_MIN_PF
+    cv_ok   = (agg.get('pnl_cv') is not None and agg['pnl_cv'] <= _FUNDED_MAX_CV)
+    tst_ok  = (agg.get('t_stat_pnl') is not None
+               and agg['t_stat_pnl'] >= _FUNDED_MIN_TSTAT)
+    _pass_fail(f"  Profitable folds >= {_FUNDED_MIN_PCT_PROF:.0%}",
+               pct_ok, f"{agg['pct_profitable_folds']:.0%}", lbl)
+    _pass_fail(f"  Avg profit factor >= {_FUNDED_MIN_PF:.2f}",
+               pf_ok, f"{agg['avg_profit_factor']:.3f}", lbl)
+    _pass_fail(f"  PnL CV <= {_FUNDED_MAX_CV:.1f}",
+               cv_ok, pnl_cv_str, lbl)
+    _pass_fail(f"  PnL t-stat >= {_FUNDED_MIN_TSTAT:.2f}",
+               tst_ok, t_stat_str, lbl)
     print(f"{bar}\n")
+
+
+def _pass_fail(label: str, passed: bool, value: str, lbl_width: int) -> None:
+    mark = "PASS" if passed else "FAIL"
+    print(f"    [{mark}]  {label:{lbl_width - 4}}: {value}")
 
 
 def _save_report(symbol: str, result: WalkForwardSummary) -> None:
@@ -787,7 +894,7 @@ def _save_report(symbol: str, result: WalkForwardSummary) -> None:
     }
     with open(out_path, "w") as fp:
         json.dump(data, fp, indent=2, default=str)
-    log.info("Walk-forward report → %s", out_path)
+    log.info("Walk-forward report -> %s", out_path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
