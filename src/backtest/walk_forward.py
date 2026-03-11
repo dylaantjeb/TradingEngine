@@ -168,12 +168,12 @@ def _train_on_slice(symbol: str, train_slice: pd.DataFrame, n_trials: int) -> No
     from src.training.train import _build_model   # reuse internal helper
 
     feat_cols = [c for c in train_slice.columns if c != "label"]
-    X = train_slice[feat_cols].values
-    y = train_slice["label"].values
+    X_df = train_slice[feat_cols]   # keep as DataFrame so scaler stores feature_names_in_
+    y    = train_slice["label"].values
 
     from sklearn.preprocessing import RobustScaler
     scaler = RobustScaler()
-    X_scaled = scaler.fit_transform(X)
+    X_scaled = scaler.fit_transform(X_df)
 
     # Minimal training – use default params for speed in walk-forward
     import xgboost as xgb
@@ -205,8 +205,9 @@ def _train_on_slice(symbol: str, train_slice: pd.DataFrame, n_trials: int) -> No
     joblib.dump(scaler, arts / "scalers" / f"{symbol}_scaler.joblib")
 
     inv_label_map = {str(i): int(cls) for i, cls in enumerate(le.classes_)}
+    feat_cols_list = list(X_df.columns)
     with open(arts / "schema" / f"{symbol}_features.json", "w") as f:
-        json.dump({"feature_names": feat_cols, "inv_label_map": inv_label_map}, f)
+        json.dump({"feature_names": feat_cols_list, "inv_label_map": inv_label_map}, f)
 
 
 def _backtest_on_slice(symbol: str, test_slice: pd.DataFrame) -> dict:
@@ -215,9 +216,6 @@ def _backtest_on_slice(symbol: str, test_slice: pd.DataFrame) -> dict:
 
     cfg = _load_cfg(symbol)
 
-    feat_cols = [c for c in test_slice.columns if c != "label"]
-    X = test_slice[feat_cols].values
-
     import joblib
     arts = Path("artifacts")
     model  = joblib.load(arts / "models"  / f"{symbol}_xgb_best.joblib")
@@ -225,16 +223,50 @@ def _backtest_on_slice(symbol: str, test_slice: pd.DataFrame) -> dict:
     with open(arts / "schema" / f"{symbol}_features.json") as f:
         schema = json.load(f)
 
+    feature_names = schema["feature_names"]
     inv_label_map = {k: int(v) for k, v in schema["inv_label_map"].items()}
-    X_scaled = scaler.transform(X)
+
+    # Pass DataFrame (not .values) to preserve feature_names_in_ → no scaler warning
+    feat_cols = [c for c in test_slice.columns if c != "label" and c in feature_names]
+    X_df     = test_slice[feat_cols]
+    X_scaled = scaler.transform(X_df)
     proba    = model.predict_proba(X_scaled)
     pred_enc = np.argmax(proba, axis=1)
     conf     = np.max(proba, axis=1)
-    signals  = np.array([inv_label_map[str(e)] for e in pred_enc])
-    signals[conf < 0.50] = 0
 
-    trades, equity_curve = _simulate_trades(test_slice, signals, cfg, symbol)
-    metrics = _compute_metrics(trades, equity_curve)
+    sig_arr  = np.array([inv_label_map[str(e)] for e in pred_enc])
+    sig_series   = pd.Series(sig_arr, index=test_slice.index)
+    conf_series  = pd.Series(conf,    index=test_slice.index)
+
+    # Derive open prices and ATR ticks from test_slice
+    tick_size   = float(cfg.get("tick_size", 0.25))
+    multiplier  = float(cfg.get("multiplier", 50.0))
+    commission_rt = 2.0 * float(cfg.get("commission_per_side_usd", 1.50))
+    slippage_pts  = float(cfg.get("slippage_ticks_per_side", 0.5)) * tick_size
+    half_spread   = float(cfg.get("spread_ticks", 1.0)) * 0.5 * tick_size
+    friction_pts  = slippage_pts + half_spread
+
+    if "open" in test_slice.columns:
+        open_prices = test_slice["open"]
+    else:
+        open_prices = test_slice.get("close", pd.Series(5000.0, index=test_slice.index))
+
+    atr_ticks = pd.Series(20.0, index=test_slice.index)
+    if "atr_14" in test_slice.columns and "close" in test_slice.columns:
+        atr_ticks = (test_slice["atr_14"] * test_slice["close"] / tick_size).fillna(20.0)
+
+    trades, equity_curve, cost_summary = _simulate_trades(
+        signals      = sig_series,
+        open_prices  = open_prices,
+        atr_ticks    = atr_ticks,
+        cfg          = cfg,
+        friction_pts = friction_pts,
+        commission_rt= commission_rt,
+        multiplier   = multiplier,
+        conf_series  = conf_series,
+    )
+    metrics = _compute_metrics(equity_curve, trades, cost_summary)
+    metrics["n_trades"] = len(trades)
     return metrics
 
 

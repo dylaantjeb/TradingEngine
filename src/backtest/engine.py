@@ -15,15 +15,21 @@ Cost model per round trip (one contract)
   exit_fill  = next_open - direction * friction_pts_per_side   (adverse)
   commission = 2 * commission_per_side_usd
 
-  net_pnl = direction * (exit_fill - entry_fill) * multiplier - commission
+  net_pnl = direction * (exit_fill - entry_fill) * multiplier * n_contracts
+          - commission * n_contracts
 
-Throttles applied at signal time
-──────────────────────────────────
-  • max_trades_per_day   : hard ceiling on new entries per calendar day
-  • min_holding_bars     : cannot exit before holding N bars
-  • cooldown_bars_after_exit : bars to wait after exit before re-entering
-  • session filter (UTC hours)
-  • ATR filter (ticks)
+Prop-firm safety filters (applied at signal time)
+──────────────────────────────────────────────────
+  1.  Confidence gating   : model confidence must exceed threshold
+  2.  Session filter      : UTC-hour window
+  3.  News blackout       : configurable HH:MM windows
+  4.  ATR filter          : volatility in-range check
+  5.  Trend filter        : close vs EMA(200) — blocks counter-trend trades
+  6.  Risk gate           : daily halt / kill switch
+  7.  Loss cooldown       : bars to skip after a losing trade
+  8.  Exit cooldown       : bars to skip after any exit
+  9.  Min holding period  : prevent premature exits
+  10. Daily trade cap     : hard ceiling on new entries per calendar day
 
 Report saved to:  artifacts/reports/<SYM>_backtest.json
 """
@@ -35,7 +41,7 @@ import logging
 import sys
 from datetime import datetime, time as dt_time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -45,20 +51,46 @@ log = logging.getLogger(__name__)
 
 _UNIVERSE_CFG_PATH = Path("config/universe.yaml")
 
-# ── Default hardening parameters (overridden by universe.yaml) ────────────────
+# ── Default parameters (overridden by universe.yaml) ──────────────────────────
 _DEFAULTS = {
+    # Execution
     "execution_delay_bars": 1,
+    # Cost model
     "commission_per_side_usd": 1.50,
     "slippage_ticks_per_side": 0.5,
     "spread_ticks": 1.0,
+    # Filters
     "session_start_utc_hour": 9,
     "session_end_utc_hour": 22,
     "atr_min_ticks": 4,
     "atr_max_ticks": 200,
     "news_blackout_windows": [],
-    "max_trades_per_day": 20,
-    "min_holding_bars": 3,
-    "cooldown_bars_after_exit": 2,
+    # Throttles
+    "max_trades_per_day": 6,
+    "min_holding_bars": 5,
+    "cooldown_bars_after_exit": 5,
+    # Confidence gating (0 = disabled — safe default for backward compat)
+    "min_long_confidence": 0.0,
+    "min_short_confidence": 0.0,
+    # Trend filter (disabled by default — safe for backward compat)
+    "trend_filter_enabled": False,
+    "trend_filter_ema_period": 200,
+    # Risk limits (very large = effectively disabled by default)
+    "starting_equity": 100_000.0,
+    "max_daily_loss_usd": 1e15,
+    "max_daily_loss_pct": 1.0,
+    "max_total_drawdown_usd": 1e15,
+    "max_total_drawdown_pct": 1.0,
+    "max_consecutive_losses": 9999,
+    "cooldown_bars_after_loss": 0,
+    # Position sizing
+    "position_sizing_method": "fixed",
+    "fixed_contracts": 1,
+    "risk_per_trade_usd": 500.0,
+    "risk_per_trade_pct": 0.01,
+    "atr_stop_multiplier": 1.5,
+    "max_contracts": 3,
+    "tick_size": 0.25,
 }
 
 
@@ -72,16 +104,39 @@ def _load_universe_cfg() -> dict:
 def _build_run_cfg(universe_cfg: dict, overrides: dict) -> dict:
     """Merge universe.yaml sections + CLI overrides into a flat config dict."""
     cfg = dict(_DEFAULTS)
-    # Merge YAML sections
+    # Core sections
     cfg.update(universe_cfg.get("execution", {}))
     cfg.update(universe_cfg.get("cost_model", {}))
     cfg.update(universe_cfg.get("filters", {}))
     cfg.update(universe_cfg.get("throttles", {}))
+    # Confidence
+    cfg.update(universe_cfg.get("confidence", {}))
+    # Trend filter (nested keys need remapping)
+    tf = universe_cfg.get("trend_filter", {})
+    if "enabled" in tf:
+        cfg["trend_filter_enabled"] = tf["enabled"]
+    if "ema_period" in tf:
+        cfg["trend_filter_ema_period"] = tf["ema_period"]
+    # Risk limits
+    cfg.update(universe_cfg.get("risk_limits", {}))
+    # Position sizing (method key remapped to avoid collision)
+    ps = universe_cfg.get("position_sizing", {})
+    if "method" in ps:
+        cfg["position_sizing_method"] = ps["method"]
+    for k, v in ps.items():
+        if k != "method":
+            cfg[k] = v
     # CLI overrides win
     for k, v in overrides.items():
         if v is not None:
             cfg[k] = v
     return cfg
+
+
+def _load_cfg(symbol: str) -> dict:
+    """Return flat run-config dict for symbol (used by walk_forward)."""
+    universe_cfg = _load_universe_cfg()
+    return _build_run_cfg(universe_cfg, {})
 
 
 def run_backtest(
@@ -123,15 +178,16 @@ def run_backtest(
 
     # ── Contract specs ──────────────────────────────────────────────────────────
     specs = universe_cfg.get("contract_specs", {}).get(symbol, {})
-    tick_size   = float(specs.get("tick_size", 0.25))
+    tick_size   = float(specs.get("tick_size", cfg.get("tick_size", 0.25)))
     tick_value  = float(specs.get("tick_value", 12.50))
     multiplier  = float(specs.get("multiplier", 50))
+    cfg["tick_size"] = tick_size
 
     # ── Derived cost params ─────────────────────────────────────────────────────
     commission_rt     = 2.0 * float(cfg["commission_per_side_usd"])
     slippage_pts      = float(cfg["slippage_ticks_per_side"]) * tick_size
     half_spread_pts   = float(cfg["spread_ticks"]) * 0.5 * tick_size
-    friction_per_side = slippage_pts + half_spread_pts   # adverse pts on each fill
+    friction_per_side = slippage_pts + half_spread_pts
 
     log.info(
         "Cost model [%s]: commission RT=$%.2f | slippage=%.4f pts/side | "
@@ -181,15 +237,17 @@ def run_backtest(
     from src.utils.alignment import check_label_alignment
     check_label_alignment(features, symbol=symbol)
 
-    # ── Generate predictions ────────────────────────────────────────────────────
-    X = features[feature_names].copy()
-    X_scaled = scaler.transform(X)
+    # ── Generate predictions ─────────────────────────────────────────────────
+    # Pass DataFrame (not .values) to preserve feature_names_in_ → no scaler warning
+    X_df = features[feature_names]
+    X_scaled = scaler.transform(X_df)
     proba = model.predict_proba(X_scaled)
     pred_encoded = np.argmax(proba, axis=1)
     lookup = np.array([inv_label_map[str(k)] for k in range(len(inv_label_map))], dtype=np.int8)
     signal = lookup[pred_encoded]
+    confidence = np.max(proba, axis=1)
 
-    # ── Load raw prices (need 'open' for next-bar fills) ───────────────────────
+    # ── Load raw prices (need 'open' for next-bar fills) ──────────────────────
     if raw_path.exists():
         prices = pd.read_csv(raw_path, parse_dates=["timestamp"], index_col="timestamp")
         prices.sort_index(inplace=True)
@@ -207,25 +265,36 @@ def run_backtest(
         common_idx = features.index
         log.warning("No common index between features and prices; using features index only")
 
-    sig_series   = pd.Series(signal, index=features.index).reindex(common_idx)
-    open_prices  = prices["open"].reindex(common_idx) if "open" in prices.columns \
-                   else prices["close"].reindex(common_idx)
-    close_prices = prices["close"].reindex(common_idx)
+    sig_series    = pd.Series(signal, index=features.index).reindex(common_idx)
+    conf_series   = pd.Series(confidence, index=features.index).reindex(common_idx)
+    open_prices   = prices["open"].reindex(common_idx) if "open" in prices.columns \
+                    else prices["close"].reindex(common_idx)
+    close_prices  = prices["close"].reindex(common_idx)
 
-    # ATR in ticks (for filter): atr_14 feature = atr_pts / close
+    # ATR in ticks: atr_14 feature is atr_pts/close
     atr_ticks_series = (
         features["atr_14"].reindex(common_idx) * close_prices / tick_size
     ).fillna(0)
 
+    # ── EMA for trend filter ────────────────────────────────────────────────────
+    ema_series = None
+    if cfg.get("trend_filter_enabled", False):
+        ema_period = int(cfg.get("trend_filter_ema_period", 200))
+        ema_series = close_prices.ewm(span=ema_period, adjust=False).mean()
+        log.info("Trend filter enabled: EMA(%d)", ema_period)
+
     # ── Simulate trades ─────────────────────────────────────────────────────────
     trades, equity_curve, cost_summary = _simulate_trades(
-        signals        = sig_series,
-        open_prices    = open_prices,
-        atr_ticks      = atr_ticks_series,
-        cfg            = cfg,
-        friction_pts   = friction_per_side,
-        commission_rt  = commission_rt,
-        multiplier     = multiplier,
+        signals       = sig_series,
+        open_prices   = open_prices,
+        atr_ticks     = atr_ticks_series,
+        cfg           = cfg,
+        friction_pts  = friction_per_side,
+        commission_rt = commission_rt,
+        multiplier    = multiplier,
+        conf_series   = conf_series,
+        close_prices  = close_prices,
+        ema_series    = ema_series,
     )
 
     # ── Metrics ─────────────────────────────────────────────────────────────────
@@ -292,13 +361,20 @@ def _simulate_trades(
     friction_pts: float,
     commission_rt: float,
     multiplier: float,
+    conf_series: Optional[pd.Series] = None,
+    close_prices: Optional[pd.Series] = None,
+    ema_series: Optional[pd.Series] = None,
 ) -> tuple[list[dict], pd.Series, dict]:
     """
     Bar-by-bar simulation with 1-bar execution delay, full cost model,
-    session/ATR filters, and trade-frequency throttles.
+    10-filter prop-firm safety pipeline, and position sizing.
+
+    Backward compatible: conf_series/close_prices/ema_series are optional.
+    When omitted, those filters are skipped (safe for old test calls).
 
     Signal at bar i → pending order → filled at bar i+1 open.
     """
+    # ── Static config ────────────────────────────────────────────────────────
     delay         = int(cfg.get("execution_delay_bars", 1))
     sess_start    = int(cfg.get("session_start_utc_hour", 0))
     sess_end      = int(cfg.get("session_end_utc_hour", 24))
@@ -309,18 +385,58 @@ def _simulate_trades(
     min_hold      = int(cfg.get("min_holding_bars", 1))
     cooldown_bars = int(cfg.get("cooldown_bars_after_exit", 0))
 
+    # Confidence gating (default 0.0 = no threshold → backward compat)
+    min_long_conf  = float(cfg.get("min_long_confidence", 0.0))
+    min_short_conf = float(cfg.get("min_short_confidence", 0.0))
+
+    # Trend filter (default False → backward compat)
+    trend_filter_on = bool(cfg.get("trend_filter_enabled", False))
+
+    # Risk limits (very large defaults → backward compat)
+    starting_equity        = float(cfg.get("starting_equity", 100_000.0))
+    max_daily_loss_usd     = float(cfg.get("max_daily_loss_usd", 1e15))
+    max_daily_loss_pct     = float(cfg.get("max_daily_loss_pct", 1.0))
+    max_total_dd_usd       = float(cfg.get("max_total_drawdown_usd", 1e15))
+    max_total_dd_pct       = float(cfg.get("max_total_drawdown_pct", 1.0))
+    max_consec_losses      = int(cfg.get("max_consecutive_losses", 9999))
+    loss_cooldown_cfg      = int(cfg.get("cooldown_bars_after_loss", 0))
+
+    # Position sizing
+    ps_method      = str(cfg.get("position_sizing_method", "fixed"))
+    fixed_contracts = int(cfg.get("fixed_contracts", 1))
+    risk_usd       = float(cfg.get("risk_per_trade_usd", 500.0))
+    risk_pct       = float(cfg.get("risk_per_trade_pct", 0.01))
+    atr_stop_mult  = float(cfg.get("atr_stop_multiplier", 1.5))
+    max_contracts  = int(cfg.get("max_contracts", 3))
+    tick_size      = float(cfg.get("tick_size", 0.25))
+
+    # ── Pre-allocate arrays ──────────────────────────────────────────────────
     sig_arr   = signals.values.astype(np.int8)
     open_arr  = open_prices.reindex(signals.index).values.astype(np.float64)
     atr_arr   = atr_ticks.reindex(signals.index).values.astype(np.float64)
     ts_arr    = signals.index
     n         = len(sig_arr)
 
+    conf_arr  = None
+    if conf_series is not None:
+        conf_arr = conf_series.reindex(signals.index).values.astype(np.float64)
+
+    close_arr = None
+    if close_prices is not None:
+        close_arr = close_prices.reindex(signals.index).values.astype(np.float64)
+
+    ema_arr = None
+    if ema_series is not None:
+        ema_arr = ema_series.reindex(signals.index).values.astype(np.float64)
+
     equity_arr = np.zeros(n, dtype=np.float64)
     trades: list[dict] = []
 
-    position    = 0        # current position: -1, 0, +1
+    # ── Mutable state ────────────────────────────────────────────────────────
+    position    = 0        # current: -1, 0, +1
     entry_price = 0.0
     entry_idx   = 0
+    entry_contracts = 1
     equity      = 0.0
     gross_pnl   = 0.0
     total_cost  = 0.0
@@ -329,29 +445,113 @@ def _simulate_trades(
     cooldown_left     = 0
     daily_trade_count = 0
     last_trade_date   = None
-    pending_target    = None   # None=no pending, 0=exit pending, ±1=entry pending
+    pending_target    = None
+    pending_contracts = 1
+
+    # Risk / prop-firm state
+    daily_pnl          = 0.0
+    peak_equity        = 0.0       # max equity achieved (for drawdown)
+    consecutive_losses = 0
+    consec_losses_max  = 0
+    daily_halt         = False
+    kill_switch_active = False
+    loss_cooldown_left = 0
+    daily_halt_count   = 0
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+
+    def _size(atr_t: float) -> int:
+        """Compute position size (contracts) based on sizing method."""
+        if ps_method == "fixed_dollar_risk":
+            atr_pts  = atr_t * tick_size
+            stop_pts = atr_pts * atr_stop_mult
+            if stop_pts > 0 and multiplier > 0:
+                n_c = int(risk_usd / (stop_pts * multiplier))
+            else:
+                n_c = 1
+        elif ps_method == "fixed_pct_risk":
+            total_eq = starting_equity + equity
+            r_usd    = total_eq * risk_pct
+            atr_pts  = atr_t * tick_size
+            stop_pts = atr_pts * atr_stop_mult
+            if stop_pts > 0 and multiplier > 0:
+                n_c = int(r_usd / (stop_pts * multiplier))
+            else:
+                n_c = 1
+        else:  # "fixed"
+            n_c = fixed_contracts
+        return max(1, min(n_c, max_contracts))
+
+    def _update_risk(net_pnl: float, ts) -> None:
+        nonlocal equity, daily_pnl, peak_equity, consecutive_losses, consec_losses_max
+        nonlocal daily_halt, kill_switch_active, loss_cooldown_left, daily_halt_count
+
+        equity    += net_pnl
+        daily_pnl += net_pnl
+        peak_equity = max(peak_equity, equity)
+
+        if net_pnl < 0:
+            consecutive_losses += 1
+            consec_losses_max   = max(consec_losses_max, consecutive_losses)
+            if loss_cooldown_cfg > 0:
+                loss_cooldown_left = loss_cooldown_cfg
+        else:
+            consecutive_losses = 0
+
+        # Daily halt
+        if not daily_halt:
+            total_eq_before = starting_equity + equity - net_pnl
+            daily_loss = -daily_pnl
+            if (daily_loss >= max_daily_loss_usd
+                    or (total_eq_before > 0 and daily_loss / total_eq_before >= max_daily_loss_pct)
+                    or consecutive_losses >= max_consec_losses):
+                daily_halt = True
+                daily_halt_count += 1
+                log.warning(
+                    "[%s] Daily halt triggered — daily_pnl=%.2f consec_losses=%d",
+                    ts, daily_pnl, consecutive_losses,
+                )
+
+        # Kill switch (permanent — does not reset with new day)
+        if not kill_switch_active:
+            drawdown = equity - peak_equity   # negative when in DD
+            dd_base  = starting_equity + peak_equity
+            if (-drawdown >= max_total_dd_usd
+                    or (dd_base > 0 and -drawdown / dd_base >= max_total_dd_pct)):
+                kill_switch_active = True
+                log.warning(
+                    "[%s] Kill switch activated — drawdown=%.2f (peak=%.2f)",
+                    ts, drawdown, peak_equity,
+                )
+
+    # ── Main loop ────────────────────────────────────────────────────────────
 
     for i in range(n):
-        ts      = ts_arr[i]
-        today   = ts.date()
+        ts    = ts_arr[i]
+        today = ts.date()
 
-        # ── Reset daily counter ─────────────────────────────────────────────────
+        # ── Reset daily counters ─────────────────────────────────────────────
         if today != last_trade_date:
             daily_trade_count = 0
             last_trade_date   = today
+            if daily_halt and not kill_switch_active:
+                daily_halt = False   # kill switch stays; daily halt resets
+                log.info("[%s] Daily halt cleared (new trading day)", ts)
+            daily_pnl = 0.0
 
-        # ── STEP 1: Execute pending order from previous bar at open[i] ──────────
+        # ── STEP 1: Execute pending order from previous bar at open[i] ───────
         if pending_target is not None and delay > 0:
             o = open_arr[i]
             if not np.isnan(o):
+                n_c = pending_contracts   # contracts decided at signal time
+
                 if position != 0 and pending_target != position:
                     # Exit (and possibly reverse)
                     exit_fill = o - position * friction_pts
-                    raw_pnl   = position * (exit_fill - entry_price) * multiplier
-                    cost      = commission_rt
+                    raw_pnl   = position * (exit_fill - entry_price) * multiplier * entry_contracts
+                    cost      = commission_rt * entry_contracts
                     net_pnl   = raw_pnl - cost
-                    equity   += net_pnl
-                    gross_pnl += raw_pnl
+                    gross_pnl  += raw_pnl
                     total_cost += cost
                     trades.append({
                         "entry_time":    str(ts_arr[entry_idx]),
@@ -360,115 +560,150 @@ def _simulate_trades(
                         "entry_price":   round(entry_price, 4),
                         "exit_price":    round(exit_fill, 4),
                         "hold_bars":     i - entry_idx,
+                        "n_contracts":   entry_contracts,
                         "gross_pnl":     round(raw_pnl, 2),
                         "cost":          round(cost, 2),
                         "net_pnl":       round(net_pnl, 2),
-                        "equity":        round(equity, 2),
+                        "equity":        round(equity + net_pnl, 2),
                     })
+                    _update_risk(net_pnl, ts)
                     if cooldown_bars > 0:
                         cooldown_left = cooldown_bars
                     position = 0
 
                     if pending_target != 0:
-                        # Immediate reversal into new position
-                        entry_price = o + pending_target * friction_pts
-                        position    = pending_target
-                        entry_idx   = i
+                        # Reversal into new position
+                        entry_price     = o + pending_target * friction_pts
+                        position        = pending_target
+                        entry_idx       = i
+                        entry_contracts = n_c
 
                 elif position == 0 and pending_target != 0:
-                    entry_price = o + pending_target * friction_pts
-                    position    = pending_target
-                    entry_idx   = i
+                    entry_price     = o + pending_target * friction_pts
+                    position        = pending_target
+                    entry_idx       = i
+                    entry_contracts = n_c
 
             pending_target = None
 
-        # For delay=0 (same-bar), we execute the signal immediately below
-        # (pending_target is set and then checked in next iteration, but
-        #  for delay=0 we skip the pending mechanism and fill directly)
-
-        # ── STEP 2: Generate signal at bar i ────────────────────────────────────
+        # ── STEP 2: Generate signal for this bar ──────────────────────────────
         o   = open_arr[i]
         sig = int(sig_arr[i])
         if np.isnan(o):
             equity_arr[i] = equity
             continue
 
-        # Session filter
+        # Filter 1: Confidence gating
+        if conf_arr is not None:
+            conf_t = conf_arr[i] if not np.isnan(conf_arr[i]) else 0.0
+            if sig == 1 and conf_t < min_long_conf:
+                sig = 0
+            elif sig == -1 and conf_t < min_short_conf:
+                sig = 0
+
+        # Filter 2: Session filter
         if not _in_session(ts, sess_start, sess_end):
             sig = 0
 
-        # News blackout
+        # Filter 3: News blackout
         if _in_blackout(ts, blackouts):
             sig = 0
 
-        # ATR filter
+        # Filter 4: ATR filter
         atr_t = atr_arr[i]
         if not (atr_min <= atr_t <= atr_max):
             sig = 0
 
-        # Cooldown after exit
+        # Filter 5: Trend filter (close vs EMA)
+        if trend_filter_on and ema_arr is not None and close_arr is not None:
+            ema_t   = ema_arr[i]
+            close_t = close_arr[i]
+            if not (np.isnan(ema_t) or np.isnan(close_t)):
+                if sig == 1 and close_t < ema_t:    # long blocked (below EMA)
+                    sig = 0
+                elif sig == -1 and close_t > ema_t: # short blocked (above EMA)
+                    sig = 0
+
+        # Filter 6: Risk gate — kill switch / daily halt
+        if kill_switch_active or daily_halt:
+            if position == 0:
+                sig = 0   # no new entries
+            elif sig * position < 0:
+                sig = 0   # convert reversal to plain exit
+
+        # Filter 7: Loss cooldown (after losing trade)
+        if loss_cooldown_left > 0:
+            loss_cooldown_left -= 1
+            if position == 0:
+                sig = 0
+
+        # Filter 8: Exit cooldown (after any exit)
         if cooldown_left > 0:
             cooldown_left -= 1
             if position == 0:
                 sig = 0
 
-        # Minimum holding period – force hold, don't change signal
+        # Filter 9: Minimum holding period
         if position != 0 and (i - entry_idx) < min_hold:
-            sig = position   # stay in current direction
+            sig = position   # force hold
 
-        # Daily trade cap: limits new position initiations (entries + reversals).
-        # A reversal (long→short or short→long) counts as one new entry.
-        # A pure exit (→flat) does NOT count against the cap.
+        # Filter 10: Daily trade cap
         if sig != 0 and sig != position and daily_trade_count >= max_tpd:
-            if position == 0:
-                sig = 0           # block new entry from flat
-            else:
-                sig = position    # block reversal: force hold
+            sig = 0 if position == 0 else position
 
-        # Determine target position
-        target = int(sig)   # desired state: -1, 0, or +1
+        # ── Determine target and queue ────────────────────────────────────────
+        target = int(sig)
 
         if delay == 0:
-            # Same-bar fill (leaky mode – only for debug)
+            # Same-bar fill (leaky debug mode)
             if target != position:
                 if position != 0:
                     exit_fill = o - position * friction_pts
-                    raw_pnl   = position * (exit_fill - entry_price) * multiplier
-                    cost      = commission_rt
+                    raw_pnl   = position * (exit_fill - entry_price) * multiplier * entry_contracts
+                    cost      = commission_rt * entry_contracts
                     net_pnl   = raw_pnl - cost
-                    equity   += net_pnl
-                    gross_pnl += raw_pnl
+                    gross_pnl  += raw_pnl
                     total_cost += cost
                     trades.append({
-                        "entry_time": str(ts_arr[entry_idx]),
-                        "exit_time":  str(ts),
-                        "direction":  position,
+                        "entry_time":  str(ts_arr[entry_idx]),
+                        "exit_time":   str(ts),
+                        "direction":   position,
                         "entry_price": round(entry_price, 4),
                         "exit_price":  round(exit_fill, 4),
                         "hold_bars":   i - entry_idx,
-                        "gross_pnl":  round(raw_pnl, 2),
-                        "cost":       round(cost, 2),
-                        "net_pnl":    round(net_pnl, 2),
-                        "equity":     round(equity, 2),
+                        "n_contracts": entry_contracts,
+                        "gross_pnl":   round(raw_pnl, 2),
+                        "cost":        round(cost, 2),
+                        "net_pnl":     round(net_pnl, 2),
+                        "equity":      round(equity + net_pnl, 2),
                     })
+                    _update_risk(net_pnl, ts)
                     position = 0
                 if target != 0:
-                    entry_price = o + target * friction_pts
-                    position    = target
-                    entry_idx   = i
+                    n_c         = _size(atr_t)
+                    entry_price     = o + target * friction_pts
+                    position        = target
+                    entry_idx       = i
+                    entry_contracts = n_c
         else:
-            # Normal delayed execution: queue order for next bar
+            # Normal delayed execution: queue for next bar
             if target != position and i < n - 1:
-                pending_target = target
-                # Count both entries (flat→dir) and reversals (dir→-dir)
+                pending_target    = target
+                pending_contracts = _size(atr_t) if target != 0 else entry_contracts
                 if target != 0:
                     daily_trade_count += 1
 
         equity_arr[i] = equity
 
     equity_series = pd.Series(equity_arr, index=signals.index, name="equity")
-    cost_summary  = {"gross_pnl": gross_pnl, "total_costs": total_cost,
-                     "net_pnl": gross_pnl - total_cost}
+    cost_summary  = {
+        "gross_pnl":              gross_pnl,
+        "total_costs":            total_cost,
+        "net_pnl":                gross_pnl - total_cost,
+        "consecutive_losses_max": consec_losses_max,
+        "kill_switch_triggered":  kill_switch_active,
+        "daily_halt_count":       daily_halt_count,
+    }
     return trades, equity_series, cost_summary
 
 
@@ -487,14 +722,18 @@ def _compute_metrics(
             "profit_factor": 0.0, "gross_pnl": 0.0, "total_costs": 0.0,
             "net_pnl": 0.0, "trades_per_day": 0.0,
             "avg_trade_duration_bars": 0.0, "rolling_sharpe_20d": None,
+            "max_drawdown_usd": 0.0,
+            "consecutive_losses_max": cost_summary.get("consecutive_losses_max", 0),
+            "kill_switch_triggered": cost_summary.get("kill_switch_triggered", False),
+            "daily_halt_count": cost_summary.get("daily_halt_count", 0),
         }
 
-    net_pnls  = [t["net_pnl"]  for t in trades]
+    net_pnls   = [t["net_pnl"]   for t in trades]
     gross_pnls = [t["gross_pnl"] for t in trades]
     hold_bars  = [t["hold_bars"] for t in trades]
     total_pnl  = sum(net_pnls)
-    wins   = [p for p in net_pnls if p > 0]
-    losses = [p for p in net_pnls if p <= 0]
+    wins       = [p for p in net_pnls if p > 0]
+    losses     = [p for p in net_pnls if p <= 0]
     win_rate      = len(wins) / len(net_pnls)
     expectancy    = float(np.mean(net_pnls))
     profit_factor = (sum(wins) / (abs(sum(losses)) + 1e-9)) if losses else float("inf")
@@ -523,7 +762,7 @@ def _compute_metrics(
     else:
         trades_per_day = float(len(trades))
 
-    # Rolling Sharpe (20 trading days on daily equity returns)
+    # Rolling Sharpe (20 trading days)
     rolling_sharpe_20d = None
     try:
         daily_eq  = equity.resample("D").last().dropna()
@@ -550,13 +789,16 @@ def _compute_metrics(
         "profit_factor":             round(float(profit_factor), 4),
         "avg_trade_duration_bars":   round(float(np.mean(hold_bars)), 1),
         "trades_per_day":            round(trades_per_day, 2),
+        "consecutive_losses_max":    cost_summary.get("consecutive_losses_max", 0),
+        "kill_switch_triggered":     cost_summary.get("kill_switch_triggered", False),
+        "daily_halt_count":          cost_summary.get("daily_halt_count", 0),
     }
 
 
 def _print_metrics_table(symbol: str, metrics: dict) -> None:
     width = 60
     print(f"\n{'='*width}")
-    print(f"  {symbol} backtest results  (hardened: 1-bar delay)")
+    print(f"  {symbol} backtest results  (hardened: 1-bar delay, prop-firm rules)")
     print(f"{'='*width}")
     ordered = [
         ("total_pnl_usd",           "Net P&L ($)"),
@@ -574,6 +816,9 @@ def _print_metrics_table(symbol: str, metrics: dict) -> None:
         ("trades_per_day",          "Trades / day"),
         ("n_trades",                "Total trades"),
         ("n_bars",                  "Bars evaluated"),
+        ("consecutive_losses_max",  "Max consec. losses"),
+        ("kill_switch_triggered",   "Kill switch triggered"),
+        ("daily_halt_count",        "Daily halts"),
     ]
     for key, label in ordered:
         val = metrics.get(key, "—")
