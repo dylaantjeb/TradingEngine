@@ -137,15 +137,19 @@ def cmd_live_paper(args: argparse.Namespace) -> None:
 
 
 def cmd_walk_forward(args: argparse.Namespace) -> None:
-    """Run walk-forward validation (rolling train/test windows)."""
+    """Run walk-forward / OOS validation."""
     from src.backtest.walk_forward import run_walk_forward
+
+    n_trials = 0 if getattr(args, "no_optuna", False) else args.trials
 
     run_walk_forward(
         symbol=args.symbol,
+        mode=args.mode,
         train_bars=args.train_bars,
         test_bars=args.test_bars,
         step_bars=args.step_bars,
-        n_trials=args.trials,
+        split_pct=args.split_pct,
+        n_trials=n_trials,
         save_report=True,
     )
 
@@ -304,11 +308,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_live.set_defaults(func=cmd_live_paper)
 
     # ── walk-forward ───────────────────────────────────────────────────────────
-    p_wf = sub.add_parser("walk-forward", help="Walk-forward validation (rolling train/test)")
+    p_wf = sub.add_parser(
+        "walk-forward",
+        help="Walk-forward / OOS validation (rolling | expanding | split)",
+    )
     p_wf.add_argument("--symbol", required=True)
     p_wf.add_argument(
+        "--mode", default="rolling", choices=["rolling", "expanding", "split"],
+        help=(
+            "Validation mode: 'rolling' (fixed train window slides forward), "
+            "'expanding' (train window grows from origin), "
+            "'split' (single time-based train/test cut). Default: rolling"
+        ),
+    )
+    p_wf.add_argument(
         "--train-bars", dest="train_bars", type=int, default=10_000,
-        help="Bars in each training window (default 10000)",
+        help="Bars in each training window – rolling/expanding (default 10000)",
     )
     p_wf.add_argument(
         "--test-bars", dest="test_bars", type=int, default=2_000,
@@ -316,11 +331,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_wf.add_argument(
         "--step-bars", dest="step_bars", type=int, default=None,
-        help="Step between windows (default = test_bars → non-overlapping)",
+        help="Step between folds (default = test_bars → non-overlapping test windows)",
+    )
+    p_wf.add_argument(
+        "--split-pct", dest="split_pct", type=float, default=0.8,
+        help="Fraction of data used for training in split mode (default 0.8)",
     )
     p_wf.add_argument(
         "--trials", type=int, default=10,
-        help="Optuna trials per window (default 10)",
+        help="Optuna trials per fold – ignored when --no-optuna is set (default 10)",
+    )
+    p_wf.add_argument(
+        "--no-optuna", dest="no_optuna", action="store_true",
+        help="Skip Optuna; use fast fixed hyperparameters (recommended for many folds)",
     )
     p_wf.set_defaults(func=cmd_walk_forward)
 

@@ -1,259 +1,562 @@
 """
-Walk-forward validation for TradingEngine.
+Walk-forward (time-series cross-validation) for TradingEngine.
 
-Splits the dataset into rolling train/test windows, trains a fresh model
-on each train window, then runs the backtest on the following test window.
-Aggregates per-window metrics and prints a summary table.
+Three modes
+-----------
+  rolling  : fixed-size train window slides forward with each fold  (default)
+  expanding: anchored train window grows with each fold (anchored at t=0)
+  split    : single train/test cut by time fraction (simplest OOS test)
+
+Leakage guarantees
+------------------
+  • Model and RobustScaler are fit ONLY on the train slice for each fold.
+  • Production artifacts (artifacts/) are NEVER written during walk-forward;
+    per-fold training runs entirely in memory.
+  • Test slice timestamps are strictly greater than train slice timestamps
+    (enforced by integer-index slicing on a time-sorted DataFrame).
+  • EMA(200) for the trend filter is computed on the full close series so
+    every test window has proper warm-up history before its first bar.
+  • Raw prices for execution fills come from data/raw/<symbol>_M1.csv;
+    if the file is absent a close-only proxy is used with a logged warning.
+
+Stability metrics reported
+--------------------------
+  pct_profitable_folds : fraction of folds with net_pnl > 0
+  pnl_cv               : coeff. of variation of fold PnLs (lower = more stable)
+  std_sharpe           : std of fold Sharpe ratios        (lower = more stable)
+  t_stat_pnl           : t-statistic of fold PnLs         (>1.65 → 95% sig.)
+  stability            : STABLE | PROMISING | MIXED | UNSTABLE
 
 Usage
 -----
-python -m src.cli walk-forward --symbol ES --train-bars 10000 --test-bars 2000
+  # rolling (default) – fixed train window slides forward
+  python -m src.cli walk-forward --symbol ES
+
+  # expanding – train window grows from origin
+  python -m src.cli walk-forward --symbol ES --mode expanding \\
+      --train-bars 8000 --test-bars 2000
+
+  # single train/test split (80/20)
+  python -m src.cli walk-forward --symbol ES --mode split --split-pct 0.8
+
+  # skip Optuna → fast fixed hyperparameters (recommended for many folds)
+  python -m src.cli walk-forward --symbol ES --no-optuna
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
+import math
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pandas as pd
+import yaml
 
 log = logging.getLogger(__name__)
 
+_ARTS = Path("artifacts")
+_UNIVERSE_CFG = Path("config/universe.yaml")
 
-@dataclass
-class WindowResult:
-    window_idx: int
-    train_start: str
-    train_end: str
-    test_start: str
-    test_end: str
-    n_trades: int
-    net_pnl: float
-    win_rate: float
-    profit_factor: float
-    sharpe: float
-    max_drawdown: float
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data structures
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 @dataclass
-class WalkForwardResult:
-    symbol: str
-    n_windows: int
-    windows: list[WindowResult] = field(default_factory=list)
-    aggregate: dict = field(default_factory=dict)
+class FoldResult:
+    """Per-fold backtest results."""
+    fold_idx:             int
+    mode:                 str
+    train_start:          str
+    train_end:            str
+    train_bars:           int
+    test_start:           str
+    test_end:             str
+    test_bars:            int
+    n_trades:             int   = 0
+    net_pnl:              float = 0.0
+    gross_pnl:            float = 0.0
+    win_rate:             float = 0.0
+    profit_factor:        float = 0.0
+    sharpe:               float = 0.0
+    sortino:              float = 0.0
+    max_drawdown_usd:     float = 0.0
+    max_drawdown_pct:     float = 0.0
+    expectancy_usd:       float = 0.0
+    avg_hold_bars:        float = 0.0
+    trades_per_day:       float = 0.0
+    consecutive_losses_max: int = 0
+    profitable:           bool  = False
+
+
+@dataclass
+class WalkForwardSummary:
+    symbol:     str
+    mode:       str
+    n_folds:    int
+    train_bars: int
+    test_bars:  int
+    folds:      list[FoldResult] = field(default_factory=list)
+    aggregate:  dict             = field(default_factory=dict)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def run_walk_forward(
     symbol: str,
+    mode: str = "rolling",
     train_bars: int = 10_000,
     test_bars: int = 2_000,
     step_bars: Optional[int] = None,
-    n_trials: int = 10,
+    min_train_bars: Optional[int] = None,
+    split_pct: float = 0.8,
+    n_trials: int = 0,
     save_report: bool = True,
-) -> WalkForwardResult:
+) -> WalkForwardSummary:
     """
-    Run walk-forward validation.
+    Run walk-forward / OOS validation.
 
     Parameters
     ----------
-    symbol      : Symbol to use (must have data/processed/<symbol>_*.parquet).
-    train_bars  : Number of bars in each training window.
-    test_bars   : Number of bars in each test window.
-    step_bars   : Step between windows (default = test_bars → non-overlapping).
-    n_trials    : Optuna trials per window training.
-    save_report : Save JSON report to artifacts/reports/.
+    symbol        : Symbol to validate (must have data/processed/ parquets).
+    mode          : 'rolling' | 'expanding' | 'split'.
+    train_bars    : Training window size in bars (rolling / expanding).
+    test_bars     : Test window size in bars.
+    step_bars     : Step between folds (default = test_bars → non-overlapping).
+    min_train_bars: Expanding mode: minimum initial training size
+                    (default = train_bars).
+    split_pct     : Split mode: fraction of dataset used for training
+                    (default 0.8).
+    n_trials      : Optuna trials per fold (0 = fast fixed hyperparameters;
+                    recommended for walk-forward with many folds).
+    save_report   : Write JSON report to artifacts/reports/.
+
+    Returns
+    -------
+    WalkForwardSummary with per-fold FoldResult objects and aggregate metrics.
     """
-    from src.training.train import train as _train
-    from src.backtest.engine import run_backtest
+    if mode not in ("rolling", "expanding", "split"):
+        raise ValueError(
+            f"mode must be 'rolling', 'expanding', or 'split', got {mode!r}"
+        )
 
-    step_bars = step_bars or test_bars
+    step    = step_bars    or test_bars
+    min_tr  = min_train_bars or train_bars
 
+    # ── Load features + labels ─────────────────────────────────────────────
     feat_path = Path(f"data/processed/{symbol}_features.parquet")
     lbl_path  = Path(f"data/processed/{symbol}_labels.parquet")
-
-    if not feat_path.exists() or not lbl_path.exists():
-        raise FileNotFoundError(
-            f"Processed data not found for {symbol}.  "
-            "Run:  python -m src.cli build-dataset --symbol ES --input <csv>"
-        )
+    for p in (feat_path, lbl_path):
+        if not p.exists():
+            raise FileNotFoundError(
+                f"Processed data not found: {p}\n"
+                f"Run:  python -m src.cli build-dataset --symbol {symbol} --input <csv>"
+            )
 
     features = pd.read_parquet(feat_path)
     labels   = pd.read_parquet(lbl_path)
+    aligned  = features.join(labels[["label"]], how="inner").sort_index()
+    n_total  = len(aligned)
 
-    aligned = features.join(labels[["label"]], how="inner")
-    aligned = aligned.sort_index()
-    n_total = len(aligned)
+    feature_names = [c for c in aligned.columns if c != "label"]
 
     log.info(
-        "Walk-forward: %d total bars | train=%d test=%d step=%d",
-        n_total, train_bars, test_bars, step_bars,
+        "Walk-forward [%s] %s → %s  |  %d bars  |  %d features  |  mode=%s",
+        symbol,
+        aligned.index[0].date(), aligned.index[-1].date(),
+        n_total, len(feature_names), mode,
     )
 
-    windows: list[WindowResult] = []
-    start_idx = 0
-    window_idx = 0
+    # ── Raw prices + EMA (computed once on full series) ────────────────────
+    raw_prices, full_ema = _load_prices(symbol, aligned.index)
 
-    while start_idx + train_bars + test_bars <= n_total:
-        train_slice = aligned.iloc[start_idx : start_idx + train_bars]
-        test_slice  = aligned.iloc[start_idx + train_bars : start_idx + train_bars + test_bars]
+    # ── Engine config ──────────────────────────────────────────────────────
+    from src.backtest.engine import _load_cfg
+    cfg   = _load_cfg(symbol)
+    specs = _load_specs(symbol)
 
-        log.info(
-            "Window %d: train [%s → %s] | test [%s → %s]",
-            window_idx,
-            train_slice.index[0], train_slice.index[-1],
-            test_slice.index[0],  test_slice.index[-1],
+    # ── Build fold index tuples ────────────────────────────────────────────
+    if mode == "rolling":
+        fold_ranges = _build_folds_rolling(n_total, train_bars, test_bars, step)
+    elif mode == "expanding":
+        fold_ranges = _build_folds_expanding(n_total, min_tr, test_bars, step)
+    else:  # split
+        fold_ranges = _build_folds_split(n_total, split_pct)
+
+    if not fold_ranges:
+        raise ValueError(
+            f"No folds could be built: need ≥ {train_bars + test_bars} bars, "
+            f"have {n_total}."
         )
 
-        # ── Retrain on this window ─────────────────────────────────────────────
+    log.info(
+        "%d fold(s) created  (mode=%s  train=%d  test=%d  step=%d)",
+        len(fold_ranges), mode, train_bars, test_bars, step,
+    )
+
+    # ── Main fold loop ─────────────────────────────────────────────────────
+    folds: list[FoldResult] = []
+
+    for fold_idx, (tr_s, tr_e, te_s, te_e) in enumerate(fold_ranges):
+        train_df = aligned.iloc[tr_s:tr_e]
+        test_df  = aligned.iloc[te_s:te_e]
+
+        log.info(
+            "Fold %d/%d  train [%s → %s, %d bars]  test [%s → %s, %d bars]",
+            fold_idx + 1, len(fold_ranges),
+            train_df.index[0].date(), train_df.index[-1].date(), len(train_df),
+            test_df.index[0].date(),  test_df.index[-1].date(),  len(test_df),
+        )
+
+        # ── Train (in-memory; no disk writes) ─────────────────────────────
         try:
-            _train_on_slice(symbol, train_slice, n_trials)
+            model, scaler, inv_label_map = _train_on_slice(
+                train_df, feature_names, n_trials
+            )
         except Exception as exc:
-            log.warning("Window %d train failed: %s – skipping", window_idx, exc)
-            start_idx += step_bars
-            window_idx += 1
+            log.warning("Fold %d  training failed: %s — skipping", fold_idx, exc)
             continue
 
-        # ── Backtest on test window ────────────────────────────────────────────
+        # ── Backtest on test window ────────────────────────────────────────
         try:
-            metrics = _backtest_on_slice(symbol, test_slice)
+            metrics = _backtest_on_slice(
+                model=model,
+                scaler=scaler,
+                feature_names=feature_names,
+                inv_label_map=inv_label_map,
+                test_df=test_df,
+                raw_prices=raw_prices,
+                full_ema=full_ema,
+                cfg=cfg,
+                specs=specs,
+            )
         except Exception as exc:
-            log.warning("Window %d backtest failed: %s – skipping", window_idx, exc)
-            start_idx += step_bars
-            window_idx += 1
+            log.warning("Fold %d  backtest failed: %s — skipping", fold_idx, exc)
             continue
 
-        wr = WindowResult(
-            window_idx=window_idx,
-            train_start=str(train_slice.index[0]),
-            train_end=str(train_slice.index[-1]),
-            test_start=str(test_slice.index[0]),
-            test_end=str(test_slice.index[-1]),
+        fr = FoldResult(
+            fold_idx=fold_idx,
+            mode=mode,
+            train_start=str(train_df.index[0]),
+            train_end=str(train_df.index[-1]),
+            train_bars=len(train_df),
+            test_start=str(test_df.index[0]),
+            test_end=str(test_df.index[-1]),
+            test_bars=len(test_df),
             n_trades=metrics.get("n_trades", 0),
             net_pnl=metrics.get("net_pnl", 0.0),
+            gross_pnl=metrics.get("gross_pnl", 0.0),
             win_rate=metrics.get("win_rate", 0.0),
             profit_factor=metrics.get("profit_factor", 0.0),
             sharpe=metrics.get("sharpe", 0.0),
-            max_drawdown=metrics.get("max_drawdown", 0.0),
+            sortino=metrics.get("sortino", 0.0),
+            max_drawdown_usd=metrics.get("max_drawdown_usd", 0.0),
+            max_drawdown_pct=metrics.get("max_drawdown_pct", 0.0),
+            expectancy_usd=metrics.get("expectancy_usd", 0.0),
+            avg_hold_bars=metrics.get("avg_trade_duration_bars", 0.0),
+            trades_per_day=metrics.get("trades_per_day", 0.0),
+            consecutive_losses_max=metrics.get("consecutive_losses_max", 0),
+            profitable=metrics.get("net_pnl", 0.0) > 0,
         )
-        windows.append(wr)
+        folds.append(fr)
 
-        start_idx += step_bars
-        window_idx += 1
-
-    result = WalkForwardResult(
+    agg = _aggregate(folds)
+    summary = WalkForwardSummary(
         symbol=symbol,
-        n_windows=len(windows),
-        windows=windows,
-        aggregate=_aggregate(windows),
+        mode=mode,
+        n_folds=len(folds),
+        train_bars=train_bars,
+        test_bars=test_bars,
+        folds=folds,
+        aggregate=agg,
     )
 
-    _print_results(result)
+    _print_summary(summary)
 
-    if save_report and windows:
-        _save_report(symbol, result)
+    if save_report and folds:
+        _save_report(symbol, summary)
 
-    return result
-
-
-# ── Internal helpers ───────────────────────────────────────────────────────────
+    return summary
 
 
-def _train_on_slice(symbol: str, train_slice: pd.DataFrame, n_trials: int) -> None:
-    """Train model on a DataFrame slice (saves artifacts to disk as usual)."""
-    import joblib
-    from src.training.train import _build_model   # reuse internal helper
+# ─────────────────────────────────────────────────────────────────────────────
+# Fold-building helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-    feat_cols = [c for c in train_slice.columns if c != "label"]
-    X_df = train_slice[feat_cols]   # keep as DataFrame so scaler stores feature_names_in_
-    y    = train_slice["label"].values
 
-    from sklearn.preprocessing import RobustScaler
-    scaler = RobustScaler()
-    X_scaled = scaler.fit_transform(X_df)
+def _build_folds_rolling(
+    n: int, train_bars: int, test_bars: int, step_bars: int,
+) -> list[tuple[int, int, int, int]]:
+    """
+    Fixed-size rolling window folds.
 
-    # Minimal training – use default params for speed in walk-forward
+    Each fold:
+      train = [start, start + train_bars)
+      test  = [start + train_bars, start + train_bars + test_bars)
+
+    Window advances by step_bars; stops when test window would exceed n.
+
+    Returns list of (train_start, train_end, test_start, test_end) index tuples.
+    """
+    folds: list[tuple[int, int, int, int]] = []
+    start = 0
+    while start + train_bars + test_bars <= n:
+        folds.append((
+            start,
+            start + train_bars,
+            start + train_bars,
+            start + train_bars + test_bars,
+        ))
+        start += step_bars
+    return folds
+
+
+def _build_folds_expanding(
+    n: int, min_train_bars: int, test_bars: int, step_bars: int,
+) -> list[tuple[int, int, int, int]]:
+    """
+    Expanding (anchored) window folds.
+
+    Train always starts at 0 and grows by step_bars each fold.
+    First fold: train = [0, min_train_bars), test = [min_train_bars, +test_bars).
+
+    Returns list of (train_start, train_end, test_start, test_end) index tuples.
+    """
+    folds: list[tuple[int, int, int, int]] = []
+    train_end = min_train_bars
+    while train_end + test_bars <= n:
+        folds.append((0, train_end, train_end, train_end + test_bars))
+        train_end += step_bars
+    return folds
+
+
+def _build_folds_split(
+    n: int, split_pct: float,
+) -> list[tuple[int, int, int, int]]:
+    """
+    Single time-based train/test split.
+
+    train = [0, int(n * split_pct))
+    test  = [int(n * split_pct), n)
+
+    Returns a list containing exactly one tuple.
+    """
+    split = int(n * split_pct)
+    if split <= 0 or split >= n:
+        raise ValueError(
+            f"split_pct={split_pct:.2f} gives a degenerate split (split={split}, n={n})."
+        )
+    return [(0, split, split, n)]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Training helper (in-memory — never writes to artifacts/)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _train_on_slice(
+    train_df: pd.DataFrame,
+    feature_names: list[str],
+    n_trials: int = 0,
+) -> tuple:
+    """
+    Train XGBoost + RobustScaler on train_df in memory.
+
+    Parameters
+    ----------
+    train_df      : DataFrame with feature columns + "label" column.
+    feature_names : Ordered list of feature column names to use.
+    n_trials      : Optuna trials (0 = fast fixed hyperparameters).
+
+    Returns
+    -------
+    (model, scaler, inv_label_map)
+      model         — fitted XGBClassifier
+      scaler        — fitted RobustScaler (fitted on train_df only)
+      inv_label_map — {str(encoded_class): original_label_int}
+
+    Raises
+    ------
+    ValueError if train_df has fewer than 2 distinct label classes.
+    """
     import xgboost as xgb
-    from sklearn.preprocessing import LabelEncoder
+    from sklearn.preprocessing import LabelEncoder, RobustScaler
 
-    le = LabelEncoder()
-    y_enc = le.fit_transform(y)
+    feat_cols = [c for c in feature_names if c in train_df.columns]
+    if not feat_cols:
+        raise ValueError("No matching feature columns found in train_df.")
+
+    X_df  = train_df[feat_cols]          # keep as DataFrame (preserves feature names)
+    y_raw = train_df["label"].values
+
+    unique_classes = np.unique(y_raw)
+    if len(unique_classes) < 2:
+        raise ValueError(
+            f"Train slice has only {len(unique_classes)} unique label class(es): "
+            f"{unique_classes}. XGBoost requires at least 2."
+        )
+
+    le    = LabelEncoder()
+    y_enc = le.fit_transform(y_raw)
+
+    scaler   = RobustScaler()
+    X_scaled = scaler.fit_transform(X_df)      # scaler fitted on train window only
+
+    inv_label_map = {str(i): int(cls) for i, cls in enumerate(le.classes_)}
+
+    if n_trials > 0:
+        model = _optuna_train(X_scaled, y_enc, n_trials)
+    else:
+        # Sensible fixed hyperparameters — fast, good for M1 bar data
+        model = xgb.XGBClassifier(
+            n_estimators=300,
+            max_depth=4,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            eval_metric="mlogloss",
+            random_state=42,
+            verbosity=0,
+        )
+        model.fit(X_scaled, y_enc)
+
+    return model, scaler, inv_label_map
+
+
+def _optuna_train(
+    X_scaled: np.ndarray,
+    y_enc: np.ndarray,
+    n_trials: int,
+):
+    """
+    Quick Optuna hyperparameter search within a training slice.
+
+    Inner validation: last 20% of the training slice (time-ordered, no shuffle).
+    """
+    import optuna
+    import xgboost as xgb
+    from sklearn.metrics import f1_score
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    split   = int(len(X_scaled) * 0.8)
+    X_tr    = X_scaled[:split];  X_val = X_scaled[split:]
+    y_tr    = y_enc[:split];     y_val = y_enc[split:]
+
+    def objective(trial: optuna.Trial) -> float:
+        params = {
+            "n_estimators":     trial.suggest_int("n_estimators", 100, 500),
+            "max_depth":        trial.suggest_int("max_depth", 3, 6),
+            "learning_rate":    trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
+            "subsample":        trial.suggest_float("subsample", 0.6, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+            "eval_metric":      "mlogloss",
+            "random_state":     42,
+            "verbosity":        0,
+        }
+        m = xgb.XGBClassifier(**params)
+        m.fit(X_tr, y_tr)
+        pred = m.predict(X_val)
+        return float(f1_score(y_val, pred, average="macro", zero_division=0))
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
 
     model = xgb.XGBClassifier(
-        n_estimators=200,
-        max_depth=4,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        use_label_encoder=False,
+        **study.best_params,
         eval_metric="mlogloss",
         random_state=42,
         verbosity=0,
     )
     model.fit(X_scaled, y_enc)
-
-    # Save artefacts so backtest can load them
-    arts = Path("artifacts")
-    (arts / "models").mkdir(parents=True, exist_ok=True)
-    (arts / "scalers").mkdir(parents=True, exist_ok=True)
-    (arts / "schema").mkdir(parents=True, exist_ok=True)
-
-    joblib.dump(model,  arts / "models"  / f"{symbol}_xgb_best.joblib")
-    joblib.dump(scaler, arts / "scalers" / f"{symbol}_scaler.joblib")
-
-    inv_label_map = {str(i): int(cls) for i, cls in enumerate(le.classes_)}
-    feat_cols_list = list(X_df.columns)
-    with open(arts / "schema" / f"{symbol}_features.json", "w") as f:
-        json.dump({"feature_names": feat_cols_list, "inv_label_map": inv_label_map}, f)
+    return model
 
 
-def _backtest_on_slice(symbol: str, test_slice: pd.DataFrame) -> dict:
-    """Run a mini backtest on a DataFrame slice, return metrics dict."""
-    from src.backtest.engine import _simulate_trades, _compute_metrics, _load_cfg
+# ─────────────────────────────────────────────────────────────────────────────
+# Backtest helper (purely in-memory)
+# ─────────────────────────────────────────────────────────────────────────────
 
-    cfg = _load_cfg(symbol)
 
-    import joblib
-    arts = Path("artifacts")
-    model  = joblib.load(arts / "models"  / f"{symbol}_xgb_best.joblib")
-    scaler = joblib.load(arts / "scalers" / f"{symbol}_scaler.joblib")
-    with open(arts / "schema" / f"{symbol}_features.json") as f:
-        schema = json.load(f)
+def _backtest_on_slice(
+    model,
+    scaler,
+    feature_names: list[str],
+    inv_label_map: dict[str, int],
+    test_df: pd.DataFrame,
+    raw_prices: Optional[pd.DataFrame],
+    full_ema: Optional[pd.Series],
+    cfg: dict,
+    specs: dict,
+) -> dict:
+    """
+    Run backtest on a test-window DataFrame.
 
-    feature_names = schema["feature_names"]
-    inv_label_map = {k: int(v) for k, v in schema["inv_label_map"].items()}
+    All inputs are in-memory; no disk reads.
+    The scaler was fit on the train slice only — transform here is OOS.
+    """
+    from src.backtest.engine import _simulate_trades, _compute_metrics
 
-    # Pass DataFrame (not .values) to preserve feature_names_in_ → no scaler warning
-    feat_cols = [c for c in test_slice.columns if c != "label" and c in feature_names]
-    X_df     = test_slice[feat_cols]
-    X_scaled = scaler.transform(X_df)
-    proba    = model.predict_proba(X_scaled)
-    pred_enc = np.argmax(proba, axis=1)
-    conf     = np.max(proba, axis=1)
+    feat_cols = [c for c in feature_names if c in test_df.columns]
+    X_df      = test_df[feat_cols]
+    X_scaled  = scaler.transform(X_df)       # OOS transform — scaler fit on train only
+    proba     = model.predict_proba(X_scaled)
+    pred_enc  = np.argmax(proba, axis=1)
+    conf      = np.max(proba, axis=1)
 
-    sig_arr  = np.array([inv_label_map[str(e)] for e in pred_enc])
-    sig_series   = pd.Series(sig_arr, index=test_slice.index)
-    conf_series  = pd.Series(conf,    index=test_slice.index)
+    sig_arr     = np.array([inv_label_map[str(e)] for e in pred_enc])
+    sig_series  = pd.Series(sig_arr, index=test_df.index)
+    conf_series = pd.Series(conf,    index=test_df.index)
 
-    # Derive open prices and ATR ticks from test_slice
-    tick_size   = float(cfg.get("tick_size", 0.25))
-    multiplier  = float(cfg.get("multiplier", 50.0))
+    # Cost parameters (don't mutate the caller's dict)
+    cfg          = dict(cfg)
+    tick_size    = float(specs.get("tick_size",  cfg.get("tick_size", 0.25)))
+    multiplier   = float(specs.get("multiplier", 50.0))
+    cfg["tick_size"] = tick_size
     commission_rt = 2.0 * float(cfg.get("commission_per_side_usd", 1.50))
     slippage_pts  = float(cfg.get("slippage_ticks_per_side", 0.5)) * tick_size
     half_spread   = float(cfg.get("spread_ticks", 1.0)) * 0.5 * tick_size
     friction_pts  = slippage_pts + half_spread
 
-    if "open" in test_slice.columns:
-        open_prices = test_slice["open"]
+    # Open / close prices for execution fills
+    if raw_prices is not None:
+        rp           = raw_prices.reindex(test_df.index)
+        has_prices   = "close" in rp.columns and not rp["close"].isna().all()
     else:
-        open_prices = test_slice.get("close", pd.Series(5000.0, index=test_slice.index))
+        has_prices = False
 
-    atr_ticks = pd.Series(20.0, index=test_slice.index)
-    if "atr_14" in test_slice.columns and "close" in test_slice.columns:
-        atr_ticks = (test_slice["atr_14"] * test_slice["close"] / tick_size).fillna(20.0)
+    if has_prices:
+        close_prices = rp["close"].ffill().bfill().fillna(5000.0)
+        open_prices  = (
+            rp["open"].ffill().bfill().fillna(close_prices)
+            if "open" in rp.columns
+            else close_prices
+        )
+    else:
+        if raw_prices is not None:
+            log.warning(
+                "Raw prices reindexed to test window are all NaN — using 5000.0 proxy"
+            )
+        open_prices  = pd.Series(5000.0, index=test_df.index)
+        close_prices = pd.Series(5000.0, index=test_df.index)
+
+    # ATR in ticks
+    atr_ticks = pd.Series(20.0, index=test_df.index)
+    if "atr_14" in test_df.columns:
+        atr_ticks = (test_df["atr_14"] * close_prices / tick_size).fillna(20.0)
+
+    # EMA series: pass the full-dataset series so the test window has
+    # proper warm-up history; _simulate_trades reindexes to test index.
+    ema_series: Optional[pd.Series] = None
+    if cfg.get("trend_filter_enabled", False) and full_ema is not None:
+        ema_series = full_ema
 
     trades, equity_curve, cost_summary = _simulate_trades(
         signals      = sig_series,
@@ -264,72 +567,278 @@ def _backtest_on_slice(symbol: str, test_slice: pd.DataFrame) -> dict:
         commission_rt= commission_rt,
         multiplier   = multiplier,
         conf_series  = conf_series,
+        close_prices = close_prices,
+        ema_series   = ema_series,
     )
+
     metrics = _compute_metrics(equity_curve, trades, cost_summary)
     metrics["n_trades"] = len(trades)
     return metrics
 
 
-def _aggregate(windows: list[WindowResult]) -> dict:
-    if not windows:
+# ─────────────────────────────────────────────────────────────────────────────
+# Aggregate metrics
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _aggregate(folds: list[FoldResult]) -> dict:
+    """
+    Compute aggregate + stability metrics across all completed folds.
+
+    Stability metrics
+    -----------------
+    pnl_cv       : std(pnl) / |mean(pnl)|  — coefficient of variation.
+                   Lower is more stable. Reported as None when mean_pnl ≤ 0
+                   (not meaningful for losing strategies).
+    std_sharpe   : std of fold Sharpe ratios across folds.
+                   Lower means more consistent risk-adjusted performance.
+    t_stat_pnl   : mean_pnl / (std_pnl / √n_folds).
+                   Tests H₀: mean = 0. > 1.65 → one-sided 95% significance.
+                   Reported as None when n_folds < 2 or std_pnl = 0.
+    stability    : STABLE | PROMISING | MIXED | UNSTABLE — qualitative verdict.
+    """
+    if not folds:
         return {}
-    net_pnls     = [w.net_pnl for w in windows]
-    win_rates    = [w.win_rate for w in windows]
-    sharpes      = [w.sharpe for w in windows]
-    pfs          = [w.profit_factor for w in windows]
-    mdd          = [w.max_drawdown for w in windows]
-    positive     = sum(1 for p in net_pnls if p > 0)
+
+    n           = len(folds)
+    net_pnls    = [f.net_pnl           for f in folds]
+    win_rates   = [f.win_rate          for f in folds]
+    sharpes     = [f.sharpe            for f in folds]
+    sortinos    = [f.sortino           for f in folds]
+    pfs         = [f.profit_factor     for f in folds]
+    mdd_usd     = [f.max_drawdown_usd  for f in folds]
+    mdd_pct     = [f.max_drawdown_pct  for f in folds]
+    expectancy  = [f.expectancy_usd    for f in folds]
+    tpd         = [f.trades_per_day    for f in folds]
+    n_trades    = [f.n_trades          for f in folds]
+    profitable  = sum(1 for f in folds if f.profitable)
+
+    total_pnl   = float(sum(net_pnls))
+    mean_pnl    = float(np.mean(net_pnls))
+    std_pnl     = float(np.std(net_pnls, ddof=1)) if n > 1 else 0.0
+    mean_sharpe = float(np.mean(sharpes))
+    std_sharpe  = float(np.std(sharpes, ddof=1)) if n > 1 else 0.0
+    pct_prof    = profitable / n
+
+    # Coefficient of variation (meaningful only when mean_pnl > 0)
+    pnl_cv: Optional[float] = (
+        round(std_pnl / mean_pnl, 4) if mean_pnl > 0 else None
+    )
+
+    # t-statistic of fold PnLs
+    t_stat: Optional[float] = (
+        round(mean_pnl / (std_pnl / math.sqrt(n)), 4)
+        if (n > 1 and std_pnl > 0)
+        else None
+    )
+
+    # Stability verdict
+    if pct_prof >= 0.70 and (t_stat or 0.0) >= 1.65:
+        verdict = "STABLE"
+    elif pct_prof >= 0.60 and total_pnl > 0:
+        verdict = "PROMISING"
+    elif pct_prof >= 0.40:
+        verdict = "MIXED"
+    else:
+        verdict = "UNSTABLE"
 
     return {
-        "total_net_pnl":         round(sum(net_pnls), 2),
-        "avg_net_pnl_per_window": round(float(np.mean(net_pnls)), 2),
-        "pct_profitable_windows": round(positive / len(windows), 4),
-        "avg_win_rate":          round(float(np.mean(win_rates)), 4),
-        "avg_sharpe":            round(float(np.mean(sharpes)), 4),
-        "avg_profit_factor":     round(float(np.mean(pfs)), 4),
-        "avg_max_drawdown":      round(float(np.mean(mdd)), 4),
-        "n_windows":             len(windows),
+        # Returns
+        "total_net_pnl":          round(total_pnl, 2),
+        "avg_net_pnl_per_fold":   round(mean_pnl, 2),
+        "std_net_pnl":            round(std_pnl, 2),
+        "total_n_trades":         int(sum(n_trades)),
+        # Profitability
+        "n_profitable_folds":     profitable,
+        "pct_profitable_folds":   round(pct_prof, 4),
+        # Win rate
+        "avg_win_rate":           round(float(np.mean(win_rates)), 4),
+        "median_win_rate":        round(float(np.median(win_rates)), 4),
+        # Profit factor
+        "avg_profit_factor":      round(float(np.mean(pfs)), 4),
+        "median_profit_factor":   round(float(np.median(pfs)), 4),
+        # Risk-adjusted returns
+        "avg_sharpe":             round(mean_sharpe, 4),
+        "std_sharpe":             round(std_sharpe, 4),
+        "avg_sortino":            round(float(np.mean(sortinos)), 4),
+        # Drawdown
+        "avg_max_drawdown_usd":   round(float(np.mean(mdd_usd)), 2),
+        "avg_max_drawdown_pct":   round(float(np.mean(mdd_pct)), 4),
+        "worst_drawdown_pct":     round(float(min(mdd_pct)), 4),
+        # Activity
+        "avg_expectancy_usd":     round(float(np.mean(expectancy)), 2),
+        "avg_trades_per_day":     round(float(np.mean(tpd)), 2),
+        # Stability
+        "pnl_cv":                 pnl_cv,
+        "t_stat_pnl":             t_stat,
+        "stability":              verdict,
+        "n_folds":                n,
     }
 
 
-def _print_results(result: WalkForwardResult) -> None:
-    print(f"\n{'='*72}")
-    print(f"  WALK-FORWARD VALIDATION – {result.symbol}  ({result.n_windows} windows)")
-    print(f"{'='*72}")
-    header = f"{'Win':>4}  {'Test start':>20}  {'Trades':>6}  {'NetPnL':>10}  {'WR':>6}  {'PF':>6}  {'Sharpe':>7}"
-    print(header)
-    print("-" * len(header))
-    for w in result.windows:
+# ─────────────────────────────────────────────────────────────────────────────
+# Display helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _print_summary(result: WalkForwardSummary) -> None:
+    W = 90
+    bar = "═" * W
+
+    print(f"\n{bar}")
+    print(
+        f"  WALK-FORWARD VALIDATION – {result.symbol}"
+        f"   mode={result.mode}   n_folds={result.n_folds}"
+    )
+    print(bar)
+
+    # Per-fold table header
+    col_w = 25
+    hdr = (
+        f"  {'Fold':>4}  {'Test period':<{col_w}}  {'Bars':>5}  "
+        f"{'Trd':>4}  {'Net PnL ($)':>11}  {'WR%':>5}  "
+        f"{'PF':>5}  {'Sharpe':>6}  {'MaxDD%':>7}  "
+    )
+    sep = "  " + "─" * (len(hdr) - 2)
+    print(hdr)
+    print(sep)
+
+    for f in result.folds:
+        period = f"{f.test_start[:10]}→{f.test_end[:10]}"
+        ok     = "✓" if f.profitable else "✗"
         print(
-            f"{w.window_idx:>4}  {w.test_start:>20}  {w.n_trades:>6}  "
-            f"{w.net_pnl:>+10.2f}  {w.win_rate:>6.1%}  {w.profit_factor:>6.2f}  "
-            f"{w.sharpe:>7.3f}"
+            f"  {f.fold_idx:>4}  {period:<{col_w}}  {f.test_bars:>5}  "
+            f"{f.n_trades:>4}  {f.net_pnl:>+11.2f}  {f.win_rate:>5.1%}  "
+            f"{f.profit_factor:>5.2f}  {f.sharpe:>6.3f}  {f.max_drawdown_pct:>7.2f}  "
+            f"{ok}"
         )
-    print("-" * len(header))
+
     agg = result.aggregate
-    if agg:
-        print(
-            f"{'TOTAL':>4}  {'':>20}  {'':>6}  "
-            f"{agg['total_net_pnl']:>+10.2f}  "
-            f"{agg['avg_win_rate']:>6.1%}  "
-            f"{agg['avg_profit_factor']:>6.2f}  "
-            f"{agg['avg_sharpe']:>7.3f}"
-        )
-        print(f"\n  Profitable windows: {agg['pct_profitable_windows']:.0%}  "
-              f"| Avg max-DD: {agg['avg_max_drawdown']:.1%}")
-    print(f"{'='*72}\n")
+    if not agg:
+        print(f"{bar}\n")
+        return
+
+    print(sep)
+
+    # Totals / averages row
+    print(
+        f"  {'SUM/AVG':>4}  {'':^{col_w}}  {'':>5}  "
+        f"{agg['total_n_trades']:>4}  "
+        f"{agg['total_net_pnl']:>+11.2f}  "
+        f"{agg['avg_win_rate']:>5.1%}  "
+        f"{agg['avg_profit_factor']:>5.2f}  "
+        f"{agg['avg_sharpe']:>6.3f}  "
+        f"{agg['avg_max_drawdown_pct']:>7.2f}  "
+    )
+
+    # Aggregate block
+    lbl = 34
+    print(f"\n  {'AGGREGATE PERFORMANCE':─<{W - 4}}")
+    print(f"  {'Profitable folds':{lbl}}: "
+          f"{agg['n_profitable_folds']} / {agg['n_folds']}  "
+          f"({agg['pct_profitable_folds']:.0%})")
+    print(f"  {'Total net P&L':{lbl}}: ${agg['total_net_pnl']:>+,.2f}")
+    print(f"  {'Avg net P&L / fold':{lbl}}: ${agg['avg_net_pnl_per_fold']:>+,.2f}"
+          f"  ± ${agg['std_net_pnl']:,.2f}")
+    print(f"  {'Avg profit factor':{lbl}}: {agg['avg_profit_factor']:.3f}"
+          f"  (median {agg['median_profit_factor']:.3f})")
+    print(f"  {'Avg win rate':{lbl}}: {agg['avg_win_rate']:.1%}"
+          f"  (median {agg['median_win_rate']:.1%})")
+    print(f"  {'Avg Sharpe':{lbl}}: {agg['avg_sharpe']:.3f}"
+          f"  (std {agg['std_sharpe']:.3f})")
+    print(f"  {'Avg Sortino':{lbl}}: {agg['avg_sortino']:.3f}")
+    print(f"  {'Avg max drawdown':{lbl}}: {agg['avg_max_drawdown_pct']:.2f}%"
+          f"  (worst {agg['worst_drawdown_pct']:.2f}%)")
+    print(f"  {'Avg trades / day':{lbl}}: {agg['avg_trades_per_day']:.2f}")
+    print(f"  {'Avg expectancy / trade':{lbl}}: ${agg['avg_expectancy_usd']:+.2f}")
+
+    # Stability block
+    pnl_cv_str  = (f"{agg['pnl_cv']:.3f}"
+                   if agg.get("pnl_cv") is not None
+                   else "n/a (mean PnL ≤ 0)")
+    t_stat_str  = (f"{agg['t_stat_pnl']:.2f}"
+                   if agg.get("t_stat_pnl") is not None
+                   else "n/a (< 2 folds)")
+    verdict     = agg["stability"]
+
+    print(f"\n  {'STABILITY':─<{W - 4}}")
+    print(f"  {'PnL coeff. of variation':{lbl}}: {pnl_cv_str}"
+          f"  [target < 1.5]")
+    print(f"  {'Sharpe std across folds':{lbl}}: {agg['std_sharpe']:.3f}"
+          f"  [target < 0.40]")
+    print(f"  {'PnL t-statistic':{lbl}}: {t_stat_str}"
+          f"  [> 1.65 → 95% significance]")
+    print(f"  {'Stability assessment':{lbl}}: {verdict}")
+    print(f"{bar}\n")
 
 
-def _save_report(symbol: str, result: WalkForwardResult) -> None:
+def _save_report(symbol: str, result: WalkForwardSummary) -> None:
     out_dir = Path("artifacts/reports")
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{symbol}_walk_forward.json"
     data = {
-        "symbol":    result.symbol,
-        "n_windows": result.n_windows,
-        "aggregate": result.aggregate,
-        "windows":   [w.__dict__ for w in result.windows],
+        "symbol":     result.symbol,
+        "mode":       result.mode,
+        "n_folds":    result.n_folds,
+        "train_bars": result.train_bars,
+        "test_bars":  result.test_bars,
+        "aggregate":  result.aggregate,
+        "folds":      [asdict(f) for f in result.folds],
     }
-    with open(out_path, "w") as f:
-        json.dump(data, f, indent=2)
-    log.info("Walk-forward report saved → %s", out_path)
+    with open(out_path, "w") as fp:
+        json.dump(data, fp, indent=2, default=str)
+    log.info("Walk-forward report → %s", out_path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config / price loading helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _load_prices(
+    symbol: str,
+    idx: pd.DatetimeIndex,
+) -> tuple[Optional[pd.DataFrame], Optional[pd.Series]]:
+    """
+    Load raw OHLCV prices and compute full-series EMA for trend filter.
+
+    Returns
+    -------
+    (raw_prices, full_ema)
+      raw_prices : DataFrame reindexed to `idx`, or None if CSV not found.
+      full_ema   : EMA(period) of close over the full series, or None.
+    """
+    raw_path = Path(f"data/raw/{symbol}_M1.csv")
+    if not raw_path.exists():
+        log.warning(
+            "Raw CSV not found: %s — open-price fills will use close proxy. "
+            "Fetch data with:  python -m src.cli fetch --symbol %s",
+            raw_path, symbol,
+        )
+        return None, None
+
+    raw = pd.read_csv(raw_path, parse_dates=["timestamp"], index_col="timestamp")
+    raw.sort_index(inplace=True)
+    raw = raw.reindex(idx)     # align to the features index
+
+    # EMA — computed on the FULL aligned series so any test window inherits
+    # proper warm-up history (no cold-start artefact in trend filter)
+    full_ema: Optional[pd.Series] = None
+    if _UNIVERSE_CFG.exists() and "close" in raw.columns:
+        with open(_UNIVERSE_CFG) as f:
+            uc = yaml.safe_load(f) or {}
+        tf = uc.get("trend_filter", {})
+        if tf.get("enabled", False):
+            ema_period = int(tf.get("ema_period", 200))
+            full_ema   = raw["close"].ewm(span=ema_period, adjust=False).mean()
+
+    return raw, full_ema
+
+
+def _load_specs(symbol: str) -> dict:
+    """Return contract_specs dict for symbol from universe.yaml."""
+    if not _UNIVERSE_CFG.exists():
+        return {}
+    with open(_UNIVERSE_CFG) as f:
+        uc = yaml.safe_load(f) or {}
+    return uc.get("contract_specs", {}).get(symbol, {})
