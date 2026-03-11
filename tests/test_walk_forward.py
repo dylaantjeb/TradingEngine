@@ -270,7 +270,10 @@ class TestAggregate:
             "avg_sharpe", "std_sharpe", "avg_sortino",
             "avg_max_drawdown_pct", "worst_drawdown_pct",
             "avg_expectancy_usd", "avg_trades_per_day",
-            "pnl_cv", "t_stat_pnl", "stability", "n_folds",
+            "pnl_cv", "t_stat_pnl",
+            "funded_ready",    # new primary verdict key
+            "stability",       # legacy alias (same value as funded_ready)
+            "n_folds",
         }
         missing = required - set(agg.keys())
         assert not missing, f"Missing aggregate keys: {missing}"
@@ -319,27 +322,34 @@ class TestAggregate:
         assert agg["t_stat_pnl"] is not None
         assert agg["t_stat_pnl"] > 1.65
 
-    def test_stability_stable(self):
-        # 10 folds, all profitable with increasing PnL → high t-stat, pct=1.0
-        folds = [_make_fold(i, 500.0 + i * 50) for i in range(10)]
-        agg   = _aggregate(folds)
-        assert agg["stability"] == "STABLE"
-
-    def test_stability_unstable_all_losing(self):
-        folds = [_make_fold(i, -200.0) for i in range(5)]
-        agg   = _aggregate(folds)
-        assert agg["stability"] == "UNSTABLE"
-
-    def test_stability_mixed(self):
-        # Exactly 50% profitable → MIXED
+    def test_stability_funded_ready(self):
+        # 10 folds, all highly profitable with low variance → FUNDED-READY
+        # profit_factor=2.0 (>= 1.5), pct=1.0 (>= 0.70), high t-stat, low CV
         folds = [
-            _make_fold(0,  100.0),
-            _make_fold(1, -100.0),
-            _make_fold(2,  100.0),
-            _make_fold(3, -100.0),
+            _make_fold(i, 800.0 + i * 20, profit_factor=2.0)
+            for i in range(10)
         ]
         agg = _aggregate(folds)
-        assert agg["stability"] == "MIXED"
+        assert agg["funded_ready"] == "FUNDED-READY"
+        assert agg["stability"]    == "FUNDED-READY"   # legacy alias
+
+    def test_stability_not_ready_all_losing(self):
+        folds = [_make_fold(i, -200.0, profit_factor=0.5) for i in range(5)]
+        agg   = _aggregate(folds)
+        assert agg["funded_ready"] == "NOT READY"
+        assert agg["stability"]    == "NOT READY"
+
+    def test_stability_marginal(self):
+        # Exactly 50% profitable, avg PF = 1.3 → MARGINAL
+        # (pct_prof 0.5 >= 0.40, avg_pf 1.3 >= 1.10, but below PROMISING threshold)
+        folds = [
+            _make_fold(0,  100.0, profit_factor=1.3),
+            _make_fold(1, -100.0, profit_factor=1.3),
+            _make_fold(2,  100.0, profit_factor=1.3),
+            _make_fold(3, -100.0, profit_factor=1.3),
+        ]
+        agg = _aggregate(folds)
+        assert agg["funded_ready"] == "MARGINAL"
 
     def test_worst_drawdown_is_minimum(self):
         folds = [

@@ -1,5 +1,8 @@
 # Trading universe configuration.
 # The backtest command iterates over all symbols listed here.
+#
+# Philosophy: fewer, higher-quality trades over many unstable ones.
+# Every threshold below is biased towards funded-account safety.
 
 symbols:
   - ES
@@ -16,19 +19,22 @@ cost_model:
 
 # ── Filters ────────────────────────────────────────────────────────────────────
 filters:
-  # NY regular session: 14:30-21:00 UTC = 09:30-16:00 ET (winter)
-  session_start_utc_hour: 14
-  session_end_utc_hour: 21
-  atr_min_ticks: 4
-  atr_max_ticks: 150
+  # NY regular session: 14:30–21:00 UTC = 09:30–16:00 ET (winter)
+  # Tightened: avoid the first 30 min (gap fills) and last 30 min (thin close)
+  session_start_utc_hour: 15     # 10:00 ET — avoid chaotic open
+  session_end_utc_hour: 20       # 15:00 ET — avoid thin close
+  # ATR filter: only trade when volatility is meaningful but not runaway
+  atr_min_ticks: 6               # raised from 4 — skip dead/flat conditions
+  atr_max_ticks: 100             # lowered from 150 — skip news spikes
   news_blackout_windows: []
 
 # ── Signal confidence gating ────────────────────────────────────────────────────
-# Only act when model confidence meets the minimum threshold.
-# Higher values -> fewer but higher-quality trades -> lower drawdown.
+# Raised from 0.60 → 0.68: forces model to only act on its strongest signals.
+# This is the single most effective lever for reducing overtrading and
+# improving OOS performance.  Higher = fewer trades = lower drawdown.
 confidence:
-  min_long_confidence: 0.60
-  min_short_confidence: 0.60
+  min_long_confidence: 0.68
+  min_short_confidence: 0.68
 
 # ── Structural trend filter ─────────────────────────────────────────────────────
 # Long signals blocked when close < EMA(ema_period).
@@ -38,35 +44,34 @@ trend_filter:
   ema_period: 200
 
 # ── Prop-firm style risk limits ─────────────────────────────────────────────────
-# Daily halt: triggered by daily loss limit OR max_consecutive_losses.
-#   No new positions for the rest of that calendar day.
-# Kill switch: triggered by total drawdown limit.
-#   No new positions until manually reset.
+# Conservative limits matching typical 10% max-drawdown funded-account rules,
+# with tighter daily limits to preserve capital during drawdown periods.
 risk_limits:
   starting_equity: 100000.0
-  max_daily_loss_usd: 1000.0
-  max_daily_loss_pct: 0.02
-  max_total_drawdown_usd: 3000.0
-  max_total_drawdown_pct: 0.06
-  max_consecutive_losses: 3
-  cooldown_bars_after_loss: 10
+  max_daily_loss_usd: 800.0      # lowered from 1000 — cut day early
+  max_daily_loss_pct: 0.015      # lowered from 0.02
+  max_total_drawdown_usd: 2500.0 # lowered from 3000 — protect capital
+  max_total_drawdown_pct: 0.05   # lowered from 0.06
+  max_consecutive_losses: 3      # unchanged — 3 strikes and rest
+  cooldown_bars_after_loss: 20   # doubled from 10 — cool down longer
 
 # ── Trade frequency throttles ──────────────────────────────────────────────────
+# Conservative: prefer sitting out over forcing trades.
 throttles:
-  max_trades_per_day: 6
-  min_holding_bars: 5
-  cooldown_bars_after_exit: 5
+  max_trades_per_day: 4          # lowered from 6 — quality over quantity
+  min_holding_bars: 8            # raised from 5 — avoid premature exits
+  cooldown_bars_after_exit: 10   # doubled from 5 — let market settle
   max_concurrent_positions: 1
 
 # ── Position sizing ─────────────────────────────────────────────────────────────
-# method: fixed | fixed_dollar_risk | fixed_pct_risk
+# Fixed 1 contract. Do not change to risk-based until strategy is FUNDED-READY.
 position_sizing:
   method: fixed
   fixed_contracts: 1
   risk_per_trade_usd: 500.0
   risk_per_trade_pct: 0.01
   atr_stop_multiplier: 1.5
-  max_contracts: 3
+  max_contracts: 1               # hard cap at 1 — no pyramiding during validation
 
 # ── Contract specs ─────────────────────────────────────────────────────────────
 contract_specs:

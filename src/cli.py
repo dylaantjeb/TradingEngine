@@ -107,7 +107,11 @@ def cmd_train(args: argparse.Namespace) -> None:
     """Train XGBoost model with Optuna hyperparameter search."""
     from src.training.train import train
 
-    train(symbol=args.symbol, n_trials=args.trials)
+    train(
+        symbol=args.symbol,
+        n_trials=args.trials,
+        select_by=getattr(args, "select_by", "f1"),
+    )
 
 
 def cmd_backtest(args: argparse.Namespace) -> None:
@@ -273,6 +277,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--symbol", required=True)
     p_train.add_argument(
         "--trials", type=int, default=20, help="Number of Optuna trials (default 20)"
+    )
+    p_train.add_argument(
+        "--select-by", dest="select_by", default="f1",
+        choices=["f1", "trading"],
+        help=(
+            "Model selection objective: "
+            "'f1' (maximise macro-F1, default) or "
+            "'trading' (composite of F1 + trading quality — prefers fewer, "
+            "higher-confidence signals with good directional accuracy)"
+        ),
     )
     p_train.set_defaults(func=cmd_train)
 

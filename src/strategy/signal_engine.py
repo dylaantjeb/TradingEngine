@@ -285,12 +285,14 @@ def _get_contributions(
     except Exception:
         class_contribs = np.zeros(len(feature_names))
 
-    top_idx = np.argsort(np.abs(class_contribs))[::-1][:top_n].tolist()
+    # Ensure 1-D before argsort so indices are plain scalars, not sub-arrays
+    class_contribs_1d = np.asarray(class_contribs).flatten()[:len(feature_names)]
+    top_idx = [int(i) for i in np.argsort(np.abs(class_contribs_1d))[::-1][:top_n]]
     return [
         {
             "name": feature_names[i],
             "value": float(X_scaled[0, i]),
-            "contribution": float(class_contribs[i]),
+            "contribution": float(class_contribs_1d[i]),
         }
         for i in top_idx
     ]
