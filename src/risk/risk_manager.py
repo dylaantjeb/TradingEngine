@@ -28,11 +28,26 @@ log = logging.getLogger(__name__)
 @dataclass
 class RiskParams:
     """Risk limits configuration."""
-    daily_loss_limit_usd: float   = 1_000.0    # max daily loss before kill
-    max_drawdown_frac: float      = 0.05        # 5% of peak equity
+    daily_loss_limit_usd: float   = 1_000.0    # max daily loss before kill (absolute)
+    daily_loss_limit_pct: float   = 0.02        # 2% of session-start equity (dynamic)
+    max_drawdown_frac: float      = 0.06        # 6% of peak equity
     max_position_size: int        = 5           # max contracts per symbol
     max_concurrent_positions: int = 1           # single-symbol: always 1
     kill_switch: bool             = False       # manual emergency stop
+
+    @staticmethod
+    def position_size_for_confidence(confidence: float) -> int:
+        """Dynamic position sizing by signal confidence.
+
+        < 0.60  → 1 contract (low conviction)
+        0.60–0.75 → 2 contracts (medium conviction)
+        > 0.75  → 3 contracts (high conviction)
+        """
+        if confidence > 0.75:
+            return 3
+        if confidence >= 0.60:
+            return 2
+        return 1
 
 
 class RiskManager:
@@ -87,12 +102,15 @@ class RiskManager:
         self._current_equity += pnl
         self._peak_equity = max(self._peak_equity, self._current_equity)
 
-        # Auto-kill on limit breach
-        if self._daily_loss >= self.params.daily_loss_limit_usd:
+        # Auto-kill on limit breach (larger of absolute USD and pct-based limit)
+        _start_eq = self._session_start_equity or self.params.daily_loss_limit_usd / self.params.daily_loss_limit_pct
+        _pct_limit = _start_eq * self.params.daily_loss_limit_pct
+        _daily_limit = max(self.params.daily_loss_limit_usd, _pct_limit)
+        if self._daily_loss >= _daily_limit:
             if not self._killed:
                 log.warning(
                     "RISK: Daily loss limit breached (%.2f >= %.2f). Kill switch activated.",
-                    self._daily_loss, self.params.daily_loss_limit_usd,
+                    self._daily_loss, _daily_limit,
                 )
                 self._killed = True
 
@@ -128,11 +146,14 @@ class RiskManager:
         if signal == 0:
             return True, "ok"
 
-        # Daily loss limit
-        if self._daily_loss >= self.params.daily_loss_limit_usd:
+        # Daily loss limit (larger of absolute USD and pct-based)
+        _start_eq = self._session_start_equity or self.params.daily_loss_limit_usd / self.params.daily_loss_limit_pct
+        _pct_limit = _start_eq * self.params.daily_loss_limit_pct
+        _daily_limit = max(self.params.daily_loss_limit_usd, _pct_limit)
+        if self._daily_loss >= _daily_limit:
             return False, (
                 f"daily_loss_limit_breached "
-                f"({self._daily_loss:.2f} >= {self.params.daily_loss_limit_usd:.2f})"
+                f"({self._daily_loss:.2f} >= {_daily_limit:.2f})"
             )
 
         # Max drawdown
@@ -169,10 +190,13 @@ class RiskManager:
         return self._killed or self.params.kill_switch
 
     def status(self) -> dict:
+        _start_eq = self._session_start_equity or self.params.daily_loss_limit_usd / self.params.daily_loss_limit_pct
+        _pct_limit = _start_eq * self.params.daily_loss_limit_pct
+        _daily_limit = max(self.params.daily_loss_limit_usd, _pct_limit)
         return {
             "killed":             self.is_killed,
             "daily_loss_usd":     round(self._daily_loss, 2),
-            "daily_loss_limit":   self.params.daily_loss_limit_usd,
+            "daily_loss_limit":   round(_daily_limit, 2),
             "current_equity":     round(self._current_equity, 2),
             "peak_equity":        round(self._peak_equity, 2),
             "drawdown_frac":      round(

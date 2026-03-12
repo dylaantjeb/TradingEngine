@@ -222,9 +222,12 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
     X_df         = all_features[feature_names]
     X_scaled_all = scaler.transform(X_df)
     proba_all    = model.predict_proba(X_scaled_all)
-    pred_enc_all = np.argmax(proba_all, axis=1)
+    _inv_lookup  = {inv_label_map[str(k)]: k for k in range(len(inv_label_map))}
+    _short_col   = _inv_lookup.get(-1, 0)
+    _long_col    = _inv_lookup.get(1, 2)
+    _edge_all    = proba_all[:, _long_col] - proba_all[:, _short_col]
+    signal_all   = np.where(_edge_all > 0.15, 1, np.where(_edge_all < -0.15, -1, 0)).astype(np.int8)
     conf_all     = np.max(proba_all, axis=1)
-    signal_all   = np.array([inv_label_map[str(e)] for e in pred_enc_all])
 
     # Pre-filter confidence coverage diagnostic
     _conf_threshold_diag = min_long_conf  # same for long/short
