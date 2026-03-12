@@ -75,6 +75,9 @@ _DEFAULTS = {
     # Trend filter (disabled by default — safe for backward compat)
     "trend_filter_enabled": False,
     "trend_filter_ema_period": 200,
+    "trend_slope_min_atr_frac": 0.0,   # min |slope|/ATR_pts gate (0 = disabled)
+    # Session blocks (empty = fall back to session_start/end single window)
+    "session_blocks": [],
     # Risk limits (very large = effectively disabled by default)
     "starting_equity": 100_000.0,
     "max_daily_loss_usd": 1e15,
@@ -117,6 +120,8 @@ def _build_run_cfg(universe_cfg: dict, overrides: dict) -> dict:
         cfg["trend_filter_enabled"] = tf["enabled"]
     if "ema_period" in tf:
         cfg["trend_filter_ema_period"] = tf["ema_period"]
+    if "min_slope_atr_frac" in tf:
+        cfg["trend_slope_min_atr_frac"] = tf["min_slope_atr_frac"]
     # Risk limits
     cfg.update(universe_cfg.get("risk_limits", {}))
     # Position sizing (method key remapped to avoid collision)
@@ -407,11 +412,18 @@ def run_backtest(
     _n_chop_b  = flt.get("n_chop_blocked",       0)
     _n_lv_b    = flt.get("n_low_vol_blocked",    0)
     _n_trend   = flt.get("n_after_trend",        0)
+    _n_slope_b = flt.get("n_blocked_by_slope",   0)
     _n_risk    = flt.get("n_after_risk",         0)
     _n_cd      = flt.get("n_after_cooldowns",    0)
     _n_queued  = flt.get("n_entries_queued",     0)
     _n_trend_e = flt.get("n_trend_entries",      0)
+    _n_blk1    = flt.get("n_in_block1",          0)
+    _n_blk2    = flt.get("n_in_block2",          0)
     _n_exec    = len(trades)
+    _b1_pnl    = cost_summary.get("block1_net_pnl", 0.0)
+    _b2_pnl    = cost_summary.get("block2_net_pnl", 0.0)
+    _b1_tr     = cost_summary.get("block1_n_trades", 0)
+    _b2_tr     = cost_summary.get("block2_n_trades", 0)
 
     def _pct(num, den):
         return f"{100*num/den:.0f}%" if den > 0 else "n/a"
@@ -443,8 +455,8 @@ def run_backtest(
         _n_chop_b, _n_lv_b, _n_trend_e,
     )
     log.info(
-        "[%s]   → after trend     : %5d → %5d  (%s pass)",
-        symbol, _n_regime, _n_trend, _pct(_n_trend, _n_regime),
+        "[%s]   → after trend     : %5d → %5d  (%s pass)  [slope_blocked=%d]",
+        symbol, _n_regime, _n_trend, _pct(_n_trend, _n_regime), _n_slope_b,
     )
     log.info(
         "[%s]   → after risk/halt : %5d → %5d  (%s pass)",
@@ -455,12 +467,15 @@ def run_backtest(
         symbol, _n_risk, _n_cd, _pct(_n_cd, _n_risk),
     )
     log.info(
-        "[%s]   → entries queued  : %5d → %5d  (%s pass)",
-        symbol, _n_cd, _n_queued, _pct(_n_queued, _n_cd),
+        "[%s]   → entries queued  : %5d → %5d  (%s pass)  "
+        "[block1=%d  block2=%d]",
+        symbol, _n_cd, _n_queued, _pct(_n_queued, _n_cd), _n_blk1, _n_blk2,
     )
     log.info(
-        "[%s]   → trades executed : %5d → %5d  (%s of queued)",
+        "[%s]   → trades executed : %5d → %5d  (%s of queued)  "
+        "[block1: %d trades $%.0f | block2: %d trades $%.0f]",
         symbol, _n_queued, _n_exec, _pct(_n_exec, _n_queued),
+        _b1_tr, _b1_pnl, _b2_tr, _b2_pnl,
     )
     log.info(
         "[%s]   OVERALL: conf→executed = %d → %d  (%s end-to-end pass-through)",
@@ -476,14 +491,16 @@ def run_backtest(
             "  %d in-session\n"
             "  %d after ATR\n"
             "  %d after regime  (chop_blk=%d  lv_blk=%d)\n"
-            "  %d after trend\n"
-            "  %d queued  (trend_entries=%d)\n"
-            "  %d executed\n"
+            "  %d after trend  (slope_blk=%d)\n"
+            "  %d queued  [block1=%d block2=%d  trend_entries=%d]\n"
+            "  %d executed  [block1: %d trades $%.0f | block2: %d trades $%.0f]\n"
             "  Overall pass-through = %.1f%%",
             symbol,
             _n_conf, _n_sess, _n_atr,
             _n_regime, _n_chop_b, _n_lv_b,
-            _n_trend, _n_queued, _n_trend_e, _n_exec, _overall_pct,
+            _n_trend, _n_slope_b,
+            _n_queued, _n_blk1, _n_blk2, _n_trend_e,
+            _n_exec, _b1_tr, _b1_pnl, _b2_tr, _b2_pnl, _overall_pct,
         )
 
     # ── CRITICAL pipeline blockage check ─────────────────────────────────────
@@ -499,6 +516,7 @@ def run_backtest(
             ("cooldown",  _n_risk,   _n_cd),
             ("queue",     _n_cd,     _n_queued),
         ]
+        # Note: slope_blocked contributes to trend stage drop
         _worst_stage = max(_stages, key=lambda s: s[1] - s[2])
         _w_name, _w_in, _w_out = _worst_stage
         log.critical(
@@ -579,6 +597,21 @@ def _in_session(ts: pd.Timestamp, start_h: float, end_h: float) -> bool:
     return start_h <= h < end_h
 
 
+def _in_session_blocks(
+    ts: pd.Timestamp,
+    blocks: list,
+) -> tuple[bool, int]:
+    """Return (in_any_block, block_idx) where block_idx is 1-based (0 = not in session).
+
+    blocks: list of [start_h, end_h] pairs (fractional UTC hours).
+    """
+    h = ts.hour + ts.minute / 60.0
+    for idx, b in enumerate(blocks):
+        if b[0] <= h < b[1]:
+            return True, idx + 1
+    return False, 0
+
+
 def _in_blackout(ts: pd.Timestamp, windows: list) -> bool:
     """True if `ts` falls inside any news-blackout window (UTC HH:MM)."""
     if not windows:
@@ -622,6 +655,10 @@ def _simulate_trades(
     delay         = int(cfg.get("execution_delay_bars", 1))
     sess_start    = float(cfg.get("session_start_utc_hour", 0))
     sess_end      = float(cfg.get("session_end_utc_hour", 24))
+    # Session blocks: list of [start_h, end_h] pairs. When non-empty, replace
+    # the single session window with dual hard-blocked trading windows.
+    _raw_blocks   = cfg.get("session_blocks", [])
+    sess_blocks   = [(float(b[0]), float(b[1])) for b in _raw_blocks] if _raw_blocks else []
     atr_min       = float(cfg.get("atr_min_ticks", 0))
     atr_max       = float(cfg.get("atr_max_ticks", 1e9))
     blackouts     = cfg.get("news_blackout_windows", [])
@@ -634,7 +671,10 @@ def _simulate_trades(
     min_short_conf = float(cfg.get("min_short_confidence", 0.0))
 
     # Trend filter (default False → backward compat)
-    trend_filter_on = bool(cfg.get("trend_filter_enabled", False))
+    trend_filter_on  = bool(cfg.get("trend_filter_enabled", False))
+    # Trend-quality gate: minimum |EMA_slope| / ATR_pts fraction (0 = disabled)
+    trend_slope_min  = float(cfg.get("trend_slope_min_atr_frac", 0.0))
+    tick_size        = float(cfg.get("tick_size", 0.25))
 
     # Risk limits (very large defaults → backward compat)
     starting_equity        = float(cfg.get("starting_equity", 100_000.0))
@@ -652,7 +692,7 @@ def _simulate_trades(
     risk_pct       = float(cfg.get("risk_per_trade_pct", 0.01))
     atr_stop_mult  = float(cfg.get("atr_stop_multiplier", 1.5))
     max_contracts  = int(cfg.get("max_contracts", 3))
-    tick_size      = float(cfg.get("tick_size", 0.25))
+    # tick_size already loaded above for trend_slope_min_atr_frac
 
     # ── Pre-allocate arrays ──────────────────────────────────────────────────
     sig_arr   = signals.values.astype(np.int8)
@@ -699,6 +739,14 @@ def _simulate_trades(
     last_trade_date   = None
     pending_target    = None
     pending_contracts = 1
+    pending_block     = 0   # session block of pending queued entry (1 or 2; 0 = unknown)
+    entry_block       = 0   # session block of current open position's entry bar
+
+    # Session-block PnL tracking
+    block1_pnl    = 0.0
+    block2_pnl    = 0.0
+    block1_trades = 0
+    block2_trades = 0
 
     # Risk / prop-firm state
     daily_pnl          = 0.0
@@ -718,17 +766,20 @@ def _simulate_trades(
     flt = {
         "n_total_bars":        0,   # total bars processed
         "n_confident_signals": 0,   # conf >= threshold AND raw_sig != 0
-        "n_after_session":     0,   # survived session window
+        "n_after_session":     0,   # survived session block filter
         "n_after_blackout":    0,   # survived news blackout
         "n_after_atr":         0,   # survived ATR range filter
         "n_after_regime":      0,   # survived regime classifier (trend only)
         "n_chop_blocked":      0,   # blocked: chop regime (adequate vol, no slope)
         "n_low_vol_blocked":   0,   # blocked: low-vol regime (ATR or vol too low)
-        "n_after_trend":       0,   # survived EMA slope direction filter
+        "n_after_trend":       0,   # survived EMA slope direction + quality filter
+        "n_blocked_by_slope":  0,   # blocked: slope magnitude < min_slope_atr_frac
         "n_after_risk":        0,   # survived risk/halt gate (kill-switch, daily halt)
         "n_after_cooldowns":   0,   # survived cooldowns + holding + daily cap
         "n_entries_queued":    0,   # target != position — new entry queued
         "n_trend_entries":     0,   # queued entries that occurred in trend regime
+        "n_in_block1":         0,   # queued entries in session block 1
+        "n_in_block2":         0,   # queued entries in session block 2
     }
 
     # ── Helpers ──────────────────────────────────────────────────────────────
@@ -829,6 +880,13 @@ def _simulate_trades(
                     net_pnl   = raw_pnl - cost
                     gross_pnl  += raw_pnl
                     total_cost += cost
+                    # Attribute PnL to the block of the entry bar
+                    if entry_block == 1:
+                        block1_pnl    += net_pnl
+                        block1_trades += 1
+                    elif entry_block == 2:
+                        block2_pnl    += net_pnl
+                        block2_trades += 1
                     trades.append({
                         "entry_time":    str(ts_arr[entry_idx]),
                         "exit_time":     str(ts),
@@ -841,6 +899,7 @@ def _simulate_trades(
                         "cost":          round(cost, 2),
                         "net_pnl":       round(net_pnl, 2),
                         "equity":        round(equity + net_pnl, 2),
+                        "entry_block":   entry_block,
                     })
                     _update_risk(net_pnl, ts)
                     if cooldown_bars > 0:
@@ -853,12 +912,14 @@ def _simulate_trades(
                         position        = pending_target
                         entry_idx       = i
                         entry_contracts = n_c
+                        entry_block     = pending_block
 
                 elif position == 0 and pending_target != 0:
                     entry_price     = o + pending_target * friction_pts
                     position        = pending_target
                     entry_idx       = i
                     entry_contracts = n_c
+                    entry_block     = pending_block
 
             pending_target = None
 
@@ -879,16 +940,23 @@ def _simulate_trades(
             elif sig == -1 and conf_t < min_short_conf:
                 sig = 0
 
+        # ── Session block membership for this bar ────────────────────────────
+        # Pre-compute once; used by diagnostic counter AND actual Filter 2.
+        atr_t = atr_arr[i]
+        if sess_blocks:
+            _in_block, _block_idx = _in_session_blocks(ts, sess_blocks)
+        else:
+            _in_block = _in_session(ts, sess_start, sess_end)
+            _block_idx = 1 if _in_block else 0
+
         # ── Sequential pipeline diagnostics ──────────────────────────────────
         # Track how many confident signals survive each filter in order.
         # Each stage is only counted if all prior stages passed.
         flt["n_total_bars"] += 1
         _conf_sig = int(sig)   # save post-confidence value
-        atr_t = atr_arr[i]
         if _conf_sig != 0:
             flt["n_confident_signals"] += 1
-            _sess_ok = _in_session(ts, sess_start, sess_end)
-            if _sess_ok:
+            if _in_block:
                 flt["n_after_session"] += 1
                 if not _in_blackout(ts, blackouts):
                     flt["n_after_blackout"] += 1
@@ -903,10 +971,13 @@ def _simulate_trades(
                             if trend_filter_on and ema_arr is not None:
                                 _et = ema_arr[i]
                                 if not np.isnan(_et):
-                                    # ema_arr holds EMA slope (EMA - EMA.shift(5))
                                     if (_conf_sig == 1 and _et <= 0) or \
                                        (_conf_sig == -1 and _et >= 0):
                                         _trend_ok = False
+                                    elif trend_slope_min > 0.0:
+                                        _atp = atr_t * tick_size
+                                        if _atp > 0 and abs(_et) / _atp < trend_slope_min:
+                                            _trend_ok = False
                             if _trend_ok:
                                 flt["n_after_trend"] += 1
                                 _risk_ok = not (
@@ -915,7 +986,6 @@ def _simulate_trades(
                                 )
                                 if _risk_ok:
                                     flt["n_after_risk"] += 1
-                                    # State-dependent: cooldowns, holding, daily cap
                                     _cd_ok = (
                                         not (loss_cooldown_left > 0 and position == 0) and
                                         not (cooldown_left > 0 and position == 0) and
@@ -924,12 +994,15 @@ def _simulate_trades(
                                     if _cd_ok:
                                         flt["n_after_cooldowns"] += 1
 
-        # Filter 2: Session filter — soft block: outside session trades at 50% size.
-        # _in_sess tracked here for sizing; signal is NOT zeroed out.
-        _in_sess = _in_session(ts, sess_start, sess_end)
-        _session_factor = 1.0 if _in_sess else 0.5
-        # Diagnostic counter still tracks strict session (how many would pass fully)
-        # — existing flt["n_after_session"] counts only in-session signals.
+        # Filter 2: Session blocks — hard block outside all defined windows.
+        # When session_blocks is configured: signals outside both blocks are zeroed.
+        # Legacy (session_blocks empty): soft block — signal kept, size halved.
+        _session_factor = 1.0
+        if sess_blocks:
+            if not _in_block:
+                sig = 0
+        else:
+            _session_factor = 1.0 if _in_block else 0.5
 
         # Filter 3: News blackout
         if _in_blackout(ts, blackouts):
@@ -957,16 +1030,22 @@ def _simulate_trades(
             if _regime_t < 0.8:
                 sig = 0   # skip trading in low-volatility chop
 
-        # Filter 5: Trend slope filter (EMA slope, not close-vs-EMA)
-        # ema_arr now holds EMA(N) - EMA(N).shift(5) — the 5-bar slope.
-        # Long allowed when slope > 0; short allowed when slope < 0.
+        # Filter 5: Trend slope filter — direction (5a) + quality gate (5b).
+        # ema_arr holds EMA(N) - EMA(N).shift(5) — the 5-bar slope.
+        # 5a: Long allowed when slope > 0; short allowed when slope < 0.
+        # 5b: |slope| / ATR_pts must exceed trend_slope_min_atr_frac (if set).
         if trend_filter_on and ema_arr is not None:
             ema_t = ema_arr[i]
             if not np.isnan(ema_t):
-                if sig == 1 and ema_t <= 0:    # long blocked — downsloping EMA
+                if sig == 1 and ema_t <= 0:        # 5a: long blocked — downsloping EMA
                     sig = 0
-                elif sig == -1 and ema_t >= 0: # short blocked — upsloping EMA
+                elif sig == -1 and ema_t >= 0:     # 5a: short blocked — upsloping EMA
                     sig = 0
+                elif sig != 0 and trend_slope_min > 0.0:  # 5b: slope magnitude gate
+                    _atr_pts = atr_t * tick_size
+                    if _atr_pts > 0 and abs(ema_t) / _atr_pts < trend_slope_min:
+                        flt["n_blocked_by_slope"] += 1
+                        sig = 0
 
         # Filter 6: Risk gate — kill switch / daily halt
         if kill_switch_active or daily_halt:
@@ -1034,11 +1113,16 @@ def _simulate_trades(
             if target != position and i < n - 1:
                 pending_target    = target
                 pending_contracts = _size(atr_t, _session_factor) if target != 0 else entry_contracts
+                pending_block     = _block_idx
                 if target != 0:
                     daily_trade_count += 1
                     flt["n_entries_queued"] += 1
                     if regime_arr is not None and int(regime_arr[i]) == 1:
                         flt["n_trend_entries"] += 1
+                    if _block_idx == 1:
+                        flt["n_in_block1"] += 1
+                    elif _block_idx == 2:
+                        flt["n_in_block2"] += 1
 
         equity_arr[i] = equity
 
@@ -1051,6 +1135,10 @@ def _simulate_trades(
         "kill_switch_triggered":  kill_switch_active,
         "daily_halt_count":       daily_halt_count,
         "filter_counters":        flt,
+        "block1_net_pnl":         block1_pnl,
+        "block2_net_pnl":         block2_pnl,
+        "block1_n_trades":        block1_trades,
+        "block2_n_trades":        block2_trades,
     }
     return trades, equity_series, cost_summary
 

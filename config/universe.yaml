@@ -19,13 +19,16 @@ cost_model:
 
 # ── Filters ────────────────────────────────────────────────────────────────────
 filters:
-  # ES CME Globex regular session: 09:30–16:15 ET
-  #   Winter (ET = UTC-5): 14:30–21:15 UTC
-  #   Summer (ET = UTC-4): 13:30–20:15 UTC
-  # 13.0–21.5 UTC covers 09:00–17:30 ET (summer) / 08:00–16:30 ET (winter).
-  # Fractional values are supported: 13.5 = 13:30, 21.5 = 21:30, etc.
-  session_start_utc_hour: 12.5  # 12:30 UTC = pre-open liquidity (CME futures)
-  session_end_utc_hour:   21.5  # 21:30 UTC = extended close coverage
+  # ES CME Globex — two explicit trading blocks (UTC).
+  # Block 1 = pre-open + morning: 12:30–16:00 UTC (07:30–11:00 ET summer).
+  # Block 2 = afternoon/close:    18:00–21:30 UTC (13:00–16:30 ET summer).
+  # Signals outside both blocks are hard-blocked (no trades).
+  session_blocks:
+    - [12.5, 16.0]   # Block 1: 12:30–16:00 UTC
+    - [18.0, 21.5]   # Block 2: 18:00–21:30 UTC
+  # Legacy single-window fallback (used when session_blocks is empty).
+  session_start_utc_hour: 12.5
+  session_end_utc_hour:   21.5
   # ATR filter: only trade when volatility is meaningful but not runaway
   atr_min_ticks: 4              # restored from 6 — 6 was filtering too aggressively
   atr_max_ticks: 150            # raised from 100 — allow moderately elevated vola
@@ -44,6 +47,7 @@ confidence:
 trend_filter:
   enabled: true
   ema_period: 20
+  min_slope_atr_frac: 0.15   # min |EMA_slope| / ATR_pts to allow entry (0 = disabled)
 
 # ── Prop-firm style risk limits ─────────────────────────────────────────────────
 # Conservative limits matching typical 10% max-drawdown funded-account rules.
