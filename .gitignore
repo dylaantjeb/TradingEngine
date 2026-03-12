@@ -38,3 +38,7 @@ Thumbs.db
 
 # Pytest cache
 .pytest_cache/
+
+# Log files
+logs/
+*.log
