@@ -236,7 +236,7 @@ def run_backtest(
         schema.get("select_by", "unknown"),
         saved_threshold,
         schema.get("val_confident_trades", "?"),
-        float(schema.get("val_trade_coverage_pct", 0)) * 100,
+        float(schema.get("val_trade_coverage_pct", 0)),
         float(schema.get("val_dir_accuracy", 0)) * 100,
         float(schema.get("val_profit_factor", 0)),
     )
@@ -350,6 +350,31 @@ def run_backtest(
 
     _print_metrics_table(symbol, metrics)
 
+    # ── Per-filter execution summary ─────────────────────────────────────────
+    flt = cost_summary.get("filter_counters", {})
+    _n_conf = flt.get("n_confident_signals", 0)
+    _n_exec = flt.get("n_entries_queued", 0)
+    _passthrough = f"{100*_n_exec/_n_conf:.1f}%" if _n_conf > 0 else "n/a"
+    log.info(
+        "[%s] Execution filter summary  |  "
+        "confident_signals=%d  entries_queued=%d  pass_through=%s",
+        symbol, _n_conf, _n_exec, _passthrough,
+    )
+    log.info(
+        "[%s]   blocked_session=%d  blocked_atr=%d  blocked_trend=%d  "
+        "blocked_risk=%d  blocked_loss_cd=%d  blocked_exit_cd=%d  "
+        "blocked_daily_cap=%d  blocked_in_position=%d",
+        symbol,
+        flt.get("blocked_session", 0),
+        flt.get("blocked_atr", 0),
+        flt.get("blocked_trend", 0),
+        flt.get("blocked_risk", 0),
+        flt.get("blocked_loss_cd", 0),
+        flt.get("blocked_exit_cd", 0),
+        flt.get("blocked_daily_cap", 0),
+        flt.get("blocked_in_position", 0),
+    )
+
     # Post-run sanity safeguard: warn if trades are far below what validation suggested
     _val_trades = int(schema.get("val_confident_trades", 0))
     _val_coverage = float(schema.get("val_trade_coverage_pct", 0))
@@ -370,12 +395,13 @@ def run_backtest(
     report_path = report_dir / f"{symbol}_backtest.json"
 
     report = {
-        "symbol":       symbol,
-        "run_at":       datetime.utcnow().isoformat(),
-        "cfg":          {k: str(v) for k, v in cfg.items()},
-        "metrics":      metrics,
-        "trades":       trades[:500],
-        "equity_curve": equity_curve.round(2).tolist(),
+        "symbol":          symbol,
+        "run_at":          datetime.utcnow().isoformat(),
+        "cfg":             {k: str(v) for k, v in cfg.items()},
+        "metrics":         metrics,
+        "filter_counters": cost_summary.get("filter_counters", {}),
+        "trades":          trades[:500],
+        "equity_curve":    equity_curve.round(2).tolist(),
     }
     report_path.write_text(json.dumps(report, indent=2, default=str))
     log.info("Report saved to %s", report_path)
@@ -517,6 +543,24 @@ def _simulate_trades(
     loss_cooldown_left = 0
     daily_halt_count   = 0
 
+    # ── Per-filter block counters ─────────────────────────────────────────────
+    # For every bar where a confident non-flat signal was present, we count
+    # which filters would independently block that signal.  Note: a single bar
+    # can be counted in multiple buckets (filters are checked independently).
+    flt = {
+        "n_confident_signals": 0,   # conf >= threshold AND raw_sig != 0
+        "n_entries_queued":    0,   # target != position (new entry queued)
+        "blocked_session":     0,
+        "blocked_blackout":    0,
+        "blocked_atr":         0,
+        "blocked_trend":       0,
+        "blocked_risk":        0,
+        "blocked_loss_cd":     0,
+        "blocked_exit_cd":     0,
+        "blocked_daily_cap":   0,
+        "blocked_in_position": 0,   # already holding a position same direction
+    }
+
     # ── Helpers ──────────────────────────────────────────────────────────────
 
     def _size(atr_t: float) -> int:
@@ -653,12 +697,46 @@ def _simulate_trades(
             continue
 
         # Filter 1: Confidence gating
+        conf_t = 0.0
         if conf_arr is not None:
             conf_t = conf_arr[i] if not np.isnan(conf_arr[i]) else 0.0
             if sig == 1 and conf_t < min_long_conf:
                 sig = 0
             elif sig == -1 and conf_t < min_short_conf:
                 sig = 0
+
+        # ── Record confident signal for filter-counter diagnostics ───────────
+        # After confidence gate: if signal is still non-zero, check every
+        # subsequent filter independently (a bar may be counted in multiple
+        # buckets — this shows which filters are most active).
+        _conf_sig = int(sig)   # save post-confidence value
+        if _conf_sig != 0:
+            flt["n_confident_signals"] += 1
+            atr_t = atr_arr[i]
+            if not _in_session(ts, sess_start, sess_end):
+                flt["blocked_session"] += 1
+            if _in_blackout(ts, blackouts):
+                flt["blocked_blackout"] += 1
+            if not (atr_min <= atr_t <= atr_max):
+                flt["blocked_atr"] += 1
+            if trend_filter_on and ema_arr is not None and close_arr is not None:
+                ema_t   = ema_arr[i]
+                close_t = close_arr[i]
+                if not (np.isnan(ema_t) or np.isnan(close_t)):
+                    if (_conf_sig == 1 and close_t < ema_t) or \
+                       (_conf_sig == -1 and close_t > ema_t):
+                        flt["blocked_trend"] += 1
+            if kill_switch_active or daily_halt:
+                if position == 0 or _conf_sig * position < 0:
+                    flt["blocked_risk"] += 1
+            if loss_cooldown_left > 0 and position == 0:
+                flt["blocked_loss_cd"] += 1
+            if cooldown_left > 0 and position == 0:
+                flt["blocked_exit_cd"] += 1
+            if daily_trade_count >= max_tpd and _conf_sig != position:
+                flt["blocked_daily_cap"] += 1
+            if position != 0 and _conf_sig == position:
+                flt["blocked_in_position"] += 1
 
         # Filter 2: Session filter
         if not _in_session(ts, sess_start, sess_end):
@@ -751,6 +829,7 @@ def _simulate_trades(
                 pending_contracts = _size(atr_t) if target != 0 else entry_contracts
                 if target != 0:
                     daily_trade_count += 1
+                    flt["n_entries_queued"] += 1
 
         equity_arr[i] = equity
 
@@ -762,6 +841,7 @@ def _simulate_trades(
         "consecutive_losses_max": consec_losses_max,
         "kill_switch_triggered":  kill_switch_active,
         "daily_halt_count":       daily_halt_count,
+        "filter_counters":        flt,
     }
     return trades, equity_series, cost_summary
 
