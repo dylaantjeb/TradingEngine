@@ -25,6 +25,7 @@ import pandas as pd
 import yaml
 
 from src.features.builder import build_features, MIN_ROWS
+from src.backtest.engine import _in_session_blocks
 
 log = logging.getLogger(__name__)
 
@@ -89,6 +90,8 @@ def _load_cfg(symbol: str) -> tuple[dict, dict]:
         cfg["trend_filter_enabled"] = tf["enabled"]
     if "ema_period" in tf:
         cfg["trend_filter_ema_period"] = tf["ema_period"]
+    if "min_slope_atr_frac" in tf:
+        cfg["trend_slope_min_atr_frac"] = tf["min_slope_atr_frac"]
     cfg.update(u.get("risk_limits", {}))
     ps = u.get("position_sizing", {})
     if "method" in ps:
@@ -149,6 +152,8 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
     delay          = int(cfg.get("execution_delay_bars", 1))
     sess_start     = float(cfg.get("session_start_utc_hour", 0))
     sess_end       = float(cfg.get("session_end_utc_hour", 24))
+    _raw_blocks    = cfg.get("session_blocks", [])
+    sess_blocks    = [(float(b[0]), float(b[1])) for b in _raw_blocks] if _raw_blocks else []
     atr_min        = float(cfg.get("atr_min_ticks", 0))
     atr_max        = float(cfg.get("atr_max_ticks", 1e9))
     blackouts      = cfg.get("news_blackout_windows", [])
@@ -179,6 +184,8 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
     # Trend filter
     trend_filter_on  = bool(cfg.get("trend_filter_enabled", False))
     trend_ema_period = int(cfg.get("trend_filter_ema_period", 200))
+    trend_slope_min  = float(cfg.get("trend_slope_min_atr_frac", 0.0))
+    tick_size_cfg    = float(cfg.get("tick_size", 0.25))
 
     # Risk limits
     starting_equity    = float(cfg.get("starting_equity", 100_000.0))
@@ -348,11 +355,22 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
         "n_chop_blocked":      0,
         "n_low_vol_blocked":   0,
         "n_after_trend":       0,
+        "n_blocked_by_slope":  0,
         "n_after_risk":        0,
         "n_after_cooldowns":   0,
         "n_entries_queued":    0,
         "n_trend_entries":     0,
+        "n_in_block1":         0,
+        "n_in_block2":         0,
     }
+
+    # Session block PnL tracking
+    pending_block = 0    # block of queued pending entry
+    entry_block   = 0    # block of current open position's entry bar
+    block1_pnl    = 0.0
+    block2_pnl    = 0.0
+    block1_trades = 0
+    block2_trades = 0
 
     last_signal     = 0
     last_confidence = 0.0
@@ -446,17 +464,24 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
                     net_pnl   = raw_pnl - cost
                     gross_pnl_total  += raw_pnl
                     total_cost_total += cost
+                    if entry_block == 1:
+                        block1_pnl    += net_pnl
+                        block1_trades += 1
+                    elif entry_block == 2:
+                        block2_pnl    += net_pnl
+                        block2_trades += 1
                     trades.append({
-                        "time":      str(ts),
-                        "dir":       "L" if position > 0 else "S",
-                        "entry":     round(entry_price, 2),
-                        "exit":      round(exit_fill, 2),
-                        "hold_bars": bar_count - entry_bar_num,
-                        "n_contr":   entry_contracts,
-                        "gross":     round(raw_pnl, 2),
-                        "cost":      round(cost, 2),
-                        "pnl":       round(net_pnl, 2),
-                        "equity":    round(equity + net_pnl, 2),
+                        "time":        str(ts),
+                        "dir":         "L" if position > 0 else "S",
+                        "entry":       round(entry_price, 2),
+                        "exit":        round(exit_fill, 2),
+                        "hold_bars":   bar_count - entry_bar_num,
+                        "n_contr":     entry_contracts,
+                        "gross":       round(raw_pnl, 2),
+                        "cost":        round(cost, 2),
+                        "pnl":         round(net_pnl, 2),
+                        "equity":      round(equity + net_pnl, 2),
+                        "entry_block": entry_block,
                     })
                     log.debug(
                         "[%s] EXIT %s @ %.2f  gross=%.2f cost=%.2f net=%.2f  eq=%.2f",
@@ -473,6 +498,7 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
                         position        = pending_target
                         entry_bar_num   = bar_count
                         entry_contracts = n_c
+                        entry_block     = pending_block
                         log.debug(
                             "[%s] ENTER %s @ %.2f (reversal, %d contracts)",
                             ts, "L" if position > 0 else "S", entry_price, n_c,
@@ -483,6 +509,7 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
                     position        = pending_target
                     entry_bar_num   = bar_count
                     entry_contracts = n_c
+                    entry_block     = pending_block
                     log.debug(
                         "[%s] ENTER %s @ %.2f (%d contracts)",
                         ts, "L" if position > 0 else "S", entry_price, n_c,
@@ -516,7 +543,14 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
             def _check(name: str, passed: bool) -> None:
                 (filters_passed if passed else filters_failed).append(name)
 
-            _session_factor = 1.0  # updated in Filter 2; used for position sizing
+            # ── Session block membership for this bar ────────────────────────
+            if sess_blocks:
+                _in_block, _block_idx = _in_session_blocks(ts, sess_blocks)
+            else:
+                _in_block  = _in_session(ts, sess_start, sess_end)
+                _block_idx = 1 if _in_block else 0
+
+            _session_factor = 1.0  # always full size within a block
 
             # Filter 1: Confidence gating
             conf_ok = True
@@ -533,7 +567,7 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
             _conf_sig = int(sig)
             if _conf_sig != 0:
                 flt["n_confident_signals"] += 1
-                if _in_session(ts, sess_start, sess_end):
+                if _in_block:
                     flt["n_after_session"] += 1
                     if not _in_blackout(ts, blackouts):
                         flt["n_after_blackout"] += 1
@@ -543,10 +577,13 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
                                 flt["n_after_regime"] += 1
                                 _tr_ok = True
                                 if trend_filter_on and not np.isnan(ema_val):
-                                    # ema_val is now slope (EMA - EMA.shift(5))
                                     if (_conf_sig == 1 and ema_val <= 0) or \
                                        (_conf_sig == -1 and ema_val >= 0):
                                         _tr_ok = False
+                                    elif trend_slope_min > 0.0:
+                                        _atp = atr_ticks * tick_size_cfg
+                                        if _atp > 0 and abs(ema_val) / _atp < trend_slope_min:
+                                            _tr_ok = False
                                 if _tr_ok:
                                     flt["n_after_trend"] += 1
                                     _risk_ok = not (
@@ -564,11 +601,16 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
                                         if _cd_ok:
                                             flt["n_after_cooldowns"] += 1
 
-            # Filter 2: Session — soft block: 50% size outside session
-            sess_ok = _in_session(ts, sess_start, sess_end)
-            _session_factor = 1.0 if sess_ok else 0.5
-            _check("session", sess_ok)
-            # Signal NOT zeroed out — size halved instead (see _size calls below)
+            # Filter 2: Session blocks — hard block outside all defined windows.
+            # When session_blocks is configured: signals outside blocks are zeroed.
+            # Legacy (session_blocks empty): soft block — size halved.
+            if sess_blocks:
+                if not _in_block:
+                    sig = 0
+                _check("session_block", _in_block)
+            else:
+                _session_factor = 1.0 if _in_block else 0.5
+                _check("session", _in_block)
 
             # Filter 3: Blackout
             bo_ok = not _in_blackout(ts, blackouts)
@@ -595,14 +637,18 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
                 else:
                     _check(f"regime_trend({atr_regime:.2f})", True)
 
-            # Filter 5: Trend slope filter (ema_val is EMA slope, not raw EMA)
-            # Long allowed when slope > 0; short allowed when slope < 0.
+            # Filter 5: Trend slope — direction (5a) + quality gate (5b)
             if trend_filter_on and not np.isnan(ema_val):
                 trend_ok = True
-                if sig == 1 and ema_val <= 0:
+                if sig == 1 and ema_val <= 0:       # 5a: direction
                     trend_ok = False
-                elif sig == -1 and ema_val >= 0:
+                elif sig == -1 and ema_val >= 0:    # 5a: direction
                     trend_ok = False
+                elif sig != 0 and trend_slope_min > 0.0:  # 5b: magnitude
+                    _atr_pts = atr_ticks * tick_size_cfg
+                    if _atr_pts > 0 and abs(ema_val) / _atr_pts < trend_slope_min:
+                        flt["n_blocked_by_slope"] += 1
+                        trend_ok = False
                 _check(f"trend_slope({ema_val:.4f})", trend_ok)
                 if not trend_ok:
                     sig = 0
@@ -678,11 +724,16 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
                 if target != position and raw_i < n_raw - 1:
                     pending_target    = target
                     pending_contracts = _size(atr_ticks, _session_factor) if target != 0 else entry_contracts
+                    pending_block     = _block_idx
                     if target != 0:
                         daily_trade_count += 1
                         flt["n_entries_queued"] += 1
                         if regime_val == 1:
                             flt["n_trend_entries"] += 1
+                        if _block_idx == 1:
+                            flt["n_in_block1"] += 1
+                        elif _block_idx == 2:
+                            flt["n_in_block2"] += 1
 
             # ── Per-bar diagnostics (debug level) ─────────────────────────────
             if log.isEnabledFor(logging.DEBUG):
@@ -727,6 +778,9 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
     _nchb  = flt.get("n_chop_blocked",       0)
     _nlvb  = flt.get("n_low_vol_blocked",    0)
     _nte   = flt.get("n_trend_entries",      0)
+    _nsb   = flt.get("n_blocked_by_slope",   0)
+    _nb1   = flt.get("n_in_block1",          0)
+    _nb2   = flt.get("n_in_block2",          0)
     _ntr   = flt.get("n_after_trend",        0)
     _nrisk = flt.get("n_after_risk",         0)
     _ncd   = flt.get("n_after_cooldowns",    0)
@@ -745,11 +799,22 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
         "[%s]   → after regime    : %5d → %5d  (%s pass)  [chop_blk=%d  lv_blk=%d  trend_entries=%d]",
         symbol, _natr, _nreg, _pp(_nreg, _natr), _nchb, _nlvb, _nte,
     )
-    log.info("[%s]   → after trend     : %5d → %5d  (%s pass)", symbol, _nreg, _ntr, _pp(_ntr, _nreg))
+    log.info(
+        "[%s]   → after trend     : %5d → %5d  (%s pass)  [slope_blk=%d]",
+        symbol, _nreg, _ntr, _pp(_ntr, _nreg), _nsb,
+    )
     log.info("[%s]   → after risk/halt : %5d → %5d  (%s pass)", symbol, _ntr, _nrisk, _pp(_nrisk, _ntr))
     log.info("[%s]   → after cooldowns : %5d → %5d  (%s pass)", symbol, _nrisk, _ncd, _pp(_ncd, _nrisk))
-    log.info("[%s]   → entries queued  : %5d → %5d  (%s pass)", symbol, _ncd, _nq, _pp(_nq, _ncd))
-    log.info("[%s]   → trades executed : %5d → %5d  (%s of queued)", symbol, _nq, _nex, _pp(_nex, _nq))
+    log.info(
+        "[%s]   → entries queued  : %5d → %5d  (%s pass)  [block1=%d  block2=%d]",
+        symbol, _ncd, _nq, _pp(_nq, _ncd), _nb1, _nb2,
+    )
+    log.info(
+        "[%s]   → trades executed : %5d → %5d  (%s of queued)  "
+        "[block1: %d trades $%.0f | block2: %d trades $%.0f]",
+        symbol, _nq, _nex, _pp(_nex, _nq),
+        block1_trades, block1_pnl, block2_trades, block2_pnl,
+    )
     log.info(
         "[%s]   OVERALL: conf→executed = %d → %d  (%s end-to-end pass-through)",
         symbol, _nc, _nex, _pp(_nex, _nc),
@@ -765,12 +830,16 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
             "  %d in-session\n"
             "  %d after ATR\n"
             "  %d after regime  (chop_blk=%d  lv_blk=%d)\n"
-            "  %d after trend\n"
-            "  %d queued  (trend_entries=%d)\n"
-            "  %d executed\n"
+            "  %d after trend  (slope_blk=%d)\n"
+            "  %d queued  [block1=%d block2=%d  trend_entries=%d]\n"
+            "  %d executed  [block1: %d trades $%.0f | block2: %d trades $%.0f]\n"
             "  Overall pass-through = %.1f%%",
             symbol,
-            _nc, _ns, _natr, _nreg, _nchb, _nlvb, _ntr, _nq, _nte, _nex, _overall_pct,
+            _nc, _ns, _natr, _nreg, _nchb, _nlvb,
+            _ntr, _nsb,
+            _nq, _nb1, _nb2, _nte,
+            _nex, block1_trades, block1_pnl, block2_trades, block2_pnl,
+            _overall_pct,
         )
 
     # ── CRITICAL pipeline blockage check (<10%) ───────────────────────────────
