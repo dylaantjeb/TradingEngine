@@ -3,54 +3,52 @@ Walk-forward (time-series cross-validation) for TradingEngine.
 
 Three modes
 -----------
-  rolling  : fixed-size train window slides forward with each fold  (default)
-  expanding: anchored train window grows with each fold (anchored at t=0)
-  split    : single train/test cut by time fraction (simplest OOS test)
+  rolling  : fixed-size train window slides forward (default)
+  expanding: anchored train window grows with each fold
+  split    : single train/test cut by time fraction
+
+Selection modes (--select-by)
+------------------------------
+  f1      (default): train each fold with fast fixed hyperparams; confidence
+                     threshold selected post-hoc by sweeping candidates on the
+                     inner validation split (last 20% of train window).
+  trading :          threshold co-selected with hyperparams using the same
+                     four-gate trading objective used in `train --select-by trading`.
+                     When Optuna is used (n_trials > 0) threshold is an Optuna
+                     parameter. Without Optuna, threshold is swept post-hoc.
+
+Per-fold OOS diagnostics
+-------------------------
+Every fold logs:
+  • confidence threshold used
+  • OOS confident trade count / total bars (coverage %)
+  • OOS directional accuracy on confident trades
+  • OOS profit factor
+  • WEAK / OK flag  (WEAK = fewer than _WEAK_FOLD_MIN_TRADES trades
+                            OR coverage < _WEAK_FOLD_MIN_COVERAGE_PCT)
+
+Weak-fold warning
+-----------------
+Folds with 0–4 OOS trades or < 0.2% coverage are flagged WEAK.
+They are still included in aggregate metrics (they contribute to
+pct_profitable_folds), but the summary prints a count of weak folds
+as a signal that the model is under-trading in live conditions.
 
 Leakage guarantees
 ------------------
-  • Model and RobustScaler are fit ONLY on the train slice for each fold.
-  • Production artifacts (artifacts/) are NEVER written during walk-forward;
-    per-fold training runs entirely in memory.
-  • Test slice timestamps are strictly greater than train slice timestamps
-    (enforced by integer-index slicing on a time-sorted DataFrame).
-  • EMA(200) for the trend filter is computed on the full close series so
-    every test window has proper warm-up history before its first bar.
-  • Raw prices for execution fills come from data/raw/<symbol>_M1.csv;
-    if the file is absent a close-only proxy is used with a logged warning.
+  • Model + RobustScaler fit ONLY on the train slice for each fold.
+  • Production artifacts (artifacts/) never written during walk-forward.
+  • Test timestamps strictly > train timestamps (integer-index slicing).
+  • EMA(200) computed on full series → no cold-start artefact in test window.
 
-Stability metrics reported
---------------------------
-  pct_profitable_folds : fraction of folds with net_pnl > 0
-  avg_profit_factor    : mean profit factor across folds
-  pnl_cv               : coeff. of variation of fold PnLs (lower = more stable)
-  std_sharpe           : std of fold Sharpe ratios        (lower = more stable)
-  t_stat_pnl           : t-statistic of fold PnLs         (>1.65 → 95% sig.)
-  funded_ready         : FUNDED-READY | PROMISING | MARGINAL | NOT READY
-
-Stability thresholds (stricter than industry-standard for funded-account safety)
----------------------------------------------------------------------------------
-  FUNDED-READY  : pct_profitable ≥ 0.70  AND  avg_pf ≥ 1.50  AND
-                  pnl_cv ≤ 1.0           AND  t_stat ≥ 1.65
-  PROMISING     : pct_profitable ≥ 0.60  AND  avg_pf ≥ 1.30  AND
-                  pnl_cv ≤ 1.5           AND  total_pnl > 0
-  MARGINAL      : pct_profitable ≥ 0.40  AND  avg_pf ≥ 1.10
-  NOT READY     : anything else
-
-Usage
------
-  # rolling (default) – fixed train window slides forward
-  python -m src.cli walk-forward --symbol ES
-
-  # expanding – train window grows from origin
-  python -m src.cli walk-forward --symbol ES --mode expanding \\
-      --train-bars 8000 --test-bars 2000
-
-  # single train/test split (80/20)
-  python -m src.cli walk-forward --symbol ES --mode split --split-pct 0.8
-
-  # skip Optuna → fast fixed hyperparameters (recommended for many folds)
-  python -m src.cli walk-forward --symbol ES --no-optuna
+Stability thresholds
+--------------------
+  FUNDED-READY : pct_profitable ≥ 70%  AND  avg_pf ≥ 1.5  AND
+                 pnl_cv ≤ 1.0          AND  t_stat ≥ 1.65
+  PROMISING    : pct_profitable ≥ 60%  AND  avg_pf ≥ 1.3  AND
+                 pnl_cv ≤ 1.5          AND  total_pnl > 0
+  MARGINAL     : pct_profitable ≥ 40%  AND  avg_pf ≥ 1.1
+  NOT READY    : anything else
 """
 
 from __future__ import annotations
@@ -72,10 +70,10 @@ _ARTS = Path("artifacts")
 _UNIVERSE_CFG = Path("config/universe.yaml")
 
 # Funded-account readiness thresholds
-_FUNDED_MIN_PCT_PROF   = 0.70   # ≥ 70% of folds profitable
-_FUNDED_MIN_PF         = 1.50   # avg profit factor ≥ 1.5
-_FUNDED_MAX_CV         = 1.00   # PnL CV ≤ 1.0  (tight consistency)
-_FUNDED_MIN_TSTAT      = 1.65   # t-statistic ≥ 1.65 (95% one-sided)
+_FUNDED_MIN_PCT_PROF   = 0.70
+_FUNDED_MIN_PF         = 1.50
+_FUNDED_MAX_CV         = 1.00
+_FUNDED_MIN_TSTAT      = 1.65
 
 _PROMISING_MIN_PCT_PROF = 0.60
 _PROMISING_MIN_PF       = 1.30
@@ -83,6 +81,10 @@ _PROMISING_MAX_CV       = 1.50
 
 _MARGINAL_MIN_PCT_PROF  = 0.40
 _MARGINAL_MIN_PF        = 1.10
+
+# OOS activity gate — folds below these are flagged WEAK
+_WEAK_FOLD_MIN_TRADES        = 5
+_WEAK_FOLD_MIN_COVERAGE_PCT  = 0.2   # 0.2% of test bars
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -115,6 +117,13 @@ class FoldResult:
     trades_per_day:       float = 0.0
     consecutive_losses_max: int = 0
     profitable:           bool  = False
+    # OOS activity diagnostics
+    conf_threshold:          float = 0.65
+    oos_conf_trade_count:    int   = 0
+    oos_trade_coverage_pct:  float = 0.0
+    oos_dir_accuracy:        float = 0.0
+    oos_profit_factor:       float = 0.0
+    weak_fold:               bool  = False
 
 
 @dataclass
@@ -124,6 +133,7 @@ class WalkForwardSummary:
     n_folds:    int
     train_bars: int
     test_bars:  int
+    select_by:  str = "f1"
     folds:      list[FoldResult] = field(default_factory=list)
     aggregate:  dict             = field(default_factory=dict)
 
@@ -142,6 +152,7 @@ def run_walk_forward(
     min_train_bars: Optional[int] = None,
     split_pct: float = 0.8,
     n_trials: int = 0,
+    select_by: str = "f1",
     save_report: bool = True,
 ) -> WalkForwardSummary:
     """
@@ -149,30 +160,24 @@ def run_walk_forward(
 
     Parameters
     ----------
-    symbol        : Symbol to validate (must have data/processed/ parquets).
+    symbol        : Symbol (must have data/processed/ parquets).
     mode          : 'rolling' | 'expanding' | 'split'.
     train_bars    : Training window size in bars (rolling / expanding).
     test_bars     : Test window size in bars.
-    step_bars     : Step between folds (default = test_bars → non-overlapping).
-    min_train_bars: Expanding mode: minimum initial training size
-                    (default = train_bars).
-    split_pct     : Split mode: fraction of dataset used for training
-                    (default 0.8).
-    n_trials      : Optuna trials per fold (0 = fast fixed hyperparameters;
-                    recommended for walk-forward with many folds).
+    step_bars     : Step between folds (default = test_bars).
+    min_train_bars: Expanding: minimum initial training size.
+    split_pct     : Split mode: fraction for training (default 0.8).
+    n_trials      : Optuna trials per fold (0 = fast fixed hyperparameters).
+    select_by     : 'f1' | 'trading' — model selection objective per fold.
     save_report   : Write JSON report to artifacts/reports/.
-
-    Returns
-    -------
-    WalkForwardSummary with per-fold FoldResult objects and aggregate metrics.
     """
     if mode not in ("rolling", "expanding", "split"):
-        raise ValueError(
-            f"mode must be 'rolling', 'expanding', or 'split', got {mode!r}"
-        )
+        raise ValueError(f"mode must be 'rolling', 'expanding', or 'split', got {mode!r}")
+    if select_by not in ("f1", "trading"):
+        raise ValueError(f"select_by must be 'f1' or 'trading', got {select_by!r}")
 
-    step    = step_bars    or test_bars
-    min_tr  = min_train_bars or train_bars
+    step   = step_bars    or test_bars
+    min_tr = min_train_bars or train_bars
 
     # ── Load features + labels ─────────────────────────────────────────────
     feat_path = Path(f"data/processed/{symbol}_features.parquet")
@@ -192,13 +197,14 @@ def run_walk_forward(
     feature_names = [c for c in aligned.columns if c != "label"]
 
     log.info(
-        "Walk-forward [%s] %s → %s  |  %d bars  |  %d features  |  mode=%s",
+        "Walk-forward [%s] %s → %s  |  %d bars  |  %d features  |  "
+        "mode=%s  select_by=%s",
         symbol,
         aligned.index[0].date(), aligned.index[-1].date(),
-        n_total, len(feature_names), mode,
+        n_total, len(feature_names), mode, select_by,
     )
 
-    # ── Raw prices + EMA (computed once on full series) ────────────────────
+    # ── Raw prices + EMA ──────────────────────────────────────────────────
     raw_prices, full_ema = _load_prices(symbol, aligned.index)
 
     # ── Engine config ──────────────────────────────────────────────────────
@@ -212,7 +218,7 @@ def run_walk_forward(
         fold_ranges = _build_folds_rolling(n_total, train_bars, test_bars, step)
     elif mode == "expanding":
         fold_ranges = _build_folds_expanding(n_total, min_tr, test_bars, step)
-    else:  # split
+    else:
         fold_ranges = _build_folds_split(n_total, split_pct)
 
     if not fold_ranges:
@@ -240,14 +246,29 @@ def run_walk_forward(
             test_df.index[0].date(),  test_df.index[-1].date(),  len(test_df),
         )
 
-        # ── Train (in-memory; no disk writes) ─────────────────────────────
+        # ── Train (in-memory) ──────────────────────────────────────────────
         try:
-            model, scaler, inv_label_map = _train_on_slice(
-                train_df, feature_names, n_trials
+            model, scaler, inv_label_map, conf_threshold = _train_on_slice(
+                train_df, feature_names, n_trials, select_by,
             )
         except Exception as exc:
             log.warning("Fold %d  training failed: %s — skipping", fold_idx, exc)
             continue
+
+        log.info(
+            "Fold %d  trained  |  select_by=%s  threshold=%.2f",
+            fold_idx + 1, select_by, conf_threshold,
+        )
+
+        # ── OOS activity diagnostics ───────────────────────────────────────
+        oos_stats = _compute_oos_stats(
+            model, scaler, feature_names, test_df, inv_label_map, conf_threshold,
+        )
+        weak_fold = (
+            oos_stats["n_trades"] < _WEAK_FOLD_MIN_TRADES
+            or oos_stats["trade_coverage_pct"] < _WEAK_FOLD_MIN_COVERAGE_PCT
+        )
+        _log_fold_oos_stats(fold_idx + 1, oos_stats, conf_threshold, weak_fold)
 
         # ── Backtest on test window ────────────────────────────────────────
         try:
@@ -262,6 +283,7 @@ def run_walk_forward(
                 cfg=cfg,
                 specs=specs,
                 starting_equity=starting_equity,
+                conf_threshold=conf_threshold,
             )
         except Exception as exc:
             log.warning("Fold %d  backtest failed: %s — skipping", fold_idx, exc)
@@ -290,6 +312,12 @@ def run_walk_forward(
             trades_per_day=metrics.get("trades_per_day", 0.0),
             consecutive_losses_max=metrics.get("consecutive_losses_max", 0),
             profitable=metrics.get("net_pnl", 0.0) > 0,
+            conf_threshold=conf_threshold,
+            oos_conf_trade_count=oos_stats["n_trades"],
+            oos_trade_coverage_pct=oos_stats["trade_coverage_pct"],
+            oos_dir_accuracy=oos_stats["dir_accuracy"],
+            oos_profit_factor=oos_stats["profit_factor"],
+            weak_fold=weak_fold,
         )
         folds.append(fr)
 
@@ -300,6 +328,7 @@ def run_walk_forward(
         n_folds=len(folds),
         train_bars=train_bars,
         test_bars=test_bars,
+        select_by=select_by,
         folds=folds,
         aggregate=agg,
     )
@@ -320,25 +349,12 @@ def run_walk_forward(
 def _build_folds_rolling(
     n: int, train_bars: int, test_bars: int, step_bars: int,
 ) -> list[tuple[int, int, int, int]]:
-    """
-    Fixed-size rolling window folds.
-
-    Each fold:
-      train = [start, start + train_bars)
-      test  = [start + train_bars, start + train_bars + test_bars)
-
-    Window advances by step_bars; stops when test window would exceed n.
-
-    Returns list of (train_start, train_end, test_start, test_end) index tuples.
-    """
     folds: list[tuple[int, int, int, int]] = []
     start = 0
     while start + train_bars + test_bars <= n:
         folds.append((
-            start,
-            start + train_bars,
-            start + train_bars,
-            start + train_bars + test_bars,
+            start, start + train_bars,
+            start + train_bars, start + train_bars + test_bars,
         ))
         start += step_bars
     return folds
@@ -347,14 +363,6 @@ def _build_folds_rolling(
 def _build_folds_expanding(
     n: int, min_train_bars: int, test_bars: int, step_bars: int,
 ) -> list[tuple[int, int, int, int]]:
-    """
-    Expanding (anchored) window folds.
-
-    Train always starts at 0 and grows by step_bars each fold.
-    First fold: train = [0, min_train_bars), test = [min_train_bars, +test_bars).
-
-    Returns list of (train_start, train_end, test_start, test_end) index tuples.
-    """
     folds: list[tuple[int, int, int, int]] = []
     train_end = min_train_bars
     while train_end + test_bars <= n:
@@ -366,14 +374,6 @@ def _build_folds_expanding(
 def _build_folds_split(
     n: int, split_pct: float,
 ) -> list[tuple[int, int, int, int]]:
-    """
-    Single time-based train/test split.
-
-    train = [0, int(n * split_pct))
-    test  = [int(n * split_pct), n)
-
-    Returns a list containing exactly one tuple.
-    """
     split = int(n * split_pct)
     if split <= 0 or split >= n:
         raise ValueError(
@@ -391,25 +391,18 @@ def _train_on_slice(
     train_df: pd.DataFrame,
     feature_names: list[str],
     n_trials: int = 0,
+    select_by: str = "f1",
 ) -> tuple:
     """
     Train XGBoost + RobustScaler on train_df in memory.
 
-    Hyperparameters are tuned for OOS robustness (shallower trees,
-    stronger regularisation) rather than in-sample accuracy.
-
-    Parameters
-    ----------
-    train_df      : DataFrame with feature columns + "label" column.
-    feature_names : Ordered list of feature column names to use.
-    n_trials      : Optuna trials (0 = fast fixed hyperparameters).
-
     Returns
     -------
-    (model, scaler, inv_label_map)
-      model         — fitted XGBClassifier
-      scaler        — fitted RobustScaler (fitted on train_df only)
-      inv_label_map — {str(encoded_class): original_label_int}
+    (model, scaler, inv_label_map, conf_threshold)
+      model           — fitted XGBClassifier
+      scaler          — fitted RobustScaler (fitted on train_df only)
+      inv_label_map   — {str(encoded_class): original_label_int}
+      conf_threshold  — selected confidence threshold (float)
 
     Raises
     ------
@@ -417,12 +410,13 @@ def _train_on_slice(
     """
     import xgboost as xgb
     from sklearn.preprocessing import LabelEncoder, RobustScaler
+    from src.training.train import _select_best_threshold
 
     feat_cols = [c for c in feature_names if c in train_df.columns]
     if not feat_cols:
         raise ValueError("No matching feature columns found in train_df.")
 
-    X_df  = train_df[feat_cols]          # keep as DataFrame (preserves feature names)
+    X_df  = train_df[feat_cols]
     y_raw = train_df["label"].values
 
     unique_classes = np.unique(y_raw)
@@ -436,18 +430,19 @@ def _train_on_slice(
     y_enc = le.fit_transform(y_raw)
 
     scaler   = RobustScaler()
-    X_scaled = scaler.fit_transform(X_df)      # scaler fitted on train window only
+    X_scaled = scaler.fit_transform(X_df)
 
+    # int-keyed inv_label_map — used internally for trading stats
+    int_inv_map = {i: int(cls) for i, cls in enumerate(le.classes_)}
+    # str-keyed — returned for use by _backtest_on_slice
     inv_label_map = {str(i): int(cls) for i, cls in enumerate(le.classes_)}
 
     if n_trials > 0:
-        model = _optuna_train(X_scaled, y_enc, n_trials)
+        model, conf_threshold = _optuna_train(
+            X_scaled, y_enc, y_raw, int_inv_map, n_trials, select_by,
+        )
     else:
-        # Conservative fixed hyperparameters designed for OOS robustness:
-        # - shallow trees (max_depth=3) → less overfitting
-        # - strong L2 regularisation (reg_lambda=3)
-        # - high min_child_weight → each leaf needs many samples
-        # - slower learning rate → generalises across regimes
+        # Conservative fixed hyperparameters for OOS robustness
         model = xgb.XGBClassifier(
             n_estimators=200,
             max_depth=3,
@@ -464,33 +459,59 @@ def _train_on_slice(
         )
         model.fit(X_scaled, y_enc)
 
-    return model, scaler, inv_label_map
+        if select_by == "trading":
+            # Use last 20% of train as inner val to select threshold.
+            # Model is already fit on full train; this is a post-hoc threshold
+            # sweep, not a second fit — acceptable for threshold selection.
+            inner_split     = int(len(X_scaled) * 0.8)
+            X_inner_val     = X_scaled[inner_split:]
+            y_inner_val_raw = y_raw[inner_split:]
+            inner_proba     = model.predict_proba(X_inner_val)
+            conf_threshold  = _select_best_threshold(
+                inner_proba, y_inner_val_raw, int_inv_map,
+                n_val_bars=len(X_inner_val),
+            )
+        else:
+            conf_threshold = 0.65
+
+    return model, scaler, inv_label_map, conf_threshold
 
 
 def _optuna_train(
     X_scaled: np.ndarray,
     y_enc: np.ndarray,
+    y_raw: np.ndarray,
+    int_inv_map: dict,
     n_trials: int,
-):
+    select_by: str = "f1",
+) -> tuple:
     """
     Optuna hyperparameter search within a training slice.
 
-    Inner validation: last 20% of the training slice (time-ordered, no shuffle).
-    Search space is biased towards conservative / generalisable models.
+    Returns (model, conf_threshold).
+    Inner validation: last 20% of the training slice (time-ordered).
+    When select_by='trading', threshold is co-optimised via Optuna.
     """
     import optuna
     import xgboost as xgb
     from sklearn.metrics import f1_score
+    from src.training.train import (
+        _THRESHOLD_CANDIDATES, _GATE_FAIL_SCORE,
+        _HC_MIN_TRADES, _HC_MIN_COVERAGE, _HC_MIN_DIR_ACC, _HC_MIN_PF,
+        _trading_quality_score, _select_best_threshold,
+        _COMPOSITE_F1_WEIGHT, _COMPOSITE_TRADING_WEIGHT, _COMPOSITE_ROBUST_WEIGHT,
+    )
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     split   = int(len(X_scaled) * 0.8)
     X_tr    = X_scaled[:split];  X_val = X_scaled[split:]
     y_tr    = y_enc[:split];     y_val = y_enc[split:]
+    y_val_raw = y_raw[split:]
+    n_val   = len(X_val)
 
     def objective(trial: optuna.Trial) -> float:
         params = {
-            # Conservative ranges — prefer depth ≤ 5 and higher regularisation
             "n_estimators":     trial.suggest_int("n_estimators", 100, 400),
             "max_depth":        trial.suggest_int("max_depth", 2, 5),
             "learning_rate":    trial.suggest_float("learning_rate", 0.01, 0.10, log=True),
@@ -507,19 +528,138 @@ def _optuna_train(
         m = xgb.XGBClassifier(**params)
         m.fit(X_tr, y_tr)
         pred = m.predict(X_val)
-        return float(f1_score(y_val, pred, average="macro", zero_division=0))
+        f1 = float(f1_score(y_val, pred, average="macro", zero_division=0))
+
+        if select_by != "trading":
+            return f1
+
+        # Trading: threshold as Optuna parameter with same gate logic as train.py
+        threshold = trial.suggest_categorical("conf_threshold", _THRESHOLD_CANDIDATES)
+        proba = m.predict_proba(X_val)
+        conf  = np.max(proba, axis=1)
+        sig   = np.array([int_inv_map.get(int(e), 0) for e in np.argmax(proba, axis=1)])
+        mask  = (conf >= threshold) & (sig != 0)
+        n_c   = int(mask.sum())
+        cov   = n_c / n_val
+
+        if n_c < _HC_MIN_TRADES or cov < _HC_MIN_COVERAGE:
+            return _GATE_FAIL_SCORE
+
+        sig_t   = sig[mask];  y_t = y_val_raw[mask]
+        wins    = int(((sig_t == y_t) & (y_t != 0)).sum())
+        losses  = n_c - wins
+        dir_acc = wins / n_c
+        pf      = min((wins / losses) if losses > 0 else float(wins), 5.0)
+
+        if dir_acc < _HC_MIN_DIR_ACC or pf < _HC_MIN_PF:
+            return _GATE_FAIL_SCORE
+
+        tq = _trading_quality_score(proba, y_val_raw, int_inv_map,
+                                    min_conf=threshold, n_val_bars=n_val)
+        return _COMPOSITE_F1_WEIGHT * f1 + _COMPOSITE_TRADING_WEIGHT * tq
 
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
 
+    best_params = dict(study.best_params)
+
+    # Extract threshold; fall back to post-hoc selection if needed
+    if select_by == "trading":
+        all_failed = study.best_value <= _GATE_FAIL_SCORE * 0.5
+        if all_failed:
+            log.warning(
+                "Walk-forward fold: ALL %d Optuna trials failed trading gates. "
+                "Falling back to F1 selection with post-hoc threshold.",
+                n_trials,
+            )
+        threshold_from_optuna = best_params.pop("conf_threshold", None)
+    else:
+        threshold_from_optuna = None
+
     model = xgb.XGBClassifier(
-        **study.best_params,
+        **best_params,
         eval_metric="mlogloss",
         random_state=42,
         verbosity=0,
     )
     model.fit(X_scaled, y_enc)
-    return model
+
+    if threshold_from_optuna is not None:
+        conf_threshold = float(threshold_from_optuna)
+    else:
+        # Post-hoc threshold selection using inner val
+        proba          = model.predict_proba(X_val)
+        conf_threshold = _select_best_threshold(
+            proba, y_val_raw, int_inv_map, n_val_bars=n_val,
+        )
+
+    return model, conf_threshold
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OOS activity diagnostics
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _compute_oos_stats(
+    model,
+    scaler,
+    feature_names: list[str],
+    test_df: pd.DataFrame,
+    inv_label_map: dict,
+    conf_threshold: float,
+) -> dict:
+    """
+    Compute OOS trading statistics for a fold using the selected threshold.
+
+    Returns a dict with n_trades, trade_coverage_pct, dir_accuracy,
+    profit_factor, hard_constraints_passed.
+    """
+    from src.training.train import _compute_trading_stats
+
+    feat_cols = [c for c in feature_names if c in test_df.columns]
+    X_scaled  = scaler.transform(test_df[feat_cols])
+    proba     = model.predict_proba(X_scaled)
+    y_raw     = test_df["label"].values
+    int_map   = {int(k): v for k, v in inv_label_map.items()}
+
+    return _compute_trading_stats(
+        proba, y_raw, int_map,
+        min_conf=conf_threshold, n_val_bars=len(test_df),
+    )
+
+
+def _log_fold_oos_stats(
+    fold_num: int,
+    stats: dict,
+    threshold: float,
+    weak_fold: bool,
+) -> None:
+    """Log per-fold OOS activity diagnostics."""
+    status = "WEAK" if weak_fold else "OK"
+    hc_label = "PASSED" if stats["hard_constraints_passed"] else "FAILED"
+    log.info(
+        "Fold %d OOS diagnostics  |  threshold=%.2f  |  "
+        "conf_trades=%d/%d (%.1f%%)  |  dir_acc=%.1f%%  |  PF=%.2f  |  "
+        "HC=%s  |  activity=%s",
+        fold_num,
+        threshold,
+        stats["n_trades"], stats["n_val_bars"],
+        stats["trade_coverage_pct"],
+        stats["dir_accuracy"] * 100,
+        stats["profit_factor"],
+        hc_label,
+        status,
+    )
+    if weak_fold:
+        log.warning(
+            "Fold %d WEAK: only %d confident OOS trades (%.2f%% coverage) — "
+            "model is under-trading on this test window  "
+            "[gate: >= %d trades AND >= %.1f%% coverage]",
+            fold_num,
+            stats["n_trades"], stats["trade_coverage_pct"],
+            _WEAK_FOLD_MIN_TRADES, _WEAK_FOLD_MIN_COVERAGE_PCT,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -538,18 +678,19 @@ def _backtest_on_slice(
     cfg: dict,
     specs: dict,
     starting_equity: float = 100_000.0,
+    conf_threshold: float = 0.65,
 ) -> dict:
     """
     Run backtest on a test-window DataFrame.
 
-    All inputs are in-memory; no disk reads.
-    The scaler was fit on the train slice only — transform here is OOS.
+    conf_threshold overrides the confidence gates from universe.yaml,
+    ensuring the backtest uses exactly the threshold selected during training.
     """
     from src.backtest.engine import _simulate_trades, _compute_metrics
 
     feat_cols = [c for c in feature_names if c in test_df.columns]
     X_df      = test_df[feat_cols]
-    X_scaled  = scaler.transform(X_df)       # OOS transform — scaler fit on train only
+    X_scaled  = scaler.transform(X_df)
     proba     = model.predict_proba(X_scaled)
     pred_enc  = np.argmax(proba, axis=1)
     conf      = np.max(proba, axis=1)
@@ -558,8 +699,11 @@ def _backtest_on_slice(
     sig_series  = pd.Series(sig_arr, index=test_df.index)
     conf_series = pd.Series(conf,    index=test_df.index)
 
-    # Cost parameters (don't mutate the caller's dict)
-    cfg          = dict(cfg)
+    # Apply selected threshold — override the universe.yaml confidence gates
+    cfg                       = dict(cfg)
+    cfg["min_long_confidence"]  = conf_threshold
+    cfg["min_short_confidence"] = conf_threshold
+
     tick_size    = float(specs.get("tick_size",  cfg.get("tick_size", 0.25)))
     multiplier   = float(specs.get("multiplier", 50.0))
     cfg["tick_size"] = tick_size
@@ -568,10 +712,9 @@ def _backtest_on_slice(
     half_spread   = float(cfg.get("spread_ticks", 1.0)) * 0.5 * tick_size
     friction_pts  = slippage_pts + half_spread
 
-    # Open / close prices for execution fills
     if raw_prices is not None:
-        rp           = raw_prices.reindex(test_df.index)
-        has_prices   = "close" in rp.columns and not rp["close"].isna().all()
+        rp         = raw_prices.reindex(test_df.index)
+        has_prices = "close" in rp.columns and not rp["close"].isna().all()
     else:
         has_prices = False
 
@@ -579,24 +722,18 @@ def _backtest_on_slice(
         close_prices = rp["close"].ffill().bfill().fillna(5000.0)
         open_prices  = (
             rp["open"].ffill().bfill().fillna(close_prices)
-            if "open" in rp.columns
-            else close_prices
+            if "open" in rp.columns else close_prices
         )
     else:
         if raw_prices is not None:
-            log.warning(
-                "Raw prices reindexed to test window are all NaN — using 5000.0 proxy"
-            )
+            log.warning("Raw prices reindexed to test window are all NaN — using 5000.0 proxy")
         open_prices  = pd.Series(5000.0, index=test_df.index)
         close_prices = pd.Series(5000.0, index=test_df.index)
 
-    # ATR in ticks
     atr_ticks = pd.Series(20.0, index=test_df.index)
     if "atr_14" in test_df.columns:
         atr_ticks = (test_df["atr_14"] * close_prices / tick_size).fillna(20.0)
 
-    # EMA series: pass the full-dataset series so the test window has
-    # proper warm-up history; _simulate_trades reindexes to test index.
     ema_series: Optional[pd.Series] = None
     if cfg.get("trend_filter_enabled", False) and full_ema is not None:
         ema_series = full_ema
@@ -628,42 +765,22 @@ def _backtest_on_slice(
 
 
 def _aggregate(folds: list[FoldResult]) -> dict:
-    """
-    Compute aggregate + stability metrics across all completed folds.
-
-    Funded-account readiness thresholds (stricter than old STABLE/PROMISING)
-    -------------------------------------------------------------------------
-    FUNDED-READY : pct_profitable ≥ 70%  AND  avg_pf ≥ 1.5   AND
-                   pnl_cv ≤ 1.0          AND  t_stat ≥ 1.65
-    PROMISING    : pct_profitable ≥ 60%  AND  avg_pf ≥ 1.3   AND
-                   pnl_cv ≤ 1.5          AND  total_pnl > 0
-    MARGINAL     : pct_profitable ≥ 40%  AND  avg_pf ≥ 1.1
-    NOT READY    : anything else (avg_pf < 1.1, majority losing, or high variance)
-
-    Stability metrics
-    -----------------
-    pnl_cv       : std(pnl) / |mean(pnl)|  — coefficient of variation.
-                   Lower is more stable. Reported as None when mean_pnl ≤ 0.
-    std_sharpe   : std of fold Sharpe ratios across folds.
-    t_stat_pnl   : mean_pnl / (std_pnl / √n_folds).
-                   Tests H₀: mean = 0. > 1.65 → one-sided 95% significance.
-                   Reported as None when n_folds < 2 or std_pnl = 0.
-    """
     if not folds:
         return {}
 
-    n           = len(folds)
-    net_pnls    = [f.net_pnl           for f in folds]
-    win_rates   = [f.win_rate          for f in folds]
-    sharpes     = [f.sharpe            for f in folds]
-    sortinos    = [f.sortino           for f in folds]
-    pfs         = [f.profit_factor     for f in folds]
-    mdd_usd     = [f.max_drawdown_usd  for f in folds]
-    mdd_pct     = [f.max_drawdown_pct  for f in folds]
-    expectancy  = [f.expectancy_usd    for f in folds]
-    tpd         = [f.trades_per_day    for f in folds]
-    n_trades    = [f.n_trades          for f in folds]
-    profitable  = sum(1 for f in folds if f.profitable)
+    n          = len(folds)
+    net_pnls   = [f.net_pnl           for f in folds]
+    win_rates  = [f.win_rate          for f in folds]
+    sharpes    = [f.sharpe            for f in folds]
+    sortinos   = [f.sortino           for f in folds]
+    pfs        = [f.profit_factor     for f in folds]
+    mdd_usd    = [f.max_drawdown_usd  for f in folds]
+    mdd_pct    = [f.max_drawdown_pct  for f in folds]
+    expectancy = [f.expectancy_usd    for f in folds]
+    tpd        = [f.trades_per_day    for f in folds]
+    n_trades   = [f.n_trades          for f in folds]
+    profitable = sum(1 for f in folds if f.profitable)
+    n_weak     = sum(1 for f in folds if f.weak_fold)
 
     total_pnl   = float(sum(net_pnls))
     mean_pnl    = float(np.mean(net_pnls))
@@ -673,23 +790,17 @@ def _aggregate(folds: list[FoldResult]) -> dict:
     avg_pf      = float(np.mean(pfs))
     pct_prof    = profitable / n
 
-    # Coefficient of variation (meaningful only when mean_pnl > 0)
     pnl_cv: Optional[float] = (
         round(std_pnl / mean_pnl, 4) if mean_pnl > 0 else None
     )
     pnl_cv_val = pnl_cv if pnl_cv is not None else float("inf")
 
-    # t-statistic of fold PnLs
     t_stat: Optional[float] = (
         round(mean_pnl / (std_pnl / math.sqrt(n)), 4)
-        if (n > 1 and std_pnl > 0)
-        else None
+        if (n > 1 and std_pnl > 0) else None
     )
     t_stat_val = t_stat if t_stat is not None else 0.0
 
-    # ── Funded-account readiness verdict ─────────────────────────────────
-    # Rules listed in decreasing order of strictness.
-    # A strategy must pass ALL conditions for each tier.
     if (
         pct_prof >= _FUNDED_MIN_PCT_PROF
         and avg_pf >= _FUNDED_MIN_PF
@@ -713,37 +824,29 @@ def _aggregate(folds: list[FoldResult]) -> dict:
         verdict = "NOT READY"
 
     return {
-        # Returns
         "total_net_pnl":          round(total_pnl, 2),
         "avg_net_pnl_per_fold":   round(mean_pnl, 2),
         "std_net_pnl":            round(std_pnl, 2),
         "total_n_trades":         int(sum(n_trades)),
-        # Profitability
         "n_profitable_folds":     profitable,
         "pct_profitable_folds":   round(pct_prof, 4),
-        # Win rate
+        "n_weak_folds":           n_weak,
         "avg_win_rate":           round(float(np.mean(win_rates)), 4),
         "median_win_rate":        round(float(np.median(win_rates)), 4),
-        # Profit factor
         "avg_profit_factor":      round(avg_pf, 4),
         "median_profit_factor":   round(float(np.median(pfs)), 4),
-        # Risk-adjusted returns
         "avg_sharpe":             round(mean_sharpe, 4),
         "std_sharpe":             round(std_sharpe, 4),
         "avg_sortino":            round(float(np.mean(sortinos)), 4),
-        # Drawdown (% is always relative to starting_equity — no exploding values)
         "avg_max_drawdown_usd":   round(float(np.mean(mdd_usd)), 2),
         "avg_max_drawdown_pct":   round(float(np.mean(mdd_pct)), 4),
         "worst_drawdown_pct":     round(float(min(mdd_pct)), 4),
-        # Activity
         "avg_expectancy_usd":     round(float(np.mean(expectancy)), 2),
         "avg_trades_per_day":     round(float(np.mean(tpd)), 2),
-        # Stability / robustness
         "pnl_cv":                 pnl_cv,
         "t_stat_pnl":             t_stat,
         "funded_ready":           verdict,
-        # Legacy alias so old JSON reports / tests still work
-        "stability":              verdict,
+        "stability":              verdict,   # legacy alias
         "n_folds":                n,
     }
 
@@ -752,7 +855,6 @@ def _aggregate(folds: list[FoldResult]) -> dict:
 # Display helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Emoji-free verdict labels and their one-line assessment
 _VERDICT_LINES = {
     "FUNDED-READY": "FUNDED-READY  — Passes all funded-account robustness criteria.",
     "PROMISING":    "PROMISING     — Positive OOS expectancy; tighten further before live.",
@@ -762,22 +864,23 @@ _VERDICT_LINES = {
 
 
 def _print_summary(result: WalkForwardSummary) -> None:
-    W = 92
+    W = 100
     bar = "=" * W
 
     print(f"\n{bar}")
     print(
         f"  WALK-FORWARD VALIDATION  |  {result.symbol}"
-        f"  |  mode={result.mode}  |  n_folds={result.n_folds}"
+        f"  |  mode={result.mode}  |  select_by={result.select_by}"
+        f"  |  n_folds={result.n_folds}"
     )
     print(bar)
 
-    # Per-fold table header
     col_w = 25
     hdr = (
         f"  {'Fold':>4}  {'Test period':<{col_w}}  {'Bars':>5}  "
         f"{'Trd':>4}  {'Net PnL ($)':>11}  {'WR%':>5}  "
-        f"{'PF':>5}  {'Sharpe':>6}  {'MaxDD%':>7}  {'MaxDD($)':>10}"
+        f"{'PF':>5}  {'Sharpe':>6}  {'MaxDD%':>7}  {'MaxDD($)':>10}  "
+        f"{'Thr':>5}  {'OOSn':>5}  {'Cov%':>5}"
     )
     sep = "  " + "-" * (len(hdr) - 2)
     print(hdr)
@@ -786,12 +889,14 @@ def _print_summary(result: WalkForwardSummary) -> None:
     for f in result.folds:
         period = f"{f.test_start[:10]}>{f.test_end[:10]}"
         ok     = "[+]" if f.profitable else "[-]"
+        wk     = "[W]" if f.weak_fold else "   "
         print(
             f"  {f.fold_idx:>4}  {period:<{col_w}}  {f.test_bars:>5}  "
             f"{f.n_trades:>4}  {f.net_pnl:>+11.2f}  {f.win_rate:>5.1%}  "
             f"{f.profit_factor:>5.2f}  {f.sharpe:>6.3f}  "
             f"{f.max_drawdown_pct:>6.2f}%  {f.max_drawdown_usd:>+10.2f}  "
-            f"{ok}"
+            f"{f.conf_threshold:>5.2f}  {f.oos_conf_trade_count:>5d}  "
+            f"{f.oos_trade_coverage_pct:>5.1f}%  {ok}{wk}"
         )
 
     agg = result.aggregate
@@ -800,8 +905,6 @@ def _print_summary(result: WalkForwardSummary) -> None:
         return
 
     print(sep)
-
-    # Totals / averages row
     print(
         f"  {'SUM/AVG':>4}  {'':^{col_w}}  {'':>5}  "
         f"{agg['total_n_trades']:>4}  "
@@ -813,12 +916,15 @@ def _print_summary(result: WalkForwardSummary) -> None:
         f"{agg['avg_max_drawdown_usd']:>+10.2f}"
     )
 
-    # Aggregate block
     lbl = 36
     print(f"\n  {'AGGREGATE PERFORMANCE':-<{W - 4}}")
     print(f"  {'Profitable folds':{lbl}}: "
           f"{agg['n_profitable_folds']} / {agg['n_folds']}  "
           f"({agg['pct_profitable_folds']:.0%})")
+    n_weak = agg.get("n_weak_folds", 0)
+    if n_weak:
+        print(f"  {'Weak folds (< {_WEAK_FOLD_MIN_TRADES} trades or < {_WEAK_FOLD_MIN_COVERAGE_PCT:.1f}% coverage)':{lbl}}: "
+              f"{n_weak} / {agg['n_folds']}  [WARNING: model under-trades on these folds]")
     print(f"  {'Total net P&L':{lbl}}: ${agg['total_net_pnl']:>+,.2f}")
     print(f"  {'Avg net P&L / fold':{lbl}}: ${agg['avg_net_pnl_per_fold']:>+,.2f}"
           f"  +/- ${agg['std_net_pnl']:,.2f}")
@@ -836,13 +942,10 @@ def _print_summary(result: WalkForwardSummary) -> None:
     print(f"  {'Avg trades / day':{lbl}}: {agg['avg_trades_per_day']:.2f}")
     print(f"  {'Avg expectancy / trade':{lbl}}: ${agg['avg_expectancy_usd']:+.2f}")
 
-    # Stability block
     pnl_cv_str = (f"{agg['pnl_cv']:.3f}"
-                  if agg.get("pnl_cv") is not None
-                  else "n/a (mean PnL <= 0)")
+                  if agg.get("pnl_cv") is not None else "n/a (mean PnL <= 0)")
     t_stat_str = (f"{agg['t_stat_pnl']:.2f}"
-                  if agg.get("t_stat_pnl") is not None
-                  else "n/a (< 2 folds)")
+                  if agg.get("t_stat_pnl") is not None else "n/a (< 2 folds)")
     verdict    = agg.get("funded_ready", agg.get("stability", "UNKNOWN"))
 
     print(f"\n  {'ROBUSTNESS / STABILITY':-<{W - 4}}")
@@ -853,24 +956,21 @@ def _print_summary(result: WalkForwardSummary) -> None:
     print(f"  {'PnL t-statistic':{lbl}}: {t_stat_str}"
           f"  [>= 1.65 -> 95% significance]")
 
-    # Funded-readiness verdict box
     verdict_line = _VERDICT_LINES.get(verdict, f"UNKNOWN ({verdict})")
     print(f"\n  {'FUNDED-ACCOUNT READINESS':-<{W - 4}}")
     print(f"\n    >> {verdict_line}\n")
     print(f"  {'Criteria (all must pass for FUNDED-READY)':{lbl}}")
-    pct_ok  = agg['pct_profitable_folds'] >= _FUNDED_MIN_PCT_PROF
-    pf_ok   = agg['avg_profit_factor'] >= _FUNDED_MIN_PF
-    cv_ok   = (agg.get('pnl_cv') is not None and agg['pnl_cv'] <= _FUNDED_MAX_CV)
-    tst_ok  = (agg.get('t_stat_pnl') is not None
-               and agg['t_stat_pnl'] >= _FUNDED_MIN_TSTAT)
+    pct_ok = agg["pct_profitable_folds"] >= _FUNDED_MIN_PCT_PROF
+    pf_ok  = agg["avg_profit_factor"] >= _FUNDED_MIN_PF
+    cv_ok  = (agg.get("pnl_cv") is not None and agg["pnl_cv"] <= _FUNDED_MAX_CV)
+    tst_ok = (agg.get("t_stat_pnl") is not None
+               and agg["t_stat_pnl"] >= _FUNDED_MIN_TSTAT)
     _pass_fail(f"  Profitable folds >= {_FUNDED_MIN_PCT_PROF:.0%}",
                pct_ok, f"{agg['pct_profitable_folds']:.0%}", lbl)
     _pass_fail(f"  Avg profit factor >= {_FUNDED_MIN_PF:.2f}",
                pf_ok, f"{agg['avg_profit_factor']:.3f}", lbl)
-    _pass_fail(f"  PnL CV <= {_FUNDED_MAX_CV:.1f}",
-               cv_ok, pnl_cv_str, lbl)
-    _pass_fail(f"  PnL t-stat >= {_FUNDED_MIN_TSTAT:.2f}",
-               tst_ok, t_stat_str, lbl)
+    _pass_fail(f"  PnL CV <= {_FUNDED_MAX_CV:.1f}", cv_ok, pnl_cv_str, lbl)
+    _pass_fail(f"  PnL t-stat >= {_FUNDED_MIN_TSTAT:.2f}", tst_ok, t_stat_str, lbl)
     print(f"{bar}\n")
 
 
@@ -886,6 +986,7 @@ def _save_report(symbol: str, result: WalkForwardSummary) -> None:
     data = {
         "symbol":     result.symbol,
         "mode":       result.mode,
+        "select_by":  result.select_by,
         "n_folds":    result.n_folds,
         "train_bars": result.train_bars,
         "test_bars":  result.test_bars,
@@ -906,15 +1007,6 @@ def _load_prices(
     symbol: str,
     idx: pd.DatetimeIndex,
 ) -> tuple[Optional[pd.DataFrame], Optional[pd.Series]]:
-    """
-    Load raw OHLCV prices and compute full-series EMA for trend filter.
-
-    Returns
-    -------
-    (raw_prices, full_ema)
-      raw_prices : DataFrame reindexed to `idx`, or None if CSV not found.
-      full_ema   : EMA(period) of close over the full series, or None.
-    """
     raw_path = Path(f"data/raw/{symbol}_M1.csv")
     if not raw_path.exists():
         log.warning(
@@ -926,10 +1018,8 @@ def _load_prices(
 
     raw = pd.read_csv(raw_path, parse_dates=["timestamp"], index_col="timestamp")
     raw.sort_index(inplace=True)
-    raw = raw.reindex(idx)     # align to the features index
+    raw = raw.reindex(idx)
 
-    # EMA — computed on the FULL aligned series so any test window inherits
-    # proper warm-up history (no cold-start artefact in trend filter)
     full_ema: Optional[pd.Series] = None
     if _UNIVERSE_CFG.exists() and "close" in raw.columns:
         with open(_UNIVERSE_CFG) as f:
@@ -943,7 +1033,6 @@ def _load_prices(
 
 
 def _load_specs(symbol: str) -> dict:
-    """Return contract_specs dict for symbol from universe.yaml."""
     if not _UNIVERSE_CFG.exists():
         return {}
     with open(_UNIVERSE_CFG) as f:

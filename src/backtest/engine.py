@@ -218,8 +218,20 @@ def run_backtest(
     with open(schema_path) as f:
         schema = json.load(f)
 
-    feature_names: list[str] = schema["feature_names"]
+    feature_names: list[str]      = schema["feature_names"]
     inv_label_map: dict[str, int] = {k: int(v) for k, v in schema["inv_label_map"].items()}
+
+    # Load threshold selected during training and override the universe.yaml
+    # confidence gates, so backtest uses exactly the same threshold as inference.
+    saved_threshold = float(schema.get("selected_conf_threshold", 0.0))
+    if saved_threshold > 0.0:
+        cfg["min_long_confidence"]  = saved_threshold
+        cfg["min_short_confidence"] = saved_threshold
+        log.info(
+            "Confidence threshold loaded from schema: %.2f "
+            "(overrides universe.yaml min_long/short_confidence)",
+            saved_threshold,
+        )
 
     # ── Load features ───────────────────────────────────────────────────────────
     try:

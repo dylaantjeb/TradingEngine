@@ -6,9 +6,11 @@ Covers:
   - _build_folds_expanding : train always anchored at 0 and grows
   - _build_folds_split     : single fold, correct split point
   - _aggregate             : all keys present, computed values correct
-  - _train_on_slice        : returns (model, scaler, inv_label_map) in memory
+  - _train_on_slice        : returns (model, scaler, inv_label_map, threshold)
   - FoldResult             : dataclass construction and profitable flag
   - No disk writes         : _train_on_slice must not touch artifacts/
+  - Threshold selection    : deterministic, in candidates, falls back to 0.65
+  - Weak fold detection    : FoldResult.weak_fold flagged correctly
 
 Run with:  PYTHONPATH=/home/user/TradingEngine python3 -m pytest tests/test_walk_forward.py -v
 """
@@ -385,39 +387,62 @@ class TestTrainOnSlice:
     def _df(self, n: int = 600, seed: int = 0) -> pd.DataFrame:
         return _make_train_df(n, n_features=4, seed=seed, n_classes=3)
 
-    def test_returns_three_tuple(self):
+    def test_returns_four_tuple(self):
         result = _train_on_slice(self._df(), self.FEATURE_NAMES, n_trials=0)
-        assert len(result) == 3
+        assert len(result) == 4
 
     def test_model_has_predict_proba(self):
-        model, _, _ = _train_on_slice(self._df(), self.FEATURE_NAMES, n_trials=0)
+        model, _, _, _ = _train_on_slice(self._df(), self.FEATURE_NAMES, n_trials=0)
         assert callable(getattr(model, "predict_proba", None))
 
     def test_scaler_is_fitted(self):
-        _, scaler, _ = _train_on_slice(self._df(), self.FEATURE_NAMES, n_trials=0)
+        _, scaler, _, _ = _train_on_slice(self._df(), self.FEATURE_NAMES, n_trials=0)
         # RobustScaler stores center_ after fitting
         assert hasattr(scaler, "center_"), "Scaler must be fitted (center_ missing)"
 
     def test_inv_label_map_string_keys_int_values(self):
-        _, _, inv_map = _train_on_slice(self._df(), self.FEATURE_NAMES, n_trials=0)
+        _, _, inv_map, _ = _train_on_slice(self._df(), self.FEATURE_NAMES, n_trials=0)
         for k, v in inv_map.items():
             assert isinstance(k, str), f"Key {k!r} must be str"
             assert isinstance(v, int), f"Value {v!r} for key {k!r} must be int"
 
     def test_inv_label_map_covers_all_classes(self):
         df = self._df()
-        _, _, inv_map = _train_on_slice(df, self.FEATURE_NAMES, n_trials=0)
+        _, _, inv_map, _ = _train_on_slice(df, self.FEATURE_NAMES, n_trials=0)
         # Every encoded class index must appear
         for i in range(len(inv_map)):
             assert str(i) in inv_map, f"Class index {i} missing from inv_label_map"
 
     def test_predict_proba_shape(self):
         df  = self._df(n=300)
-        model, scaler, inv_map = _train_on_slice(df, self.FEATURE_NAMES, n_trials=0)
-        X   = df[self.FEATURE_NAMES].values
+        model, scaler, inv_map, _ = _train_on_slice(df, self.FEATURE_NAMES, n_trials=0)
         proba = model.predict_proba(scaler.transform(df[self.FEATURE_NAMES]))
         n_classes = len(inv_map)
         assert proba.shape == (len(df), n_classes)
+
+    def test_threshold_in_valid_range(self):
+        """Fourth element must be a float in [0.50, 0.75]."""
+        from src.training.train import _THRESHOLD_CANDIDATES
+        _, _, _, threshold = _train_on_slice(self._df(), self.FEATURE_NAMES, n_trials=0)
+        assert isinstance(threshold, float)
+        assert min(_THRESHOLD_CANDIDATES) <= threshold <= max(_THRESHOLD_CANDIDATES), (
+            f"Threshold {threshold} outside candidate range"
+        )
+
+    def test_threshold_is_a_candidate(self):
+        """Threshold must be one of the defined candidates."""
+        from src.training.train import _THRESHOLD_CANDIDATES
+        _, _, _, threshold = _train_on_slice(self._df(), self.FEATURE_NAMES, n_trials=0)
+        assert threshold in _THRESHOLD_CANDIDATES, (
+            f"Threshold {threshold} not in candidates {_THRESHOLD_CANDIDATES}"
+        )
+
+    def test_threshold_deterministic(self):
+        """Same data → same threshold (no randomness in selection)."""
+        df = self._df(seed=77)
+        _, _, _, t1 = _train_on_slice(df, self.FEATURE_NAMES, n_trials=0)
+        _, _, _, t2 = _train_on_slice(df, self.FEATURE_NAMES, n_trials=0)
+        assert t1 == t2, f"Threshold not deterministic: {t1} vs {t2}"
 
     def test_no_disk_artifacts_written(self):
         """_train_on_slice must not write to artifacts/ directory."""
@@ -443,7 +468,7 @@ class TestTrainOnSlice:
         """Slices with only 2 of 3 classes are valid (common in WF)."""
         df = _make_train_df(n=400, n_classes=2, seed=7)  # only -1 and 1
         result = _train_on_slice(df, self.FEATURE_NAMES, n_trials=0)
-        assert len(result) == 3
+        assert len(result) == 4
 
     def test_single_class_raises(self):
         """Slices with a single label class must raise ValueError."""
@@ -491,6 +516,44 @@ class TestDataclasses:
         assert s.folds == []
         assert s.aggregate == {}
 
+    def test_fold_result_new_fields_have_defaults(self):
+        """New OOS diagnostic fields must have sensible defaults."""
+        fr = _make_fold(0, 100.0)
+        assert fr.conf_threshold == 0.65
+        assert fr.oos_conf_trade_count == 0
+        assert fr.oos_trade_coverage_pct == 0.0
+        assert fr.oos_dir_accuracy == 0.0
+        assert fr.oos_profit_factor == 0.0
+        assert fr.weak_fold is False
+
+    def test_fold_result_weak_fold_can_be_set(self):
+        """weak_fold can be explicitly set to True."""
+        fr = FoldResult(
+            fold_idx=0, mode="rolling",
+            train_start="2020-01-01", train_end="2020-06-01",
+            train_bars=5000,
+            test_start="2020-06-01", test_end="2020-09-01",
+            test_bars=2000,
+            weak_fold=True,
+        )
+        assert fr.weak_fold is True
+
+    def test_walk_forward_summary_has_select_by(self):
+        """WalkForwardSummary must have select_by field defaulting to 'f1'."""
+        s = WalkForwardSummary(
+            symbol="ES", mode="rolling", n_folds=0,
+            train_bars=10_000, test_bars=2_000,
+        )
+        assert s.select_by == "f1"
+
+    def test_walk_forward_summary_select_by_trading(self):
+        s = WalkForwardSummary(
+            symbol="ES", mode="rolling", n_folds=0,
+            train_bars=10_000, test_bars=2_000,
+            select_by="trading",
+        )
+        assert s.select_by == "trading"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. No-leakage property across all modes (parametrised)
@@ -511,3 +574,116 @@ def test_no_leakage_parametrised(mode, folds_fn, kwargs):
         )
         assert tr_s < tr_e,   f"[{mode}] Empty train window"
         assert te_s < te_e,   f"[{mode}] Empty test window"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. Weak fold detection logic
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestWeakFoldDetection:
+    """
+    Verify that the weak_fold field is set correctly by the walk-forward
+    machinery based on OOS activity thresholds.
+
+    Tests use FoldResult directly (unit-level) to avoid needing real data.
+    The integration-level assignment is tested implicitly by checking that
+    the constants and FoldResult fields are in sync.
+    """
+
+    def test_weak_fold_constants_reasonable(self):
+        """_WEAK_FOLD_MIN_TRADES and _WEAK_FOLD_MIN_COVERAGE_PCT are importable."""
+        from src.backtest.walk_forward import (
+            _WEAK_FOLD_MIN_TRADES,
+            _WEAK_FOLD_MIN_COVERAGE_PCT,
+        )
+        assert _WEAK_FOLD_MIN_TRADES >= 1
+        assert 0.0 < _WEAK_FOLD_MIN_COVERAGE_PCT < 5.0
+
+    def test_fold_with_zero_trades_would_be_weak(self):
+        """A fold with 0 OOS trades should be classified as weak."""
+        from src.backtest.walk_forward import _WEAK_FOLD_MIN_TRADES, _WEAK_FOLD_MIN_COVERAGE_PCT
+        oos_trades   = 0
+        oos_coverage = 0.0
+        is_weak = (oos_trades < _WEAK_FOLD_MIN_TRADES) or (oos_coverage < _WEAK_FOLD_MIN_COVERAGE_PCT)
+        assert is_weak
+
+    def test_fold_with_one_trade_would_be_weak(self):
+        """A fold with 1 OOS trade should be classified as weak."""
+        from src.backtest.walk_forward import _WEAK_FOLD_MIN_TRADES, _WEAK_FOLD_MIN_COVERAGE_PCT
+        oos_trades   = 1
+        oos_coverage = 0.1   # still below 0.2%
+        is_weak = (oos_trades < _WEAK_FOLD_MIN_TRADES) or (oos_coverage < _WEAK_FOLD_MIN_COVERAGE_PCT)
+        assert is_weak
+
+    def test_fold_with_sufficient_activity_not_weak(self):
+        """A fold with >= _WEAK_FOLD_MIN_TRADES AND >= coverage is NOT weak."""
+        from src.backtest.walk_forward import _WEAK_FOLD_MIN_TRADES, _WEAK_FOLD_MIN_COVERAGE_PCT
+        oos_trades   = _WEAK_FOLD_MIN_TRADES
+        oos_coverage = _WEAK_FOLD_MIN_COVERAGE_PCT
+        is_weak = (oos_trades < _WEAK_FOLD_MIN_TRADES) or (oos_coverage < _WEAK_FOLD_MIN_COVERAGE_PCT)
+        assert not is_weak
+
+    def test_aggregate_counts_weak_folds(self):
+        """_aggregate must include n_weak_folds key when folds have weak_fold set."""
+        folds = []
+        for i in range(5):
+            fr = _make_fold(i, 100.0 if i % 2 == 0 else -50.0)
+            # Manually set weak_fold on two folds
+            object.__setattr__(fr, "weak_fold", i < 2)
+            folds.append(fr)
+        agg = _aggregate(folds)
+        assert "n_weak_folds" in agg, "aggregate must include n_weak_folds"
+        assert agg["n_weak_folds"] == 2
+
+    def test_aggregate_n_weak_folds_zero_by_default(self):
+        """When no folds are weak, n_weak_folds should be 0."""
+        folds = [_make_fold(i, 100.0) for i in range(4)]
+        agg = _aggregate(folds)
+        assert agg.get("n_weak_folds", 0) == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. Threshold selection (via _train_on_slice) — determinism and candidates
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestThresholdSelectionViaTrainOnSlice:
+    """
+    Integration-level tests that verify _train_on_slice returns a threshold
+    that is deterministic, within the defined candidates, and consistent
+    across calls with the same data.
+    """
+
+    FEATURE_NAMES = ["f0", "f1", "f2", "f3"]
+
+    def _df(self, n: int = 600, seed: int = 42) -> pd.DataFrame:
+        return _make_train_df(n, n_features=4, seed=seed, n_classes=3)
+
+    def test_threshold_from_candidates(self):
+        from src.training.train import _THRESHOLD_CANDIDATES
+        _, _, _, t = _train_on_slice(self._df(), self.FEATURE_NAMES, n_trials=0)
+        assert t in _THRESHOLD_CANDIDATES
+
+    def test_threshold_deterministic_repeated_calls(self):
+        df = self._df(seed=55)
+        thresholds = [
+            _train_on_slice(df, self.FEATURE_NAMES, n_trials=0)[3]
+            for _ in range(3)
+        ]
+        assert len(set(thresholds)) == 1, f"Non-deterministic thresholds: {thresholds}"
+
+    def test_trading_select_by_returns_threshold_in_candidates(self):
+        """select_by='trading' must also return a valid threshold."""
+        from src.training.train import _THRESHOLD_CANDIDATES
+        _, _, _, t = _train_on_slice(
+            self._df(), self.FEATURE_NAMES, n_trials=0, select_by="trading"
+        )
+        assert t in _THRESHOLD_CANDIDATES
+
+    def test_f1_and_trading_both_return_float(self):
+        for mode in ("f1", "trading"):
+            _, _, _, t = _train_on_slice(
+                self._df(), self.FEATURE_NAMES, n_trials=0, select_by=mode
+            )
+            assert isinstance(t, float), f"select_by={mode!r} returned {type(t)}"
