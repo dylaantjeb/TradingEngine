@@ -17,7 +17,7 @@ Steps
 
 Confidence threshold selection
 ────────────────────────────────
-Candidate thresholds: [0.50, 0.55, 0.60, 0.65, 0.70].
+Candidate thresholds: [0.45, 0.50, 0.55, 0.60, 0.65, 0.70].
 
   --select-by trading : threshold is an Optuna parameter → co-optimised
                         alongside model hyperparams. Robustness bonus rewards
@@ -73,7 +73,7 @@ VAL_FRACTION   = 0.20
 # ── Confidence threshold candidates ───────────────────────────────────────────
 # Evaluated during model selection; best is stored in schema and used at
 # inference time by backtest and live-paper engines.
-_THRESHOLD_CANDIDATES: list[float] = [0.50, 0.55, 0.60, 0.65, 0.70]
+_THRESHOLD_CANDIDATES: list[float] = [0.45, 0.50, 0.55, 0.60, 0.65, 0.70]
 _DEFAULT_THRESHOLD = 0.65   # fallback when no candidate passes all gates
 
 # ── Composite objective weights ────────────────────────────────────────────────
