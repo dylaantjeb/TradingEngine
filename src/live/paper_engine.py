@@ -299,19 +299,17 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
     kill_switch_active = False
     loss_cooldown_left = 0
 
-    # Per-filter block counters (independent checks for confident signals)
+    # Sequential pipeline counters (each stage counts signals surviving *in order*)
     flt = {
+        "n_total_bars":        0,
         "n_confident_signals": 0,
+        "n_after_session":     0,
+        "n_after_blackout":    0,
+        "n_after_atr":         0,
+        "n_after_trend":       0,
+        "n_after_risk":        0,
+        "n_after_cooldowns":   0,
         "n_entries_queued":    0,
-        "blocked_session":     0,
-        "blocked_blackout":    0,
-        "blocked_atr":         0,
-        "blocked_trend":       0,
-        "blocked_risk":        0,
-        "blocked_loss_cd":     0,
-        "blocked_exit_cd":     0,
-        "blocked_daily_cap":   0,
-        "blocked_in_position": 0,
     }
 
     last_signal     = 0
@@ -482,31 +480,38 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
             if not conf_ok:
                 sig = 0
 
-            # ── Accumulate independent filter counters after conf gate ────────
+            # ── Sequential pipeline diagnostics after confidence gate ─────────
+            flt["n_total_bars"] += 1
             _conf_sig = int(sig)
             if _conf_sig != 0:
                 flt["n_confident_signals"] += 1
-                if not _in_session(ts, sess_start, sess_end):
-                    flt["blocked_session"] += 1
-                if _in_blackout(ts, blackouts):
-                    flt["blocked_blackout"] += 1
-                if not (atr_min <= atr_ticks <= atr_max):
-                    flt["blocked_atr"] += 1
-                if trend_filter_on and not np.isnan(ema_val):
-                    if (_conf_sig == 1 and close_px < ema_val) or \
-                       (_conf_sig == -1 and close_px > ema_val):
-                        flt["blocked_trend"] += 1
-                if (kill_switch_active or daily_halt) and \
-                        (position == 0 or _conf_sig * position < 0):
-                    flt["blocked_risk"] += 1
-                if loss_cooldown_left > 0 and position == 0:
-                    flt["blocked_loss_cd"] += 1
-                if cooldown_left > 0 and position == 0:
-                    flt["blocked_exit_cd"] += 1
-                if daily_trade_count >= max_tpd and _conf_sig != position:
-                    flt["blocked_daily_cap"] += 1
-                if position != 0 and _conf_sig == position:
-                    flt["blocked_in_position"] += 1
+                if _in_session(ts, sess_start, sess_end):
+                    flt["n_after_session"] += 1
+                    if not _in_blackout(ts, blackouts):
+                        flt["n_after_blackout"] += 1
+                        if atr_min <= atr_ticks <= atr_max:
+                            flt["n_after_atr"] += 1
+                            _tr_ok = True
+                            if trend_filter_on and not np.isnan(ema_val):
+                                if (_conf_sig == 1 and close_px < ema_val) or \
+                                   (_conf_sig == -1 and close_px > ema_val):
+                                    _tr_ok = False
+                            if _tr_ok:
+                                flt["n_after_trend"] += 1
+                                _risk_ok = not (
+                                    (kill_switch_active or daily_halt) and
+                                    (position == 0 or _conf_sig * position < 0)
+                                )
+                                if _risk_ok:
+                                    flt["n_after_risk"] += 1
+                                    _cd_ok = (
+                                        not (loss_cooldown_left > 0 and position == 0) and
+                                        not (cooldown_left > 0 and position == 0) and
+                                        not (daily_trade_count >= max_tpd and
+                                             _conf_sig != position)
+                                    )
+                                    if _cd_ok:
+                                        flt["n_after_cooldowns"] += 1
 
             # Filter 2: Session
             sess_ok = _in_session(ts, sess_start, sess_end)
@@ -645,36 +650,51 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
     except KeyboardInterrupt:
         print("\n  Stopped by user.")
 
-    # ── Per-filter execution summary ─────────────────────────────────────────
-    _n_conf_flt = flt.get("n_confident_signals", 0)
-    _n_exec_flt = flt.get("n_entries_queued", 0)
-    _pass_pct   = f"{100*_n_exec_flt/_n_conf_flt:.1f}%" if _n_conf_flt > 0 else "n/a"
+    # ── Sequential execution pipeline breakdown ───────────────────────────────
+    _nt    = flt.get("n_total_bars",        0)
+    _nc    = flt.get("n_confident_signals",  0)
+    _ns    = flt.get("n_after_session",      0)
+    _nbo   = flt.get("n_after_blackout",     0)
+    _natr  = flt.get("n_after_atr",          0)
+    _ntr   = flt.get("n_after_trend",        0)
+    _nrisk = flt.get("n_after_risk",         0)
+    _ncd   = flt.get("n_after_cooldowns",    0)
+    _nq    = flt.get("n_entries_queued",     0)
+    _nex   = len(trades)
+
+    def _pp(n, d):
+        return f"{100*n/d:.0f}%" if d > 0 else "n/a"
+
+    log.info("[%s] Execution pipeline (%d total bars):", symbol, _nt)
+    log.info("[%s]   confident signals : %5d        (%s of bars)", symbol, _nc, _pp(_nc, _nt))
+    log.info("[%s]   → after session   : %5d → %5d  (%s pass)", symbol, _nc, _ns, _pp(_ns, _nc))
+    log.info("[%s]   → after blackout  : %5d → %5d  (%s pass)", symbol, _ns, _nbo, _pp(_nbo, _ns))
+    log.info("[%s]   → after ATR       : %5d → %5d  (%s pass)", symbol, _nbo, _natr, _pp(_natr, _nbo))
+    log.info("[%s]   → after trend     : %5d → %5d  (%s pass)", symbol, _natr, _ntr, _pp(_ntr, _natr))
+    log.info("[%s]   → after risk/halt : %5d → %5d  (%s pass)", symbol, _ntr, _nrisk, _pp(_nrisk, _ntr))
+    log.info("[%s]   → after cooldowns : %5d → %5d  (%s pass)", symbol, _nrisk, _ncd, _pp(_ncd, _nrisk))
+    log.info("[%s]   → entries queued  : %5d → %5d  (%s pass)", symbol, _ncd, _nq, _pp(_nq, _ncd))
+    log.info("[%s]   → trades executed : %5d → %5d  (%s of queued)", symbol, _nq, _nex, _pp(_nex, _nq))
     log.info(
-        "[%s] Execution filter summary  |  "
-        "confident_signals=%d  entries_queued=%d  pass_through=%s",
-        symbol, _n_conf_flt, _n_exec_flt, _pass_pct,
-    )
-    log.info(
-        "[%s]   blocked_session=%d  blocked_atr=%d  blocked_trend=%d  "
-        "blocked_risk=%d  blocked_loss_cd=%d  blocked_exit_cd=%d  "
-        "blocked_daily_cap=%d  blocked_in_position=%d",
-        symbol,
-        flt.get("blocked_session", 0),
-        flt.get("blocked_atr", 0),
-        flt.get("blocked_trend", 0),
-        flt.get("blocked_risk", 0),
-        flt.get("blocked_loss_cd", 0),
-        flt.get("blocked_exit_cd", 0),
-        flt.get("blocked_daily_cap", 0),
-        flt.get("blocked_in_position", 0),
+        "[%s]   OVERALL: conf→executed = %d → %d  (%s end-to-end pass-through)",
+        symbol, _nc, _nex, _pp(_nex, _nc),
     )
 
-    # Post-run sanity safeguard: warn if trades are far below expected
-    if _n_conf > 0 and len(trades) < max(5, _n_conf // 10):
+    # ── Pass-through warnings ─────────────────────────────────────────────────
+    if _ns > 0 and _nq < _ns * 0.20:
         log.warning(
-            "[%s] Only %d trade(s) executed but %d bars had confident signals. "
-            "Session/ATR/trend/risk filters may be too restrictive.",
-            symbol, len(trades), _n_conf,
+            "[%s] LOW PIPELINE YIELD: only %d queued entries from %d in-session "
+            "confident signals (%.0f%% < 20%% threshold). "
+            "Consider loosening: cooldown_bars_after_exit, cooldown_bars_after_loss, "
+            "min_holding_bars, max_trades_per_day, or max_consecutive_losses.",
+            symbol, _nq, _ns, 100*_nq/max(_ns, 1),
+        )
+    if _nq > 0 and _nex < _nq * 0.10:
+        log.warning(
+            "[%s] EXECUTION UNDERPERFORMANCE: only %d trades executed from %d queued "
+            "entries (%.0f%% < 10%% threshold). "
+            "The delay=1 bar fill or position logic may be losing orders.",
+            symbol, _nex, _nq, 100*_nex/max(_nq, 1),
         )
 
     _print_summary(symbol, trades, equity, gross_pnl_total, total_cost_total, bar_count)

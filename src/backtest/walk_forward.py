@@ -269,11 +269,8 @@ def run_walk_forward(
             oos_stats["n_trades"] < _WEAK_FOLD_MIN_TRADES
             or oos_stats["trade_coverage_pct"] < _WEAK_FOLD_MIN_COVERAGE_PCT
         )
-        # Executed trade count not known yet — log pre-filter stats now,
-        # then log the execution comparison after the backtest completes.
-        _log_fold_oos_stats(fold_idx + 1, oos_stats, conf_threshold, weak_fold)
-
         # ── Backtest on test window ────────────────────────────────────────
+        # Full diagnostics are logged after backtest (with actual executed trades).
         try:
             metrics = _backtest_on_slice(
                 model=model,
@@ -292,13 +289,15 @@ def run_walk_forward(
             log.warning("Fold %d  backtest failed: %s — skipping", fold_idx, exc)
             continue
 
-        # Log execution pass-through: exec_est → actual executed trades
+        # Log execution pass-through with full backtest pipeline breakdown
         _executed = metrics.get("n_trades", 0)
-        if oos_stats.get("exec_est_signals") is not None:
-            _log_fold_oos_stats(
-                fold_idx + 1, oos_stats, conf_threshold,
-                weak_fold, executed_trades=_executed,
-            )
+        _exec_flt = metrics.get("filter_counters", None)
+        _log_fold_oos_stats(
+            fold_idx + 1, oos_stats, conf_threshold,
+            weak_fold,
+            executed_trades=_executed,
+            exec_filter_counters=_exec_flt,
+        )
 
         fr = FoldResult(
             fold_idx=fold_idx,
@@ -716,10 +715,15 @@ def _compute_oos_stats(
             atr_mask = np.ones(n_val, dtype=bool)
         n_atr = int((conf_mask & atr_mask).sum())
 
-        n_exec_est = int((conf_mask & sess_mask & atr_mask).sum())
+        # Sequential: conf → session → atr
+        n_exec_est = int((conf_mask & sess_mask & atr_mask).sum())   # = n_after_atr sequential
 
+        stats["n_conf_signals"]    = n_conf
+        stats["n_after_session"]   = n_sess
+        stats["n_after_atr"]       = n_exec_est
+        # Pass % at each sequential stage
         stats["session_pass_pct"]  = round(100.0 * n_sess    / max(n_conf, 1), 2)
-        stats["atr_pass_pct"]      = round(100.0 * n_atr     / max(n_conf, 1), 2)
+        stats["atr_pass_pct"]      = round(100.0 * n_exec_est / max(n_sess, 1), 2)
         stats["exec_est_signals"]  = n_exec_est
         stats["exec_est_coverage"] = round(100.0 * n_exec_est / max(n_val, 1), 2)
     else:
@@ -737,60 +741,117 @@ def _log_fold_oos_stats(
     threshold: float,
     weak_fold: bool,
     executed_trades: int | None = None,
+    exec_filter_counters: dict | None = None,
 ) -> None:
-    """Log per-fold OOS activity diagnostics, including execution-aware estimates."""
+    """Log per-fold OOS diagnostics with full sequential pipeline breakdown."""
     status   = "WEAK" if weak_fold else "OK"
     hc_label = "PASSED" if stats["hard_constraints_passed"] else "FAILED"
+
+    n_val  = stats["n_val_bars"]
+    n_conf = stats["n_trades"]    # pre-filter model confident signals
+    cov    = stats["trade_coverage_pct"]
+
     log.info(
-        "Fold %d OOS diagnostics  |  threshold=%.2f  |  "
-        "conf_trades=%d/%d (%.1f%%)  |  dir_acc=%.1f%%  |  PF=%.2f  |  "
-        "HC=%s  |  activity=%s",
-        fold_num,
-        threshold,
-        stats["n_trades"], stats["n_val_bars"],
-        stats["trade_coverage_pct"],
-        stats["dir_accuracy"] * 100,
-        stats["profit_factor"],
-        hc_label,
-        status,
+        "Fold %d  threshold=%.2f  HC=%s  activity=%s  |  "
+        "dir_acc=%.1f%%  PF=%.2f  conf=%d/%d (%.1f%%)",
+        fold_num, threshold, hc_label, status,
+        stats["dir_accuracy"] * 100, stats["profit_factor"],
+        n_conf, n_val, cov,
     )
 
-    # Execution-aware filter estimates
-    exec_est = stats.get("exec_est_signals")
-    if exec_est is not None:
-        sess_pct = stats.get("session_pass_pct", 0)
-        atr_pct  = stats.get("atr_pass_pct", 0)
-        exec_cov = stats.get("exec_est_coverage", 0)
+    def _pct(n, d):
+        return f"{100*n/d:.0f}%" if d > 0 else "n/a"
+
+    # ── Pre-filter sequential pipeline (session + ATR, from model predictions) ─
+    n_conf_raw = stats.get("n_conf_signals", n_conf)   # total model signals
+    n_sess     = stats.get("n_after_session", None)
+    n_atr      = stats.get("n_after_atr", None)        # = exec_est_signals
+    exec_cov   = stats.get("exec_est_coverage", None)
+
+    if n_sess is not None:
         log.info(
-            "Fold %d exec-aware estimate  |  "
-            "session_pass=%.0f%%  atr_pass=%.0f%%  "
-            "exec_est=%d (%.1f%% coverage)",
-            fold_num, sess_pct, atr_pct, exec_est, exec_cov,
+            "Fold %d pre-filter pipeline  |  "
+            "conf=%d  →sess=%d(%s)  →atr=%d(%s)  exec_est_cov=%.1f%%",
+            fold_num,
+            n_conf_raw,
+            n_sess,  _pct(n_sess, n_conf_raw),
+            n_atr,   _pct(n_atr,  n_sess),
+            exec_cov if exec_cov is not None else 0.0,
         )
-        if executed_trades is not None:
-            pass_pct = f"{100*executed_trades/max(exec_est,1):.0f}%" if exec_est > 0 else "n/a"
-            log.info(
-                "Fold %d execution pass-through  |  "
-                "exec_est=%d → executed=%d (%s)",
-                fold_num, exec_est, executed_trades, pass_pct,
+
+    # ── Post-backtest pipeline (from actual _simulate_trades counters) ─────────
+    if exec_filter_counters:
+        fc    = exec_filter_counters
+        _nt   = fc.get("n_total_bars",        0)
+        _nc   = fc.get("n_confident_signals",  0)
+        _ns   = fc.get("n_after_session",      0)
+        _nbo  = fc.get("n_after_blackout",     0)
+        _natr = fc.get("n_after_atr",          0)
+        _ntr  = fc.get("n_after_trend",        0)
+        _nrk  = fc.get("n_after_risk",         0)
+        _ncd  = fc.get("n_after_cooldowns",    0)
+        _nq   = fc.get("n_entries_queued",     0)
+        _nex  = executed_trades if executed_trades is not None else 0
+
+        log.info(
+            "Fold %d backtest pipeline (%d bars)  |  "
+            "conf=%d  →sess=%d(%s)  →atr=%d(%s)  →trend=%d(%s)"
+            "  →risk=%d(%s)  →cd=%d(%s)  →q=%d(%s)  →exec=%d(%s)",
+            fold_num, _nt,
+            _nc,
+            _ns,   _pct(_ns,   _nc),
+            _natr, _pct(_natr, _ns),
+            _ntr,  _pct(_ntr,  _natr),
+            _nrk,  _pct(_nrk,  _ntr),
+            _ncd,  _pct(_ncd,  _nrk),
+            _nq,   _pct(_nq,   _ncd),
+            _nex,  _pct(_nex,  _nq),
+        )
+
+        # Warnings
+        if _ns > 0 and _nq < _ns * 0.20:
+            log.warning(
+                "Fold %d LOW YIELD: %d queued from %d in-session signals "
+                "(%.0f%% < 20%%). Top bottleneck: %s",
+                fold_num, _nq, _ns, 100*_nq/max(_ns, 1),
+                _top_bottleneck(fc),
             )
-            if exec_est > 0 and executed_trades < max(3, exec_est // 5):
-                log.warning(
-                    "Fold %d low pass-through (%d/%d): "
-                    "cooldown/holding/daily-cap filters may be suppressing most entries. "
-                    "Consider relaxing min_holding_bars or cooldown_bars_after_exit.",
-                    fold_num, executed_trades, exec_est,
-                )
+    elif executed_trades is not None and n_atr is not None:
+        # Fallback: show exec_est → executed
+        pass_pct = _pct(executed_trades, n_atr)
+        log.info(
+            "Fold %d execution  exec_est=%d → executed=%d (%s pass-through)",
+            fold_num, n_atr, executed_trades, pass_pct,
+        )
+        if n_atr > 0 and executed_trades < max(3, n_atr // 5):
+            log.warning(
+                "Fold %d LOW pass-through (%d/%d): "
+                "cooldown/holding/daily-cap filters likely suppressing most entries. "
+                "Consider reducing min_holding_bars and cooldown_bars_after_exit.",
+                fold_num, executed_trades, n_atr,
+            )
 
     if weak_fold:
         log.warning(
-            "Fold %d WEAK: only %d confident OOS trades (%.2f%% coverage) — "
-            "model is under-trading on this test window  "
-            "[gate: >= %d trades AND >= %.1f%% coverage]",
-            fold_num,
-            stats["n_trades"], stats["trade_coverage_pct"],
-            _WEAK_FOLD_MIN_TRADES, _WEAK_FOLD_MIN_COVERAGE_PCT,
+            "Fold %d WEAK: %d confident trades (%.2f%% cov) below activity gates "
+            "[>= %d trades AND >= %.1f%% coverage]",
+            fold_num, n_conf, cov, _WEAK_FOLD_MIN_TRADES, _WEAK_FOLD_MIN_COVERAGE_PCT,
         )
+
+
+def _top_bottleneck(fc: dict) -> str:
+    """Return the name of the filter stage that dropped the most signals."""
+    stages = [
+        ("session",   fc.get("n_confident_signals", 0), fc.get("n_after_session",   0)),
+        ("blackout",  fc.get("n_after_session",     0), fc.get("n_after_blackout",  0)),
+        ("ATR",       fc.get("n_after_blackout",    0), fc.get("n_after_atr",       0)),
+        ("trend",     fc.get("n_after_atr",         0), fc.get("n_after_trend",     0)),
+        ("risk/halt", fc.get("n_after_trend",       0), fc.get("n_after_risk",      0)),
+        ("cooldowns", fc.get("n_after_risk",        0), fc.get("n_after_cooldowns", 0)),
+        ("queuing",   fc.get("n_after_cooldowns",   0), fc.get("n_entries_queued",  0)),
+    ]
+    biggest = max(stages, key=lambda s: s[1] - s[2], default=("unknown", 0, 0))
+    return biggest[0]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -886,7 +947,8 @@ def _backtest_on_slice(
         equity_curve, trades, cost_summary,
         starting_equity=starting_equity,
     )
-    metrics["n_trades"] = len(trades)
+    metrics["n_trades"]        = len(trades)
+    metrics["filter_counters"] = cost_summary.get("filter_counters", {})
     return metrics
 
 

@@ -19,22 +19,26 @@ cost_model:
 
 # ── Filters ────────────────────────────────────────────────────────────────────
 filters:
-  # NY regular session: 14:30–21:00 UTC = 09:30–16:00 ET (winter)
-  # Tightened: avoid the first 30 min (gap fills) and last 30 min (thin close)
-  session_start_utc_hour: 15     # 10:00 ET — avoid chaotic open
-  session_end_utc_hour: 20       # 15:00 ET — avoid thin close
+  # ES CME Globex regular session: 09:30–16:15 ET
+  #   Winter (ET = UTC-5): 14:30–21:15 UTC
+  #   Summer (ET = UTC-4): 13:30–20:15 UTC
+  # Using 14:00–21:00 UTC captures the full regular session year-round
+  # while staying safely within liquid market hours.
+  # Previous 15:00–20:00 window gave only 5 hours/day (300 M1 bars) —
+  # the narrowest common source of near-zero execution.
+  session_start_utc_hour: 14    # ≈ 09:00 ET winter / 10:00 ET summer
+  session_end_utc_hour:   21    # ≈ 16:00 ET winter / 17:00 ET summer
   # ATR filter: only trade when volatility is meaningful but not runaway
-  atr_min_ticks: 6               # raised from 4 — skip dead/flat conditions
-  atr_max_ticks: 100             # lowered from 150 — skip news spikes
+  atr_min_ticks: 4              # restored from 6 — 6 was filtering too aggressively
+  atr_max_ticks: 150            # raised from 100 — allow moderately elevated vola
   news_blackout_windows: []
 
 # ── Signal confidence gating ────────────────────────────────────────────────────
-# Raised from 0.60 → 0.68: forces model to only act on its strongest signals.
-# This is the single most effective lever for reducing overtrading and
-# improving OOS performance.  Higher = fewer trades = lower drawdown.
+# The schema threshold (saved by train.py) overrides these at runtime.
+# These values serve only as a last-resort fallback when no schema is loaded.
 confidence:
-  min_long_confidence: 0.68
-  min_short_confidence: 0.68
+  min_long_confidence: 0.60
+  min_short_confidence: 0.60
 
 # ── Structural trend filter ─────────────────────────────────────────────────────
 # Long signals blocked when close < EMA(ema_period).
@@ -44,23 +48,26 @@ trend_filter:
   ema_period: 200
 
 # ── Prop-firm style risk limits ─────────────────────────────────────────────────
-# Conservative limits matching typical 10% max-drawdown funded-account rules,
-# with tighter daily limits to preserve capital during drawdown periods.
+# Conservative limits matching typical 10% max-drawdown funded-account rules.
 risk_limits:
   starting_equity: 100000.0
-  max_daily_loss_usd: 800.0      # lowered from 1000 — cut day early
-  max_daily_loss_pct: 0.015      # lowered from 0.02
-  max_total_drawdown_usd: 2500.0 # lowered from 3000 — protect capital
-  max_total_drawdown_pct: 0.05   # lowered from 0.06
-  max_consecutive_losses: 3      # unchanged — 3 strikes and rest
-  cooldown_bars_after_loss: 20   # doubled from 10 — cool down longer
+  max_daily_loss_usd: 1000.0     # raised from 800 — less hair-trigger daily halt
+  max_daily_loss_pct: 0.02       # raised from 0.015
+  max_total_drawdown_usd: 3000.0 # raised from 2500
+  max_total_drawdown_pct: 0.06   # raised from 0.05
+  max_consecutive_losses: 4      # raised from 3 — 3 was halting too easily
+  cooldown_bars_after_loss: 5    # reduced from 20 — 20 M1 bars = 20 min dead time
 
 # ── Trade frequency throttles ──────────────────────────────────────────────────
-# Conservative: prefer sitting out over forcing trades.
+# Previous values caused extreme suppression:
+#   min_holding=8 + cooldown_exit=10 + cooldown_loss=20 = 38-bar dead-zone/cycle.
+# With 300 session bars/day and 38-bar cycles, only ~8 trades/day are physically
+# possible — then max_trades_per_day=4 caps it further.
+# New values reduce the dead-zone to ~11 bars, allowing ~38 trades/day (before cap).
 throttles:
-  max_trades_per_day: 4          # lowered from 6 — quality over quantity
-  min_holding_bars: 8            # raised from 5 — avoid premature exits
-  cooldown_bars_after_exit: 10   # doubled from 5 — let market settle
+  max_trades_per_day: 6          # raised from 4
+  min_holding_bars: 3            # reduced from 8 — 8 min was blocking reversal signals
+  cooldown_bars_after_exit: 3    # reduced from 10 — 10 min dead time was too long
   max_concurrent_positions: 1
 
 # ── Position sizing ─────────────────────────────────────────────────────────────
