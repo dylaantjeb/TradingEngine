@@ -9,34 +9,44 @@ Steps
 4. Scale features with RobustScaler (persisted for inference).
 5. Optuna hyperparameter search — two selection modes:
      f1       (default): maximise macro-F1 on val split.
-     trading  (new):     maximise a composite score that blends F1 with a
-                         balanced trading-quality simulation on val split.
+     trading  (new):     two-level gate then balanced composite score.
 6. Retrain best model on full train set.
 7. Persist model, scaler, and feature schema.
 
-Model selection modes
-──────────────────────
-  --select-by f1      (default)
-    Pure macro-F1 optimisation. Good for balanced label distributions.
+How --select-by trading works
+──────────────────────────────
+Each Optuna trial is evaluated in two stages:
 
-  --select-by trading
-    Composite score:  0.40 * macro_F1  +  0.60 * trading_quality
+  STAGE 1 — Inline hard gates (enforced directly in the objective).
+    These are computed in the objective function itself, NOT delegated
+    to any helper. If either gate fails the trial receives _GATE_FAIL_SCORE
+    (-100.0) which is lower than any passing model can achieve, so Optuna
+    will never select it regardless of F1.
 
-    trading_quality is a five-component balanced score:
+      Gate 1: confident_trade_count >= 50
+      Gate 2: trade_coverage >= 3%  (confident_trades / total_val_bars)
+
+    "Confident trade" = model confidence >= _TRADING_SCORE_MIN_CONF (0.65)
+                        AND predicted direction != flat.
+
+  STAGE 2 — Balanced composite score (only reached when both gates pass).
+    composite = 0.40 * macro_F1  +  0.60 * trading_quality
+
+    trading_quality is a five-component score bounded to [-10, 1]:
       0.30 * directional_accuracy_confident
       0.25 * normalized_profit_factor
       0.20 * trade_coverage_score
       0.15 * activity_score
       0.10 * pnl_per_trade_score
 
-    Hard constraints (ALL must pass, or score collapses to a large negative):
-      • confident_trade_count >= 50
-      • trade_coverage >= 3%  (n_confident_trades / n_val_bars)
-      • profit_factor >= 1.10
-      • directional_accuracy >= 52%
+    Secondary hard constraints (checked inside trading_quality scorer):
+      • profit_factor >= 1.10   (else tq = _HC_PENALTY_MEDIUM = -3.0)
+      • directional_accuracy >= 52%   (else tq = _HC_PENALTY_MEDIUM = -3.0)
 
-    This prevents a model from "winning" by taking only 10 trades out of
-    4000+ bars with perfect accuracy on those 10 bars.
+After study.optimize(), if best_value <= _GATE_FAIL_SCORE + 1 it means
+ALL trials failed the hard gates — a warning is logged and the selected
+model will still be saved, but the caller is told to use --select-by f1
+instead or to lower the confidence threshold / acquire more data.
 
 Artifacts
 ──────────
@@ -59,9 +69,9 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 MIN_TRAIN_ROWS = 200
-VAL_FRACTION = 0.20
+VAL_FRACTION   = 0.20
 
-# Minimum confidence for a prediction to count as a "trade" in the scorer.
+# Minimum confidence for a prediction to count as a "trade".
 # Matches the confidence gate in universe.yaml.
 _TRADING_SCORE_MIN_CONF = 0.65
 
@@ -69,23 +79,33 @@ _TRADING_SCORE_MIN_CONF = 0.65
 _COMPOSITE_F1_WEIGHT      = 0.40
 _COMPOSITE_TRADING_WEIGHT = 0.60
 
-# Hard-constraint thresholds — fail any one → large negative trading score
-_HC_MIN_TRADES     = 50      # minimum confident non-flat predictions
-_HC_MIN_COVERAGE   = 0.03    # minimum fraction of val bars that are "trades"
-_HC_MIN_PF         = 1.10    # minimum profit factor
-_HC_MIN_DIR_ACC    = 0.52    # minimum directional accuracy on confident trades
+# ── Hard-gate thresholds ──────────────────────────────────────────────────────
+# These are enforced at TWO levels:
+#   1. Inline in the Optuna objective (STAGE 1 gates) → _GATE_FAIL_SCORE
+#   2. Inside _compute_trading_stats (secondary gates)  → penalty values
+_HC_MIN_TRADES   = 50      # minimum confident non-flat predictions on val set
+_HC_MIN_COVERAGE = 0.03    # minimum fraction of val bars that are "trades" (3%)
+_HC_MIN_PF       = 1.10    # minimum profit factor (secondary gate)
+_HC_MIN_DIR_ACC  = 0.52    # minimum directional accuracy (secondary gate)
 
-# Penalty values returned when hard constraints fail
-# (used as the trading quality term; negative so composite score clearly loses)
-_HC_PENALTY_SEVERE = -1.0    # trade_count < 50 or coverage < 3%
-_HC_PENALTY_MEDIUM = -0.5    # pf < 1.10 or dir_accuracy < 52%
+# Sentinel score returned by the Optuna objective when STAGE 1 gates fail.
+# Must be sufficiently negative that no passing model can match it.
+# The best possible composite for a passing model is ~0.40*1 + 0.60*1 = 1.0
+# so -100 guarantees Optuna will always prefer any passing model.
+_GATE_FAIL_SCORE = -100.0
 
-# Sub-component weights for the trading quality score
-_W_DIR_ACC    = 0.30
-_W_NORM_PF    = 0.25
-_W_COVERAGE   = 0.20
-_W_ACTIVITY   = 0.15
-_W_PPT        = 0.10
+# Penalty values returned by _compute_trading_stats for secondary gate failures.
+# Negative so composite objective can distinguish them from passing models.
+_HC_PENALTY_SEVERE = -10.0   # trade_count < 50 or coverage < 3% (should not
+                               # reach here since STAGE 1 gates fire first)
+_HC_PENALTY_MEDIUM = -3.0    # pf < 1.10 or dir_accuracy < 52%
+
+# Sub-component weights (sum to 1.0)
+_W_DIR_ACC  = 0.30
+_W_NORM_PF  = 0.25
+_W_COVERAGE = 0.20
+_W_ACTIVITY = 0.15
+_W_PPT      = 0.10
 
 
 def train(
@@ -100,7 +120,8 @@ def train(
     ----------
     symbol     : Symbol identifier (e.g. "ES").
     n_trials   : Number of Optuna trials.
-    select_by  : 'f1' (maximise macro-F1) or 'trading' (balanced composite).
+    select_by  : 'f1' (maximise macro-F1) or 'trading' (balanced composite
+                 with hard gates for trade count and coverage).
     """
     if select_by not in ("f1", "trading"):
         log.error("select_by must be 'f1' or 'trading', got %r", select_by)
@@ -161,12 +182,12 @@ def train(
         )
         sys.exit(1)
 
-    # ── Train / Val split ─────────────────────────────────────────────────────
+    # ── Train / Val split (time-ordered — never shuffle) ─────────────────────
     split          = int(n * (1 - VAL_FRACTION))
-    X_train, X_val = X.iloc[:split],   X.iloc[split:]
+    X_train, X_val = X.iloc[:split],    X.iloc[split:]
     y_train, y_val = y_enc.iloc[:split], y_enc.iloc[split:]
 
-    # Ensure all encoded classes [0, 1, 2] appear in training.
+    # Pull rare classes from val into train if absent (prevents XGBoost crash)
     all_classes        = {0, 1, 2}
     missing_from_train = all_classes - set(y_train.unique())
     if missing_from_train:
@@ -187,21 +208,25 @@ def train(
         len(X_train), len(X_val), select_by,
     )
 
-    # ── Scale ─────────────────────────────────────────────────────────────────
+    # ── Scale (fit on train only) ─────────────────────────────────────────────
     scaler    = RobustScaler()
     X_train_s = scaler.fit_transform(X_train)
     X_val_s   = scaler.transform(X_val)
 
     feature_names = list(X.columns)
-    n_val_bars    = len(X_val_s)
+    n_val_bars    = len(X_val_s)      # total bars in validation window
 
     # Raw val labels in {-1, 0, 1} — used by trading quality scorer
     y_val_raw = y_val.map(inv_label_map).values
 
+    log.info(
+        "Validation set: %d bars  "
+        "Hard gates: count >= %d AND coverage >= %.0f%%",
+        n_val_bars, _HC_MIN_TRADES, _HC_MIN_COVERAGE * 100,
+    )
+
     # ── Optuna objective ───────────────────────────────────────────────────────
-    def objective(trial: optuna.Trial) -> float:
-        # Hyperparameter space biased towards OOS robustness:
-        # shallower trees, higher regularisation, more required samples per leaf.
+    def objective(trial: "optuna.Trial") -> float:
         params = {
             "n_estimators":     trial.suggest_int("n_estimators", 50, 400),
             "max_depth":        trial.suggest_int("max_depth", 2, 6),
@@ -228,17 +253,50 @@ def train(
         if select_by == "f1":
             return f1
 
-        proba = model.predict_proba(X_val_s)
-        tq    = _trading_quality_score(proba, y_val_raw, inv_label_map,
-                                       n_val_bars=n_val_bars)
+        # ── STAGE 1: Inline hard gates ────────────────────────────────────────
+        # Computed HERE in the objective, NOT delegated to any helper function.
+        # When these gates fail, return _GATE_FAIL_SCORE (-100.0) immediately.
+        # This sentinel is so negative that Optuna can never select a gated-out
+        # trial over any trial that passes, regardless of F1 score.
+        proba   = model.predict_proba(X_val_s)
+        _conf   = np.max(proba, axis=1)
+        _sig    = np.array([inv_label_map.get(int(e), 0)
+                            for e in np.argmax(proba, axis=1)])
+        _mask   = (_conf >= _TRADING_SCORE_MIN_CONF) & (_sig != 0)
+        n_conf  = int(_mask.sum())
+        cov     = n_conf / n_val_bars   # fraction of val bars that are trades
+
+        if n_conf < _HC_MIN_TRADES:
+            return _GATE_FAIL_SCORE     # too few trades — disqualified
+
+        if cov < _HC_MIN_COVERAGE:
+            return _GATE_FAIL_SCORE     # coverage below 3% — disqualified
+
+        # ── STAGE 2: Full balanced trading quality score ──────────────────────
+        tq = _trading_quality_score(
+            proba, y_val_raw, inv_label_map, n_val_bars=n_val_bars,
+        )
         return _COMPOSITE_F1_WEIGHT * f1 + _COMPOSITE_TRADING_WEIGHT * tq
 
     log.info("Running Optuna (%d trials, objective=%s) …", n_trials, select_by)
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
 
+    best_score = study.best_value
+
+    # ── Warn if ALL trials failed the hard gates ───────────────────────────────
+    all_gates_failed = select_by == "trading" and best_score <= _GATE_FAIL_SCORE + 1.0
+    if all_gates_failed:
+        log.warning(
+            "ALL %d Optuna trials failed the hard-gate checks "
+            "(count >= %d  AND  coverage >= %.0f%%). "
+            "The model will still be saved but is likely too sparse for live trading. "
+            "Consider: --select-by f1, lower confidence threshold in universe.yaml, "
+            "or acquiring more data.",
+            n_trials, _HC_MIN_TRADES, _HC_MIN_COVERAGE * 100,
+        )
+
     best_params = study.best_params
-    best_score  = study.best_value
     log.info(
         "Best val score (obj=%s): %.4f  params: %s",
         select_by, best_score, best_params,
@@ -279,6 +337,7 @@ def train(
     joblib.dump(final_model, art_model)
     joblib.dump(scaler,      art_scaler)
 
+    hc_passed = val_stats["hard_constraints_passed"]
     schema = {
         "symbol":                    symbol,
         "feature_names":             feature_names,
@@ -291,7 +350,8 @@ def train(
         "val_confident_trades":      val_stats["n_trades"],
         "val_dir_accuracy":          round(val_stats["dir_accuracy"], 6),
         "val_profit_factor":         round(val_stats["profit_factor"], 6),
-        "hard_constraints_passed":   val_stats["hard_constraints_passed"],
+        "hard_constraints_passed":   hc_passed,
+        "all_gates_failed":          all_gates_failed,
         "select_by":                 select_by,
         "n_trials":                  n_trials,
         "train_rows":                len(X_train),
@@ -302,24 +362,31 @@ def train(
     log.info("Scaler  -> %s", art_scaler)
     log.info("Schema  -> %s", art_schema)
 
-    hc_label = "PASSED" if val_stats["hard_constraints_passed"] else "FAILED"
+    hc_label        = "PASSED" if hc_passed else "FAILED"
+    all_gates_label = "  [WARNING: all Optuna trials failed hard gates]" if all_gates_failed else ""
     print(
-        f"\nTraining complete."
+        f"\nTraining complete.{all_gates_label}"
         f"\n  Selection mode         : {select_by}"
         f"\n  Val macro-F1           : {val_f1:.4f}"
         f"\n  Val trading quality    : {val_stats['trading_quality']:.4f}"
         f"\n  Confident trades       : {val_stats['n_trades']:,d} / {n_val_bars:,d} bars"
         f"\n  Trade coverage         : {val_stats['trade_coverage_pct']:.2f}%"
+        f"  [gate: >= {_HC_MIN_COVERAGE * 100:.0f}%]"
         f"\n  Directional accuracy   : {val_stats['dir_accuracy']:.1%}"
+        f"  [gate: >= {_HC_MIN_DIR_ACC:.0%}]"
         f"\n  Val profit factor      : {val_stats['profit_factor']:.3f}"
+        f"  [gate: >= {_HC_MIN_PF:.2f}]"
         f"\n  Hard constraints       : {hc_label}"
     )
-    if not val_stats["hard_constraints_passed"]:
-        print(f"  Constraint failures    : {'; '.join(val_stats['hard_constraint_failures'])}")
+    if not hc_passed:
+        print(
+            f"  Constraint failures    : "
+            f"{'; '.join(val_stats['hard_constraint_failures'])}"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Trading-quality scorer — public for testing
+# Trading-quality scorer helpers — all public for direct unit testing
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -331,13 +398,20 @@ def _trading_quality_score(
     n_val_bars: int | None = None,
 ) -> float:
     """
-    Return the trading quality score (may be negative if hard constraints fail).
+    Return the trading quality score component.
 
-    This is a thin wrapper around _compute_trading_stats that is used directly
-    in the Optuna objective function.
+    When STAGE 1 hard gates pass, this returns a value in [-10, 1].
+    A healthy model returns [0, 1].  Secondary gate failures return
+    _HC_PENALTY_MEDIUM or _HC_PENALTY_SEVERE (both negative).
+
+    This function is called AFTER the inline gates in the objective already
+    confirmed count >= 50 and coverage >= 3%, so the primary penalties
+    (_HC_PENALTY_SEVERE) should not be reached in normal Optuna runs.
+    They exist as a safety net for direct calls (e.g. from tests).
     """
-    stats = _compute_trading_stats(proba, y_raw, inv_label_map,
-                                   min_conf=min_conf, n_val_bars=n_val_bars)
+    stats = _compute_trading_stats(
+        proba, y_raw, inv_label_map, min_conf=min_conf, n_val_bars=n_val_bars,
+    )
     return stats["trading_quality"]
 
 
@@ -349,15 +423,7 @@ def _compute_trading_stats(
     n_val_bars: int | None = None,
 ) -> dict:
     """
-    Compute the full set of trading-quality statistics from val-set probabilities.
-
-    Parameters
-    ----------
-    proba        : (n_bars, n_classes) probability array from predict_proba.
-    y_raw        : True labels in {-1, 0, 1} aligned with proba rows.
-    inv_label_map: {encoded_int: original_label} e.g. {0: -1, 1: 0, 2: 1}.
-    min_conf     : Minimum confidence threshold to count as a "trade".
-    n_val_bars   : Total validation bars (defaults to len(proba) if None).
+    Compute the full set of trading-quality statistics.
 
     Returns
     -------
@@ -365,17 +431,16 @@ def _compute_trading_stats(
       n_trades                 — confident non-flat predictions
       n_val_bars               — total validation bars
       trade_coverage_pct       — 100 * n_trades / n_val_bars
-      n_wins                   — directional wins
+      n_wins                   — directional wins on confident predictions
       dir_accuracy             — n_wins / n_trades  (0.0 if n_trades == 0)
-      profit_factor            — simplified PF (n_wins / n_losses, capped at 5)
-      hard_constraints_passed  — bool: all HC pass
-      hard_constraint_failures — list[str]: descriptions of failed HCs
-      score_components         — dict of each sub-score before weighting
-      trading_quality          — final score (negative if any HC fails)
+      profit_factor            — simplified PF, capped at 5
+      hard_constraints_passed  — bool: all HCs pass
+      hard_constraint_failures — list[str] of failed constraint descriptions
+      score_components         — dict of each sub-score (only when HCs pass)
+      trading_quality          — final score; negative if any HC fails
     """
-    total = len(proba)
     if n_val_bars is None:
-        n_val_bars = total
+        n_val_bars = len(proba)
 
     conf     = np.max(proba, axis=1)
     pred_enc = np.argmax(proba, axis=1)
@@ -393,58 +458,48 @@ def _compute_trading_stats(
         n_losses = n_trades - n_wins
         dir_acc  = n_wins / n_trades
         pf       = (n_wins / n_losses) if n_losses > 0 else float(n_wins)
-        pf       = min(pf, 5.0)        # cap to avoid domination
+        pf       = min(pf, 5.0)
     else:
-        n_wins, n_losses, dir_acc, pf = 0, 0, 0.0, 0.0
+        n_wins = n_losses = 0
+        dir_acc = pf = 0.0
 
     # ── Hard constraint checks ────────────────────────────────────────────────
     penalty  = 0.0
     failures: list[str] = []
 
     if n_trades < _HC_MIN_TRADES:
-        failures.append(
-            f"trade_count={n_trades} < {_HC_MIN_TRADES}"
-        )
+        failures.append(f"trade_count={n_trades} < {_HC_MIN_TRADES}")
         penalty = max(penalty, abs(_HC_PENALTY_SEVERE))
 
     if coverage < _HC_MIN_COVERAGE:
-        failures.append(
-            f"coverage={coverage:.2%} < {_HC_MIN_COVERAGE:.0%}"
-        )
+        failures.append(f"coverage={coverage:.2%} < {_HC_MIN_COVERAGE:.0%}")
         penalty = max(penalty, abs(_HC_PENALTY_SEVERE))
 
     if pf < _HC_MIN_PF:
-        failures.append(
-            f"profit_factor={pf:.3f} < {_HC_MIN_PF:.2f}"
-        )
+        failures.append(f"profit_factor={pf:.3f} < {_HC_MIN_PF:.2f}")
         penalty = max(penalty, abs(_HC_PENALTY_MEDIUM))
 
     if dir_acc < _HC_MIN_DIR_ACC:
-        failures.append(
-            f"dir_accuracy={dir_acc:.1%} < {_HC_MIN_DIR_ACC:.0%}"
-        )
+        failures.append(f"dir_accuracy={dir_acc:.1%} < {_HC_MIN_DIR_ACC:.0%}")
         penalty = max(penalty, abs(_HC_PENALTY_MEDIUM))
 
     hc_passed = len(failures) == 0
+    base = {
+        "n_trades":                n_trades,
+        "n_val_bars":              n_val_bars,
+        "trade_coverage_pct":      round(coverage * 100, 4),
+        "n_wins":                  n_wins,
+        "dir_accuracy":            round(dir_acc, 6),
+        "profit_factor":           round(pf, 6),
+        "hard_constraints_passed": hc_passed,
+        "hard_constraint_failures": failures,
+    }
 
     if not hc_passed:
-        # Return a clearly negative score so Optuna deprioritises this model
-        tq = -penalty
-        return {
-            "n_trades":                n_trades,
-            "n_val_bars":              n_val_bars,
-            "trade_coverage_pct":      round(coverage * 100, 4),
-            "n_wins":                  n_wins,
-            "dir_accuracy":            round(dir_acc, 6),
-            "profit_factor":           round(pf, 6),
-            "hard_constraints_passed": False,
-            "hard_constraint_failures": failures,
-            "score_components":        {},
-            "trading_quality":         round(tq, 6),
-        }
+        return {**base, "score_components": {}, "trading_quality": -penalty}
 
-    # ── Five sub-components (only computed when HCs pass) ─────────────────────
-    comp_dir_acc  = dir_acc                         # already in [0,1]
+    # ── Five sub-components (only when all HCs pass) ──────────────────────────
+    comp_dir_acc  = dir_acc
     comp_norm_pf  = _normalized_pf(pf)
     comp_coverage = _coverage_score(coverage)
     comp_activity = _activity_score(n_trades)
@@ -457,63 +512,49 @@ def _compute_trading_stats(
         + _W_ACTIVITY * comp_activity
         + _W_PPT      * comp_ppt
     )
-    tq = max(0.0, min(tq, 1.0))    # clamp final score to [0, 1]
+    tq = float(max(0.0, min(tq, 1.0)))   # clamp to [0, 1]
 
     return {
-        "n_trades":                n_trades,
-        "n_val_bars":              n_val_bars,
-        "trade_coverage_pct":      round(coverage * 100, 4),
-        "n_wins":                  n_wins,
-        "dir_accuracy":            round(dir_acc, 6),
-        "profit_factor":           round(pf, 6),
-        "hard_constraints_passed": True,
-        "hard_constraint_failures": [],
+        **base,
         "score_components": {
-            "dir_accuracy":       round(comp_dir_acc,  6),
-            "normalized_pf":      round(comp_norm_pf,  6),
-            "trade_coverage":     round(comp_coverage, 6),
-            "activity":           round(comp_activity, 6),
-            "pnl_per_trade":      round(comp_ppt,      6),
+            "dir_accuracy":   round(comp_dir_acc,  6),
+            "normalized_pf":  round(comp_norm_pf,  6),
+            "trade_coverage": round(comp_coverage, 6),
+            "activity":       round(comp_activity, 6),
+            "pnl_per_trade":  round(comp_ppt,      6),
         },
         "trading_quality": round(tq, 6),
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sub-component scoring functions — each maps to [0, 1]
-# All are pure functions of one number; public for unit testing.
+# Pure sub-component functions — each maps to [0, 1]
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def _coverage_score(coverage: float) -> float:
     """
-    Map trade coverage fraction to a score in [0, 1].
+    Map trade-coverage fraction to a score in [0, 1].
 
-    Sweet spot for futures minute-bar trading: 3 – 20% of bars as entries.
+    Target range for futures minute-bar trading: 3–20% of bars as entries.
 
-    coverage → score:
-      0.0 %  →  0.00  (no trades at all)
-      1.0 %  →  0.10  (far too sparse)
-      3.0 %  →  1.00  (lower bound of target range — full credit starts here)
-     20.0 %  →  1.00  (upper bound of target range)
-     35.0 %  →  0.50  (heavy overtrading)
-     50.0 %+ →  0.25  (extreme overtrading)
+      0.0%  →  0.00
+      1.0%  →  0.10  (far too sparse)
+      3.0%  →  1.00  (lower bound of target — full credit starts here)
+     20.0%  →  1.00  (upper bound of target)
+     35.0%  →  0.50  (heavy overtrading)
+     50.0%+ →  0.25
     """
     if coverage <= 0.0:
         return 0.0
     if coverage < 0.01:
-        # 0 % – 1 %: very steep ramp from 0.00 to 0.10
         return coverage / 0.01 * 0.10
     if coverage < 0.03:
-        # 1 % – 3 %: ramp from 0.10 to 1.00
         return 0.10 + (coverage - 0.01) / 0.02 * 0.90
     if coverage <= 0.20:
-        # 3 % – 20 %: target range — full credit
         return 1.0
     if coverage <= 0.35:
-        # 20 % – 35 %: linear decline from 1.00 to 0.50
         return 1.0 - (coverage - 0.20) / 0.15 * 0.50
-    # > 35 %: heavy overtrading — decline from 0.50 to 0.25
     return max(0.25, 0.50 - (coverage - 0.35) / 0.15 * 0.25)
 
 
@@ -521,11 +562,10 @@ def _activity_score(n_trades: int) -> float:
     """
     Map trade count to a score in [0, 1].
 
-    Activity scoring:
-      0  – 9  trades  :  0.00  (too few to be statistically meaningful)
-     10  – 49 trades  :  linear ramp from 0.00 to 0.80
-     50  – 199 trades :  linear ramp from 0.80 to 1.00  (target range)
-     200 + trades     :  1.00
+      0–9   trades  →  0.00
+     10–49  trades  →  ramp 0.00 → 0.80
+     50–199 trades  →  ramp 0.80 → 1.00  (target range)
+     200+   trades  →  1.00
     """
     if n_trades < 10:
         return 0.0
@@ -539,10 +579,7 @@ def _activity_score(n_trades: int) -> float:
 def _normalized_pf(pf: float) -> float:
     """
     Map profit factor to [0, 1].
-
-    pf ≤ 1.0  →  0.0  (break-even or losing)
-    pf = 2.0  →  0.5
-    pf ≥ 3.0  →  1.0
+    pf=1.0 → 0.0, pf=2.0 → 0.5, pf>=3.0 → 1.0
     """
     return float(min(max((pf - 1.0) / 2.0, 0.0), 1.0))
 
@@ -550,18 +587,12 @@ def _normalized_pf(pf: float) -> float:
 def _ppt_score(n_wins: int, n_trades: int) -> float:
     """
     Per-trade quality score in [0, 1].
-
-    avg_per_trade = (wins - losses) / n_trades  ∈ [-1, +1]
-    Normalise to [0, 1]:  (avg + 1) / 2
-
-    50 % win rate → 0.50   (neutral)
-    60 % win rate → 0.60
-    40 % win rate → 0.40
+    avg = (wins - losses) / n_trades ∈ [-1, +1]; normalise to [0, 1].
+    50% win rate → 0.50, 100% → 1.00, 0% → 0.00
     """
     if n_trades <= 0:
         return 0.0
-    n_losses    = n_trades - n_wins
-    avg         = (n_wins - n_losses) / n_trades   # ∈ [-1, +1]
+    avg = (n_wins - (n_trades - n_wins)) / n_trades
     return float((avg + 1.0) / 2.0)
 
 
@@ -571,28 +602,27 @@ def _ppt_score(n_wins: int, n_trades: int) -> float:
 
 
 def _log_trading_stats(val_f1: float, stats: dict) -> None:
-    """Print a structured summary of val-set trading quality to the log."""
     hc  = "PASSED" if stats["hard_constraints_passed"] else "FAILED"
     log.info(
         "Val trading stats  |  macro-F1=%.4f  |  HardConstraints=%s",
         val_f1, hc,
     )
     log.info(
-        "  confident_trade_count   : %d / %d bars  (coverage=%.2f%%)",
+        "  confident_trade_count   : %d / %d bars  (coverage=%.2f%%)  "
+        "[gate: >= %d  AND  >= %.0f%%]",
         stats["n_trades"], stats["n_val_bars"], stats["trade_coverage_pct"],
+        _HC_MIN_TRADES, _HC_MIN_COVERAGE * 100,
     )
     log.info(
-        "  directional_accuracy    : %.1f%%  (target >= %.0f%%)",
+        "  directional_accuracy    : %.1f%%  [gate: >= %.0f%%]",
         stats["dir_accuracy"] * 100, _HC_MIN_DIR_ACC * 100,
     )
     log.info(
-        "  validation_profit_factor: %.3f  (target >= %.2f)",
+        "  validation_profit_factor: %.3f  [gate: >= %.2f]",
         stats["profit_factor"], _HC_MIN_PF,
     )
-    log.info(
-        "  trading_quality_score   : %.4f",
-        stats["trading_quality"],
-    )
+    log.info("  trading_quality_score   : %.4f", stats["trading_quality"])
+
     if not stats["hard_constraints_passed"]:
         log.warning(
             "  HARD CONSTRAINT FAILURES: %s",
