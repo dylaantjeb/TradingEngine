@@ -994,7 +994,19 @@ def _aggregate(folds: list[FoldResult]) -> dict:
     )
     t_stat_val = t_stat if t_stat is not None else 0.0
 
-    if (
+    # Fold rejection: if more than 2 folds have PF < 1.0, the model is
+    # unstable across market regimes — cap verdict at NOT READY.
+    n_pf_below_one = sum(1 for pf in pfs if pf < 1.0)
+    _too_many_losing_folds = n_pf_below_one > 2
+
+    if _too_many_losing_folds:
+        log.warning(
+            "WALK-FORWARD REJECTION: %d / %d folds have PF < 1.0 (> 2 allowed). "
+            "Model is unstable across regimes — verdict forced to NOT READY.",
+            n_pf_below_one, n,
+        )
+        verdict = "NOT READY"
+    elif (
         pct_prof >= _FUNDED_MIN_PCT_PROF
         and avg_pf >= _FUNDED_MIN_PF
         and pnl_cv_val <= _FUNDED_MAX_CV
@@ -1024,6 +1036,7 @@ def _aggregate(folds: list[FoldResult]) -> dict:
         "n_profitable_folds":     profitable,
         "pct_profitable_folds":   round(pct_prof, 4),
         "n_weak_folds":           n_weak,
+        "n_folds_pf_below_one":   n_pf_below_one,
         "avg_win_rate":           round(float(np.mean(win_rates)), 4),
         "median_win_rate":        round(float(np.median(win_rates)), 4),
         "avg_profit_factor":      round(avg_pf, 4),
