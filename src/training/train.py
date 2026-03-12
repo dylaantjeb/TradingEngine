@@ -17,7 +17,7 @@ Steps
 
 Confidence threshold selection
 ────────────────────────────────
-Candidate thresholds: [0.50, 0.55, 0.60, 0.65, 0.70, 0.75].
+Candidate thresholds: [0.50, 0.55, 0.60, 0.65, 0.70].
 
   --select-by trading : threshold is an Optuna parameter → co-optimised
                         alongside model hyperparams. Robustness bonus rewards
@@ -73,7 +73,7 @@ VAL_FRACTION   = 0.20
 # ── Confidence threshold candidates ───────────────────────────────────────────
 # Evaluated during model selection; best is stored in schema and used at
 # inference time by backtest and live-paper engines.
-_THRESHOLD_CANDIDATES: list[float] = [0.55, 0.60, 0.65, 0.70, 0.75]
+_THRESHOLD_CANDIDATES: list[float] = [0.50, 0.55, 0.60, 0.65, 0.70]
 _DEFAULT_THRESHOLD = 0.65   # fallback when no candidate passes all gates
 
 # ── Composite objective weights ────────────────────────────────────────────────
@@ -229,8 +229,8 @@ def train(
     try:
         from src.backtest.engine import _load_cfg as _ecfg, _in_session
         _exec_cfg  = _ecfg(symbol)
-        _sess_s    = int(_exec_cfg.get("session_start_utc_hour", 0))
-        _sess_e    = int(_exec_cfg.get("session_end_utc_hour", 24))
+        _sess_s    = float(_exec_cfg.get("session_start_utc_hour", 0))
+        _sess_e    = float(_exec_cfg.get("session_end_utc_hour", 24))
     except Exception:
         _in_session = lambda ts, s, e: True   # noqa: E731
         _sess_s, _sess_e = 0, 24
@@ -242,7 +242,7 @@ def train(
         )
         _n_val_sess = int(_sess_mask_val.sum())
         log.info(
-            "Session filter loaded: %02d:00–%02d:00 UTC  |  "
+            "Session filter loaded: %.4g–%.4g UTC  |  "
             "val bars in session: %d / %d (%.1f%%)",
             _sess_s, _sess_e, _n_val_sess, n_val_bars,
             100.0 * _n_val_sess / max(n_val_bars, 1),
@@ -472,7 +472,7 @@ def train(
         if session_coverage_factor < 0.30:
             log.warning(
                 "Only %.0f%% of confident validation signals fall within session hours "
-                "(%02d:00-%02d:00 UTC). Backtest execution may be far below validation stats.",
+                "(%.4g-%.4g UTC). Backtest execution may be far below validation stats.",
                 session_coverage_factor * 100, _sess_s, _sess_e,
             )
 
