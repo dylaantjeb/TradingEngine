@@ -24,7 +24,7 @@ filters:
   #   Summer (ET = UTC-4): 13:30–20:15 UTC
   # 13.0–21.5 UTC covers 09:00–17:30 ET (summer) / 08:00–16:30 ET (winter).
   # Fractional values are supported: 13.5 = 13:30, 21.5 = 21:30, etc.
-  session_start_utc_hour: 13.0  # 13:00 UTC = covers both winter and summer opens
+  session_start_utc_hour: 12.5  # 12:30 UTC = pre-open liquidity (CME futures)
   session_end_utc_hour:   21.5  # 21:30 UTC = extended close coverage
   # ATR filter: only trade when volatility is meaningful but not runaway
   atr_min_ticks: 4              # restored from 6 — 6 was filtering too aggressively
