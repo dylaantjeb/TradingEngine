@@ -299,6 +299,21 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
     kill_switch_active = False
     loss_cooldown_left = 0
 
+    # Per-filter block counters (independent checks for confident signals)
+    flt = {
+        "n_confident_signals": 0,
+        "n_entries_queued":    0,
+        "blocked_session":     0,
+        "blocked_blackout":    0,
+        "blocked_atr":         0,
+        "blocked_trend":       0,
+        "blocked_risk":        0,
+        "blocked_loss_cd":     0,
+        "blocked_exit_cd":     0,
+        "blocked_daily_cap":   0,
+        "blocked_in_position": 0,
+    }
+
     last_signal     = 0
     last_confidence = 0.0
 
@@ -467,6 +482,32 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
             if not conf_ok:
                 sig = 0
 
+            # ── Accumulate independent filter counters after conf gate ────────
+            _conf_sig = int(sig)
+            if _conf_sig != 0:
+                flt["n_confident_signals"] += 1
+                if not _in_session(ts, sess_start, sess_end):
+                    flt["blocked_session"] += 1
+                if _in_blackout(ts, blackouts):
+                    flt["blocked_blackout"] += 1
+                if not (atr_min <= atr_ticks <= atr_max):
+                    flt["blocked_atr"] += 1
+                if trend_filter_on and not np.isnan(ema_val):
+                    if (_conf_sig == 1 and close_px < ema_val) or \
+                       (_conf_sig == -1 and close_px > ema_val):
+                        flt["blocked_trend"] += 1
+                if (kill_switch_active or daily_halt) and \
+                        (position == 0 or _conf_sig * position < 0):
+                    flt["blocked_risk"] += 1
+                if loss_cooldown_left > 0 and position == 0:
+                    flt["blocked_loss_cd"] += 1
+                if cooldown_left > 0 and position == 0:
+                    flt["blocked_exit_cd"] += 1
+                if daily_trade_count >= max_tpd and _conf_sig != position:
+                    flt["blocked_daily_cap"] += 1
+                if position != 0 and _conf_sig == position:
+                    flt["blocked_in_position"] += 1
+
             # Filter 2: Session
             sess_ok = _in_session(ts, sess_start, sess_end)
             _check("session", sess_ok)
@@ -569,6 +610,7 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
                     pending_contracts = _size(atr_ticks) if target != 0 else entry_contracts
                     if target != 0:
                         daily_trade_count += 1
+                        flt["n_entries_queued"] += 1
 
             # ── Per-bar diagnostics (debug level) ─────────────────────────────
             if log.isEnabledFor(logging.DEBUG):
@@ -602,6 +644,30 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
 
     except KeyboardInterrupt:
         print("\n  Stopped by user.")
+
+    # ── Per-filter execution summary ─────────────────────────────────────────
+    _n_conf_flt = flt.get("n_confident_signals", 0)
+    _n_exec_flt = flt.get("n_entries_queued", 0)
+    _pass_pct   = f"{100*_n_exec_flt/_n_conf_flt:.1f}%" if _n_conf_flt > 0 else "n/a"
+    log.info(
+        "[%s] Execution filter summary  |  "
+        "confident_signals=%d  entries_queued=%d  pass_through=%s",
+        symbol, _n_conf_flt, _n_exec_flt, _pass_pct,
+    )
+    log.info(
+        "[%s]   blocked_session=%d  blocked_atr=%d  blocked_trend=%d  "
+        "blocked_risk=%d  blocked_loss_cd=%d  blocked_exit_cd=%d  "
+        "blocked_daily_cap=%d  blocked_in_position=%d",
+        symbol,
+        flt.get("blocked_session", 0),
+        flt.get("blocked_atr", 0),
+        flt.get("blocked_trend", 0),
+        flt.get("blocked_risk", 0),
+        flt.get("blocked_loss_cd", 0),
+        flt.get("blocked_exit_cd", 0),
+        flt.get("blocked_daily_cap", 0),
+        flt.get("blocked_in_position", 0),
+    )
 
     # Post-run sanity safeguard: warn if trades are far below expected
     if _n_conf > 0 and len(trades) < max(5, _n_conf // 10):
@@ -682,7 +748,7 @@ def _load_artifacts(symbol: str):
         schema.get("select_by", "unknown"),
         conf_threshold,
         schema.get("val_confident_trades", "?"),
-        float(schema.get("val_trade_coverage_pct", 0)) * 100,
+        float(schema.get("val_trade_coverage_pct", 0)),
         float(schema.get("val_dir_accuracy", 0)) * 100,
         float(schema.get("val_profit_factor", 0)),
     )

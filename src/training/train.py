@@ -77,9 +77,13 @@ _THRESHOLD_CANDIDATES: list[float] = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75]
 _DEFAULT_THRESHOLD = 0.65   # fallback when no candidate passes all gates
 
 # ── Composite objective weights ────────────────────────────────────────────────
-_COMPOSITE_F1_WEIGHT      = 0.35
-_COMPOSITE_TRADING_WEIGHT = 0.55
+# Session weight: bonus for models whose confident signals cluster in trading
+# hours (harder to game, more deployment-realistic).  Scaled small so it
+# doesn't dominate — it should serve as a tiebreaker, not a primary driver.
+_COMPOSITE_F1_WEIGHT      = 0.30
+_COMPOSITE_TRADING_WEIGHT = 0.50
 _COMPOSITE_ROBUST_WEIGHT  = 0.10  # bonus for threshold stability
+_COMPOSITE_SESSION_WEIGHT = 0.10  # bonus for in-session signal concentration
 
 # ── Hard-gate thresholds ───────────────────────────────────────────────────────
 _HC_MIN_TRADES   = 50
@@ -217,6 +221,36 @@ def train(
         _HC_MIN_DIR_ACC * 100, _HC_MIN_PF,
     )
 
+    # ── Session mask for execution-aware trading objective ────────────────────
+    # Load session hours from universe.yaml if available (fallback: full day).
+    # When select_by='trading', the objective will check that confident signals
+    # fall within the trading session — catching models that look good on paper
+    # but mostly fire outside tradeable hours.
+    try:
+        from src.backtest.engine import _load_cfg as _ecfg, _in_session
+        _exec_cfg  = _ecfg(symbol)
+        _sess_s    = int(_exec_cfg.get("session_start_utc_hour", 0))
+        _sess_e    = int(_exec_cfg.get("session_end_utc_hour", 24))
+    except Exception:
+        _in_session = lambda ts, s, e: True   # noqa: E731
+        _sess_s, _sess_e = 0, 24
+
+    _has_ts = hasattr(X_val.index, "hour")
+    if _has_ts and (_sess_s != 0 or _sess_e < 24):
+        _sess_mask_val = np.array(
+            [_in_session(ts, _sess_s, _sess_e) for ts in X_val.index], dtype=bool
+        )
+        _n_val_sess = int(_sess_mask_val.sum())
+        log.info(
+            "Session filter loaded: %02d:00–%02d:00 UTC  |  "
+            "val bars in session: %d / %d (%.1f%%)",
+            _sess_s, _sess_e, _n_val_sess, n_val_bars,
+            100.0 * _n_val_sess / max(n_val_bars, 1),
+        )
+    else:
+        _sess_mask_val = np.ones(n_val_bars, dtype=bool)
+        _n_val_sess    = n_val_bars
+
     # ── Shared param sampler ──────────────────────────────────────────────────
     def _sample_params(trial: "optuna.Trial") -> dict:
         return {
@@ -275,25 +309,49 @@ def train(
         if pf < _HC_MIN_PF:
             return _GATE_FAIL_SCORE
 
+        # ── STAGE 1b: Execution-realism gate (session-filtered coverage) ──────
+        # Among confident signals, check that enough fall within the trading
+        # session.  A model that mostly fires out-of-session will be rejected
+        # by the backtest execution layer, so penalise it here too.
+        sess_conf_mask = mask & _sess_mask_val
+        n_sess_conf    = int(sess_conf_mask.sum())
+        sess_cov       = n_sess_conf / max(_n_val_sess, 1)
+        # Gate: in-session coverage must meet the same minimum as raw coverage.
+        # Also gate on in-session trade count to ensure the model is actually
+        # executable within session hours.
+        if n_sess_conf < _HC_MIN_TRADES:
+            return _GATE_FAIL_SCORE
+        if sess_cov < _HC_MIN_COVERAGE:
+            return _GATE_FAIL_SCORE
+
         # ── STAGE 2: Balanced trading quality + threshold robustness ──────────
         tq = _trading_quality_score(
             proba, y_val_raw, inv_label_map,
             min_conf=threshold, n_val_bars=n_val_bars,
         )
 
+        # Execution-realism factor: reward models where confident signals
+        # are well-distributed within the trading session.
+        # sess_factor = fraction of confident signals that are in-session.
+        # A model that fires 95% in-session (0.95) is better than one at 30%.
+        sess_factor = n_sess_conf / max(n_conf, 1)
+
         # Robustness: fraction of adjacent threshold candidates that also pass
-        # all gates. Rewards models that work across a range of thresholds,
-        # penalising those that only pass at one specific threshold level.
+        # all gates (raw + session). Rewards models that work across thresholds.
         tidx      = _THRESHOLD_CANDIDATES.index(threshold)
         neighbors = [_THRESHOLD_CANDIDATES[i]
                      for i in (tidx - 1, tidx + 1)
                      if 0 <= i < len(_THRESHOLD_CANDIDATES)]
         n_passing_neighbors = 0
         for nb_t in neighbors:
-            nb_mask = (conf >= nb_t) & (sig != 0)
-            nb_n    = int(nb_mask.sum())
-            nb_cov  = nb_n / n_val_bars
-            if nb_n >= _HC_MIN_TRADES and nb_cov >= _HC_MIN_COVERAGE:
+            nb_mask      = (conf >= nb_t) & (sig != 0)
+            nb_sess_mask = nb_mask & _sess_mask_val
+            nb_n         = int(nb_mask.sum())
+            nb_ns        = int(nb_sess_mask.sum())
+            nb_cov       = nb_n / n_val_bars
+            nb_scov      = nb_ns / max(_n_val_sess, 1)
+            if (nb_n >= _HC_MIN_TRADES and nb_cov >= _HC_MIN_COVERAGE
+                    and nb_ns >= _HC_MIN_TRADES and nb_scov >= _HC_MIN_COVERAGE):
                 nb_sig = sig[nb_mask];  nb_y = y_val_raw[nb_mask]
                 nb_w   = int(((nb_sig == nb_y) & (nb_y != 0)).sum())
                 nb_l   = nb_n - nb_w
@@ -305,9 +363,10 @@ def train(
         robustness = n_passing_neighbors / max(len(neighbors), 1)
 
         return (
-            _COMPOSITE_F1_WEIGHT * f1
+            _COMPOSITE_F1_WEIGHT      * f1
             + _COMPOSITE_TRADING_WEIGHT * tq
-            + _COMPOSITE_ROBUST_WEIGHT * robustness
+            + _COMPOSITE_ROBUST_WEIGHT  * robustness
+            + _COMPOSITE_SESSION_WEIGHT * sess_factor
         )
 
     # ── F1 objective ──────────────────────────────────────────────────────────
@@ -397,6 +456,26 @@ def train(
         val_proba, y_val_raw, inv_label_map,
         min_conf=best_threshold, n_val_bars=n_val_bars,
     )
+
+    # Compute session coverage factor for the final selected model
+    _val_conf  = np.max(val_proba, axis=1)
+    _val_sig   = np.array([inv_label_map.get(int(e), 0) for e in np.argmax(val_proba, axis=1)])
+    _val_cmask = (_val_conf >= best_threshold) & (_val_sig != 0)
+    _n_val_conf = int(_val_cmask.sum())
+    _n_val_sess_conf = int((_val_cmask & _sess_mask_val).sum())
+    session_coverage_factor = _n_val_sess_conf / max(_n_val_conf, 1)
+    if _n_val_conf > 0:
+        log.info(
+            "Session coverage: %d / %d confident signals in session (%.1f%%)",
+            _n_val_sess_conf, _n_val_conf, session_coverage_factor * 100,
+        )
+        if session_coverage_factor < 0.30:
+            log.warning(
+                "Only %.0f%% of confident validation signals fall within session hours "
+                "(%02d:00-%02d:00 UTC). Backtest execution may be far below validation stats.",
+                session_coverage_factor * 100, _sess_s, _sess_e,
+            )
+
     _log_selected_model(val_f1, val_stats, selected_via, best_threshold)
 
     # ── Retrain on full dataset ────────────────────────────────────────────────
@@ -430,6 +509,10 @@ def train(
         "val_confident_trades":      val_stats["n_trades"],
         "val_dir_accuracy":          round(val_stats["dir_accuracy"], 6),
         "val_profit_factor":         round(val_stats["profit_factor"], 6),
+        "session_coverage_factor":   round(session_coverage_factor, 4),
+        "val_session_conf_trades":   _n_val_sess_conf,
+        "session_start_utc_hour":    _sess_s,
+        "session_end_utc_hour":      _sess_e,
         "hard_constraints_passed":   hc_passed,
         "all_gates_failed":          all_gates_failed,
         "selected_via":              selected_via,

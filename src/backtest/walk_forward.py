@@ -262,12 +262,15 @@ def run_walk_forward(
 
         # ── OOS activity diagnostics ───────────────────────────────────────
         oos_stats = _compute_oos_stats(
-            model, scaler, feature_names, test_df, inv_label_map, conf_threshold,
+            model, scaler, feature_names, test_df, inv_label_map,
+            conf_threshold, cfg=cfg,
         )
         weak_fold = (
             oos_stats["n_trades"] < _WEAK_FOLD_MIN_TRADES
             or oos_stats["trade_coverage_pct"] < _WEAK_FOLD_MIN_COVERAGE_PCT
         )
+        # Executed trade count not known yet — log pre-filter stats now,
+        # then log the execution comparison after the backtest completes.
         _log_fold_oos_stats(fold_idx + 1, oos_stats, conf_threshold, weak_fold)
 
         # ── Backtest on test window ────────────────────────────────────────
@@ -288,6 +291,14 @@ def run_walk_forward(
         except Exception as exc:
             log.warning("Fold %d  backtest failed: %s — skipping", fold_idx, exc)
             continue
+
+        # Log execution pass-through: exec_est → actual executed trades
+        _executed = metrics.get("n_trades", 0)
+        if oos_stats.get("exec_est_signals") is not None:
+            _log_fold_oos_stats(
+                fold_idx + 1, oos_stats, conf_threshold,
+                weak_fold, executed_trades=_executed,
+            )
 
         fr = FoldResult(
             fold_idx=fold_idx,
@@ -438,8 +449,10 @@ def _train_on_slice(
     inv_label_map = {str(i): int(cls) for i, cls in enumerate(le.classes_)}
 
     if n_trials > 0:
+        # Pass index for session-aware scoring when timestamps are available
         model, conf_threshold = _optuna_train(
             X_scaled, y_enc, y_raw, int_inv_map, n_trials, select_by,
+            val_index=X_df.index,
         )
     else:
         # Conservative fixed hyperparameters for OOS robustness
@@ -484,6 +497,7 @@ def _optuna_train(
     int_inv_map: dict,
     n_trials: int,
     select_by: str = "f1",
+    val_index=None,
 ) -> tuple:
     """
     Optuna hyperparameter search within a training slice.
@@ -491,6 +505,8 @@ def _optuna_train(
     Returns (model, conf_threshold).
     Inner validation: last 20% of the training slice (time-ordered).
     When select_by='trading', threshold is co-optimised via Optuna.
+    val_index: DatetimeIndex of the full training slice — used to derive
+               inner-val timestamps for session-aware scoring.
     """
     import optuna
     import xgboost as xgb
@@ -499,7 +515,8 @@ def _optuna_train(
         _THRESHOLD_CANDIDATES, _GATE_FAIL_SCORE,
         _HC_MIN_TRADES, _HC_MIN_COVERAGE, _HC_MIN_DIR_ACC, _HC_MIN_PF,
         _trading_quality_score, _select_best_threshold,
-        _COMPOSITE_F1_WEIGHT, _COMPOSITE_TRADING_WEIGHT, _COMPOSITE_ROBUST_WEIGHT,
+        _COMPOSITE_F1_WEIGHT, _COMPOSITE_TRADING_WEIGHT,
+        _COMPOSITE_ROBUST_WEIGHT, _COMPOSITE_SESSION_WEIGHT,
     )
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -509,6 +526,26 @@ def _optuna_train(
     y_tr    = y_enc[:split];     y_val = y_enc[split:]
     y_val_raw = y_raw[split:]
     n_val   = len(X_val)
+
+    # ── Session mask for inner validation ────────────────────────────────────
+    # Build once: which inner-val bars are within the trading session.
+    try:
+        from src.backtest.engine import _load_cfg as _ecfg, _in_session
+        # symbol not available here — use generic cfg if walk-forward passes one
+        # Fall through to default session hours
+        raise AttributeError("no symbol in _optuna_train")
+    except Exception:
+        _in_session_fn = lambda ts, s, e: (s <= ts.hour < e)  # noqa: E731
+        _sess_s, _sess_e = 9, 22  # safe defaults
+
+    if val_index is not None and hasattr(val_index, "hour"):
+        inner_val_idx = val_index[split:]
+        _sess_mask = np.array(
+            [_in_session_fn(ts, _sess_s, _sess_e) for ts in inner_val_idx], dtype=bool
+        )
+    else:
+        _sess_mask = np.ones(n_val, dtype=bool)
+    _n_val_sess = int(_sess_mask.sum())
 
     def objective(trial: optuna.Trial) -> float:
         params = {
@@ -545,6 +582,13 @@ def _optuna_train(
         if n_c < _HC_MIN_TRADES or cov < _HC_MIN_COVERAGE:
             return _GATE_FAIL_SCORE
 
+        # Session-filtered gate: confident signals must also be viable in session
+        sess_mask_conf = mask & _sess_mask
+        n_sess_conf    = int(sess_mask_conf.sum())
+        sess_cov       = n_sess_conf / max(_n_val_sess, 1)
+        if n_sess_conf < _HC_MIN_TRADES or sess_cov < _HC_MIN_COVERAGE:
+            return _GATE_FAIL_SCORE
+
         sig_t   = sig[mask];  y_t = y_val_raw[mask]
         wins    = int(((sig_t == y_t) & (y_t != 0)).sum())
         losses  = n_c - wins
@@ -554,9 +598,14 @@ def _optuna_train(
         if dir_acc < _HC_MIN_DIR_ACC or pf < _HC_MIN_PF:
             return _GATE_FAIL_SCORE
 
-        tq = _trading_quality_score(proba, y_val_raw, int_inv_map,
-                                    min_conf=threshold, n_val_bars=n_val)
-        return _COMPOSITE_F1_WEIGHT * f1 + _COMPOSITE_TRADING_WEIGHT * tq
+        tq          = _trading_quality_score(proba, y_val_raw, int_inv_map,
+                                             min_conf=threshold, n_val_bars=n_val)
+        sess_factor = n_sess_conf / max(n_c, 1)
+        return (
+            _COMPOSITE_F1_WEIGHT      * f1
+            + _COMPOSITE_TRADING_WEIGHT * tq
+            + _COMPOSITE_SESSION_WEIGHT * sess_factor
+        )
 
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
@@ -608,14 +657,20 @@ def _compute_oos_stats(
     test_df: pd.DataFrame,
     inv_label_map: dict,
     conf_threshold: float,
+    cfg: dict | None = None,
 ) -> dict:
     """
     Compute OOS trading statistics for a fold using the selected threshold.
 
     Returns a dict with n_trades, trade_coverage_pct, dir_accuracy,
-    profit_factor, hard_constraints_passed.
+    profit_factor, hard_constraints_passed, plus execution-aware extras:
+      session_pass_pct   – fraction of confident signals in trading session
+      atr_pass_pct       – fraction of confident signals passing ATR filter
+      exec_est_signals   – estimated signals surviving session+ATR (both applied)
+      exec_est_coverage  – exec_est_signals / n_val_bars  (%)
     """
     from src.training.train import _compute_trading_stats
+    from src.backtest.engine import _in_session
 
     feat_cols = [c for c in feature_names if c in test_df.columns]
     X_scaled  = scaler.transform(test_df[feat_cols])
@@ -623,10 +678,57 @@ def _compute_oos_stats(
     y_raw     = test_df["label"].values
     int_map   = {int(k): v for k, v in inv_label_map.items()}
 
-    return _compute_trading_stats(
+    stats = _compute_trading_stats(
         proba, y_raw, int_map,
         min_conf=conf_threshold, n_val_bars=len(test_df),
     )
+
+    # ── Execution-aware pre-filter estimate ───────────────────────────────────
+    # Identify bars with confident non-flat signals, then apply session+ATR.
+    if cfg is not None and len(test_df) > 0:
+        conf_vals = np.max(proba, axis=1)
+        sig_vals  = np.array([int_map.get(int(e), 0) for e in np.argmax(proba, axis=1)])
+        conf_mask = (conf_vals >= conf_threshold) & (sig_vals != 0)
+        n_conf    = int(conf_mask.sum())
+        n_val     = len(test_df)
+
+        # Session filter (only if DatetimeIndex available)
+        sess_start = int(cfg.get("session_start_utc_hour", 0))
+        sess_end   = int(cfg.get("session_end_utc_hour", 24))
+        has_ts     = hasattr(test_df.index, "hour")
+        if has_ts:
+            sess_mask = np.array([
+                _in_session(ts, sess_start, sess_end) for ts in test_df.index
+            ])
+        else:
+            sess_mask = np.ones(n_val, dtype=bool)
+        n_sess = int((conf_mask & sess_mask).sum())
+
+        # ATR filter (uses atr_14 feature if available)
+        atr_min  = float(cfg.get("atr_min_ticks", 0))
+        atr_max  = float(cfg.get("atr_max_ticks", 1e9))
+        tick_sz  = float(cfg.get("tick_size", 0.25))
+        if "atr_14" in test_df.columns and "close" in test_df.columns:
+            close_v  = test_df["close"].values
+            atr_t    = test_df["atr_14"].values * close_v / tick_sz
+            atr_mask = (atr_t >= atr_min) & (atr_t <= atr_max)
+        else:
+            atr_mask = np.ones(n_val, dtype=bool)
+        n_atr = int((conf_mask & atr_mask).sum())
+
+        n_exec_est = int((conf_mask & sess_mask & atr_mask).sum())
+
+        stats["session_pass_pct"]  = round(100.0 * n_sess    / max(n_conf, 1), 2)
+        stats["atr_pass_pct"]      = round(100.0 * n_atr     / max(n_conf, 1), 2)
+        stats["exec_est_signals"]  = n_exec_est
+        stats["exec_est_coverage"] = round(100.0 * n_exec_est / max(n_val, 1), 2)
+    else:
+        stats["session_pass_pct"]  = None
+        stats["atr_pass_pct"]      = None
+        stats["exec_est_signals"]  = None
+        stats["exec_est_coverage"] = None
+
+    return stats
 
 
 def _log_fold_oos_stats(
@@ -634,9 +736,10 @@ def _log_fold_oos_stats(
     stats: dict,
     threshold: float,
     weak_fold: bool,
+    executed_trades: int | None = None,
 ) -> None:
-    """Log per-fold OOS activity diagnostics."""
-    status = "WEAK" if weak_fold else "OK"
+    """Log per-fold OOS activity diagnostics, including execution-aware estimates."""
+    status   = "WEAK" if weak_fold else "OK"
     hc_label = "PASSED" if stats["hard_constraints_passed"] else "FAILED"
     log.info(
         "Fold %d OOS diagnostics  |  threshold=%.2f  |  "
@@ -651,6 +754,34 @@ def _log_fold_oos_stats(
         hc_label,
         status,
     )
+
+    # Execution-aware filter estimates
+    exec_est = stats.get("exec_est_signals")
+    if exec_est is not None:
+        sess_pct = stats.get("session_pass_pct", 0)
+        atr_pct  = stats.get("atr_pass_pct", 0)
+        exec_cov = stats.get("exec_est_coverage", 0)
+        log.info(
+            "Fold %d exec-aware estimate  |  "
+            "session_pass=%.0f%%  atr_pass=%.0f%%  "
+            "exec_est=%d (%.1f%% coverage)",
+            fold_num, sess_pct, atr_pct, exec_est, exec_cov,
+        )
+        if executed_trades is not None:
+            pass_pct = f"{100*executed_trades/max(exec_est,1):.0f}%" if exec_est > 0 else "n/a"
+            log.info(
+                "Fold %d execution pass-through  |  "
+                "exec_est=%d → executed=%d (%s)",
+                fold_num, exec_est, executed_trades, pass_pct,
+            )
+            if exec_est > 0 and executed_trades < max(3, exec_est // 5):
+                log.warning(
+                    "Fold %d low pass-through (%d/%d): "
+                    "cooldown/holding/daily-cap filters may be suppressing most entries. "
+                    "Consider relaxing min_holding_bars or cooldown_bars_after_exit.",
+                    fold_num, executed_trades, exec_est,
+                )
+
     if weak_fold:
         log.warning(
             "Fold %d WEAK: only %d confident OOS trades (%.2f%% coverage) — "

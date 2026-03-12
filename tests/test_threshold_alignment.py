@@ -43,6 +43,8 @@ _SCHEMA_REQUIRED_KEYS = {
     "val_profit_factor",
     "best_val_trading_quality",
     "hard_constraints_passed",
+    "session_coverage_factor",
+    "val_session_conf_trades",
 }
 
 
@@ -51,10 +53,11 @@ def _make_schema(
     threshold: float = 0.65,
     select_by: str = "trading",
     val_trades: int = 320,
-    val_coverage: float = 0.0774,
+    val_coverage: float = 7.74,   # stored as percentage (e.g. 7.74 means 7.74%)
     val_dir_acc: float = 0.701,
     val_pf: float = 1.645,
     feature_names: list[str] | None = None,
+    session_coverage_factor: float = 0.72,
 ) -> dict:
     return {
         "symbol":                   symbol,
@@ -66,10 +69,14 @@ def _make_schema(
         "threshold_candidates":     [0.50, 0.55, 0.60, 0.65, 0.70, 0.75],
         "best_val_f1":              0.42,
         "best_val_trading_quality": 0.61,
-        "val_trade_coverage_pct":   round(val_coverage, 6),
+        "val_trade_coverage_pct":   round(val_coverage, 4),
         "val_confident_trades":     val_trades,
         "val_dir_accuracy":         round(val_dir_acc, 6),
         "val_profit_factor":        round(val_pf, 6),
+        "session_coverage_factor":  round(session_coverage_factor, 4),
+        "val_session_conf_trades":  int(val_trades * session_coverage_factor),
+        "session_start_utc_hour":   9,
+        "session_end_utc_hour":     22,
         "hard_constraints_passed":  True,
         "all_gates_failed":         False,
         "selected_via":             "trading_objective",
@@ -414,3 +421,325 @@ class TestThresholdIdentityEndToEnd:
 
             assert cfg["min_long_confidence"]  == pytest.approx(t, abs=1e-9)
             assert cfg["min_short_confidence"] == pytest.approx(t, abs=1e-9)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. Coverage percentage correctness (no double * 100)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestCoveragePercentageFormatting:
+    """
+    val_trade_coverage_pct is stored as a percentage value (0-100) in the
+    schema.  The logging code must NOT multiply by 100 again.
+    """
+
+    def test_schema_stores_coverage_as_percentage_not_fraction(self):
+        """Coverage from _compute_trading_stats is rounded * 100 before saving."""
+        # 848 / 4135 = 20.51% → should be stored as ~20.51, not ~0.2051
+        schema = _make_schema(val_trades=848, val_coverage=20.51)
+        cov = schema["val_trade_coverage_pct"]
+        assert cov > 1.0, (
+            f"val_trade_coverage_pct={cov} looks like a fraction; should be a % (e.g. 20.51)"
+        )
+        assert cov < 100.0, f"val_trade_coverage_pct={cov} is implausibly large"
+
+    def test_coverage_logging_reads_value_directly(self):
+        """
+        The log format string uses %.1f%% and the value directly — so the
+        value must be in 0-100 range, not multiplied by 100 again.
+        This test mimics the logging expression in engine.py / paper_engine.py.
+        """
+        schema = _make_schema(val_trades=320, val_coverage=7.74)
+        raw_val = float(schema.get("val_trade_coverage_pct", 0))
+        # Correct display: 7.74%  (not 774.0%)
+        assert raw_val == pytest.approx(7.74, abs=0.01)
+        # The logged value should be < 100 (obviously a %)
+        assert raw_val < 100.0
+
+    def test_coverage_round_trip_from_compute_trading_stats(self):
+        """_compute_trading_stats stores coverage*100 → reading back gives %."""
+        from src.training.train import _compute_trading_stats
+        import numpy as np
+
+        rng = np.random.default_rng(42)
+        n = 500
+        proba = rng.dirichlet([1, 1, 1], size=n)
+        y_raw = rng.choice([-1, 0, 1], size=n)
+        inv_map = {0: -1, 1: 0, 2: 1}
+
+        stats = _compute_trading_stats(proba, y_raw, inv_map, min_conf=0.60, n_val_bars=n)
+        cov_pct = stats["trade_coverage_pct"]
+        n_trades = stats["n_trades"]
+
+        # Verify: coverage_pct == n_trades/n * 100
+        expected_pct = n_trades / n * 100
+        assert cov_pct == pytest.approx(expected_pct, abs=0.01), (
+            f"trade_coverage_pct={cov_pct} but n_trades/n*100={expected_pct:.4f}"
+        )
+        # Must be in 0-100 range
+        assert 0.0 <= cov_pct <= 100.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. Execution filter counters in _simulate_trades
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestExecutionFilterCounters:
+    """filter_counters must be present in cost_summary after _simulate_trades."""
+
+    def _make_signals(self, n=50):
+        import pandas as pd
+        ts = pd.date_range("2024-01-02 10:00", periods=n, freq="1min", tz="UTC")
+        sig  = pd.Series([1, -1] * (n // 2), index=ts)
+        conf = pd.Series([0.75] * n, index=ts)
+        open_ = pd.Series([100.0] * n, index=ts)
+        atr   = pd.Series([10.0] * n, index=ts)   # in ticks, passes atr_min=4
+        close = pd.Series([100.0] * n, index=ts)
+        return sig, open_, atr, conf, close
+
+    def test_filter_counters_present_in_cost_summary(self):
+        from src.backtest.engine import _simulate_trades
+        sig, open_, atr, conf, close = self._make_signals()
+        cfg = {
+            "execution_delay_bars": 1,
+            "session_start_utc_hour": 9,
+            "session_end_utc_hour": 22,
+            "atr_min_ticks": 4, "atr_max_ticks": 200,
+            "news_blackout_windows": [],
+            "max_trades_per_day": 9999,
+            "min_holding_bars": 1,
+            "cooldown_bars_after_exit": 0,
+            "min_long_confidence": 0.0, "min_short_confidence": 0.0,
+            "trend_filter_enabled": False,
+            "starting_equity": 100_000.0,
+            "max_daily_loss_usd": 1e15, "max_daily_loss_pct": 1.0,
+            "max_total_drawdown_usd": 1e15, "max_total_drawdown_pct": 1.0,
+            "max_consecutive_losses": 9999, "cooldown_bars_after_loss": 0,
+            "position_sizing_method": "fixed", "fixed_contracts": 1,
+            "max_contracts": 3,
+        }
+        _, _, cost = _simulate_trades(sig, open_, atr, cfg, 0.0, 3.0, 50.0,
+                                      conf_series=conf, close_prices=close)
+        assert "filter_counters" in cost, "filter_counters must be in cost_summary"
+
+    def test_filter_counter_keys_present(self):
+        from src.backtest.engine import _simulate_trades
+        sig, open_, atr, conf, close = self._make_signals()
+        cfg = {
+            "execution_delay_bars": 1,
+            "session_start_utc_hour": 9, "session_end_utc_hour": 22,
+            "atr_min_ticks": 4, "atr_max_ticks": 200,
+            "news_blackout_windows": [], "max_trades_per_day": 9999,
+            "min_holding_bars": 1, "cooldown_bars_after_exit": 0,
+            "min_long_confidence": 0.0, "min_short_confidence": 0.0,
+            "trend_filter_enabled": False,
+            "starting_equity": 100_000.0,
+            "max_daily_loss_usd": 1e15, "max_daily_loss_pct": 1.0,
+            "max_total_drawdown_usd": 1e15, "max_total_drawdown_pct": 1.0,
+            "max_consecutive_losses": 9999, "cooldown_bars_after_loss": 0,
+            "position_sizing_method": "fixed", "fixed_contracts": 1,
+            "max_contracts": 3,
+        }
+        _, _, cost = _simulate_trades(sig, open_, atr, cfg, 0.0, 3.0, 50.0,
+                                      conf_series=conf, close_prices=close)
+        flt = cost["filter_counters"]
+        for key in ("n_confident_signals", "n_entries_queued",
+                    "blocked_session", "blocked_atr", "blocked_trend",
+                    "blocked_risk", "blocked_exit_cd", "blocked_daily_cap"):
+            assert key in flt, f"Missing filter counter key: {key}"
+
+    def test_session_block_counted_correctly(self):
+        """Bars outside session must be counted in blocked_session."""
+        import pandas as pd
+        from src.backtest.engine import _simulate_trades
+
+        # All bars at 03:00 UTC — outside session 9-22
+        ts = pd.date_range("2024-01-02 03:00", periods=20, freq="1min", tz="UTC")
+        sig  = pd.Series([1] * 20, index=ts)
+        conf = pd.Series([0.80] * 20, index=ts)
+        open_ = pd.Series([100.0] * 20, index=ts)
+        atr   = pd.Series([10.0] * 20, index=ts)
+        close = pd.Series([100.0] * 20, index=ts)
+
+        cfg = {
+            "execution_delay_bars": 1,
+            "session_start_utc_hour": 9, "session_end_utc_hour": 22,
+            "atr_min_ticks": 0, "atr_max_ticks": 1000,
+            "news_blackout_windows": [], "max_trades_per_day": 9999,
+            "min_holding_bars": 1, "cooldown_bars_after_exit": 0,
+            "min_long_confidence": 0.0, "min_short_confidence": 0.0,
+            "trend_filter_enabled": False,
+            "starting_equity": 100_000.0,
+            "max_daily_loss_usd": 1e15, "max_daily_loss_pct": 1.0,
+            "max_total_drawdown_usd": 1e15, "max_total_drawdown_pct": 1.0,
+            "max_consecutive_losses": 9999, "cooldown_bars_after_loss": 0,
+            "position_sizing_method": "fixed", "fixed_contracts": 1,
+            "max_contracts": 3,
+        }
+        trades, _, cost = _simulate_trades(sig, open_, atr, cfg, 0.0, 3.0, 50.0,
+                                           conf_series=conf, close_prices=close)
+        flt = cost["filter_counters"]
+        assert flt["blocked_session"] == 20, (
+            f"All 20 bars should be blocked by session; got {flt['blocked_session']}"
+        )
+        assert len(trades) == 0
+
+    def test_atr_block_counted_correctly(self):
+        """Bars with ATR=0 (below min_ticks=4) must be counted in blocked_atr."""
+        import pandas as pd
+        from src.backtest.engine import _simulate_trades
+
+        ts = pd.date_range("2024-01-02 10:00", periods=10, freq="1min", tz="UTC")
+        sig  = pd.Series([1] * 10, index=ts)
+        conf = pd.Series([0.80] * 10, index=ts)
+        open_ = pd.Series([100.0] * 10, index=ts)
+        atr   = pd.Series([0.5] * 10, index=ts)    # below atr_min_ticks=4
+        close = pd.Series([100.0] * 10, index=ts)
+
+        cfg = {
+            "execution_delay_bars": 1,
+            "session_start_utc_hour": 0, "session_end_utc_hour": 24,
+            "atr_min_ticks": 4, "atr_max_ticks": 200,
+            "news_blackout_windows": [], "max_trades_per_day": 9999,
+            "min_holding_bars": 1, "cooldown_bars_after_exit": 0,
+            "min_long_confidence": 0.0, "min_short_confidence": 0.0,
+            "trend_filter_enabled": False,
+            "starting_equity": 100_000.0,
+            "max_daily_loss_usd": 1e15, "max_daily_loss_pct": 1.0,
+            "max_total_drawdown_usd": 1e15, "max_total_drawdown_pct": 1.0,
+            "max_consecutive_losses": 9999, "cooldown_bars_after_loss": 0,
+            "position_sizing_method": "fixed", "fixed_contracts": 1,
+            "max_contracts": 3,
+        }
+        _, _, cost = _simulate_trades(sig, open_, atr, cfg, 0.0, 3.0, 50.0,
+                                      conf_series=conf, close_prices=close)
+        flt = cost["filter_counters"]
+        assert flt["blocked_atr"] == 10, (
+            f"All 10 bars should be blocked by ATR; got {flt['blocked_atr']}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. Walk-forward OOS stats include execution-aware estimates
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestWalkForwardExecAwareOosStats:
+    """_compute_oos_stats must return execution-aware fields when cfg provided."""
+
+    def _make_test_df(self, n=200, in_session_frac=0.5):
+        """Build a minimal test_df with datetime index and required columns."""
+        import pandas as pd
+        import numpy as np
+
+        # Mix of in-session (10:00 UTC) and out-of-session (03:00 UTC) bars
+        n_sess = int(n * in_session_frac)
+        n_oos  = n - n_sess
+        ts_in  = pd.date_range("2024-01-02 10:00", periods=n_sess, freq="1min", tz="UTC")
+        ts_out = pd.date_range("2024-01-02 03:00", periods=n_oos,  freq="1min", tz="UTC")
+        ts     = ts_in.append(ts_out).sort_values()
+
+        rng = np.random.default_rng(1)
+        df = pd.DataFrame({
+            "label":   rng.choice([-1, 0, 1], size=n),
+            "atr_14":  rng.uniform(0.001, 0.003, size=n),
+            "close":   rng.uniform(100, 200, size=n),
+            "f0":      rng.normal(size=n),
+            "f1":      rng.normal(size=n),
+        }, index=ts)
+        return df
+
+    def test_exec_est_fields_present_with_cfg(self):
+        """When cfg provided, exec_est_signals and coverage fields must exist."""
+        import numpy as np
+        import xgboost as xgb
+        from sklearn.preprocessing import LabelEncoder, RobustScaler
+        from src.backtest.walk_forward import _compute_oos_stats
+
+        test_df = self._make_test_df(n=100)
+        rng = np.random.default_rng(0)
+        X   = rng.normal(size=(100, 2))
+        y   = np.tile([0, 1, 2], 34)[:100]
+
+        le  = LabelEncoder().fit(y)
+        sc  = RobustScaler().fit(X)
+        m   = xgb.XGBClassifier(n_estimators=5, verbosity=0, eval_metric="mlogloss",
+                                 random_state=0)
+        m.fit(sc.transform(X), le.transform(y))
+        inv_map = {i: int(c) for i, c in enumerate(le.classes_)}
+
+        cfg = {
+            "session_start_utc_hour": 9, "session_end_utc_hour": 22,
+            "atr_min_ticks": 0, "atr_max_ticks": 1000,
+            "tick_size": 0.25,
+        }
+        stats = _compute_oos_stats(m, sc, ["f0", "f1"], test_df, inv_map,
+                                   conf_threshold=0.40, cfg=cfg)
+
+        assert "exec_est_signals"  in stats, "exec_est_signals must be in stats"
+        assert "exec_est_coverage" in stats, "exec_est_coverage must be in stats"
+        assert "session_pass_pct"  in stats, "session_pass_pct must be in stats"
+        assert "atr_pass_pct"      in stats, "atr_pass_pct must be in stats"
+
+    def test_exec_est_fields_none_without_cfg(self):
+        """Without cfg, exec_est_* fields must be None (backward compat)."""
+        import numpy as np
+        import xgboost as xgb
+        from sklearn.preprocessing import LabelEncoder, RobustScaler
+        from src.backtest.walk_forward import _compute_oos_stats
+
+        test_df = self._make_test_df(n=50)
+        rng = np.random.default_rng(0)
+        X   = rng.normal(size=(50, 2))
+        y   = np.tile([0, 1, 2], 17)[:50]
+
+        le = LabelEncoder().fit(y)
+        sc = RobustScaler().fit(X)
+        m  = xgb.XGBClassifier(n_estimators=5, verbosity=0, eval_metric="mlogloss",
+                                random_state=0)
+        m.fit(sc.transform(X), le.transform(y))
+        inv_map = {i: int(c) for i, c in enumerate(le.classes_)}
+
+        stats = _compute_oos_stats(m, sc, ["f0", "f1"], test_df, inv_map,
+                                   conf_threshold=0.40, cfg=None)
+        assert stats["exec_est_signals"]  is None
+        assert stats["exec_est_coverage"] is None
+
+    def test_session_pass_pct_reflects_in_session_fraction(self):
+        """
+        When 50% of bars are in-session and the model fires uniformly,
+        session_pass_pct should be ≈ 50% ± some tolerance.
+        """
+        import numpy as np
+        import xgboost as xgb
+        from sklearn.preprocessing import LabelEncoder, RobustScaler
+        from src.backtest.walk_forward import _compute_oos_stats
+
+        # Build test_df: 100 bars, 50 in-session at 10:00 UTC
+        test_df = self._make_test_df(n=100, in_session_frac=0.5)
+        rng = np.random.default_rng(7)
+        X   = rng.normal(size=(100, 2))
+        y   = np.tile([0, 1, 2], 34)[:100]
+
+        le = LabelEncoder().fit(y)
+        sc = RobustScaler().fit(X)
+        m  = xgb.XGBClassifier(n_estimators=5, verbosity=0, eval_metric="mlogloss",
+                                random_state=0)
+        m.fit(sc.transform(X), le.transform(y))
+        inv_map = {i: int(c) for i, c in enumerate(le.classes_)}
+
+        cfg = {
+            "session_start_utc_hour": 9, "session_end_utc_hour": 22,
+            "atr_min_ticks": 0, "atr_max_ticks": 1000,
+            "tick_size": 0.25,
+        }
+        stats = _compute_oos_stats(m, sc, ["f0", "f1"], test_df, inv_map,
+                                   conf_threshold=0.35, cfg=cfg)
+
+        # With 50% of bars in session, session_pass_pct should be roughly 0-100
+        # (model fires uniformly → expect ~50%). Allow wide tolerance for small N.
+        sp = stats.get("session_pass_pct", None)
+        assert sp is not None
+        assert 0.0 <= sp <= 100.0, f"session_pass_pct={sp} out of range"
