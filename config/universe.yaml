@@ -22,9 +22,9 @@ filters:
   # ES CME Globex regular session: 09:30–16:15 ET
   #   Winter (ET = UTC-5): 14:30–21:15 UTC
   #   Summer (ET = UTC-4): 13:30–20:15 UTC
-  # Using 13:00–21:00 UTC aligns with CME open (13:30 UTC summer).
-  # Integer-hour field; 13 is the nearest value covering the 13:30 open.
-  session_start_utc_hour: 13    # ≈ 09:30 ET summer (CME open alignment)
+  # 13.5 = 13:30 UTC, matching the CME open precisely (summer / ET-4).
+  # Fractional values are supported: 13.5 = 13:30, 14.5 = 14:30, etc.
+  session_start_utc_hour: 13.5  # 13:30 UTC = 09:30 ET summer (CME open)
   session_end_utc_hour:   21    # ≈ 16:00 ET winter / 17:00 ET summer
   # ATR filter: only trade when volatility is meaningful but not runaway
   atr_min_ticks: 4              # restored from 6 — 6 was filtering too aggressively
@@ -43,7 +43,7 @@ confidence:
 # Short signals blocked when close > EMA(ema_period).
 trend_filter:
   enabled: true
-  ema_period: 100
+  ema_period: 50
 
 # ── Prop-firm style risk limits ─────────────────────────────────────────────────
 # Conservative limits matching typical 10% max-drawdown funded-account rules.

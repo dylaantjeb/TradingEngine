@@ -24,7 +24,7 @@ Prop-firm safety filters (applied at signal time)
   2.  Session filter      : UTC-hour window
   3.  News blackout       : configurable HH:MM windows
   4.  ATR filter          : volatility in-range check
-  5.  Trend filter        : close vs EMA(200) — blocks counter-trend trades
+  5.  Trend filter        : close vs EMA(ema_period) — blocks counter-trend trades
   6.  Risk gate           : daily halt / kill switch
   7.  Loss cooldown       : bars to skip after a losing trade
   8.  Exit cooldown       : bars to skip after any exit
@@ -411,6 +411,28 @@ def run_backtest(
         symbol, _n_conf, _n_exec, _pct(_n_exec, _n_conf),
     )
 
+    # ── CRITICAL pipeline blockage check ─────────────────────────────────────
+    # If the overall confident→executed pass-through is < 10%, identify which
+    # single filter stage drops the most signals and surface a CRITICAL warning.
+    if _n_conf > 0 and _n_exec < _n_conf * 0.10:
+        # Map stage name → (input count, output count)
+        _stages = [
+            ("session",   _n_conf,  _n_sess),
+            ("ATR",       _n_atr and _n_sess, _n_atr),
+            ("trend",     _n_atr,   _n_trend),
+            ("cooldown",  _n_trend, _n_cd),
+        ]
+        _worst_stage = max(_stages, key=lambda s: (s[1] - s[2]) if s[1] > 0 else 0)
+        _w_name, _w_in, _w_out = _worst_stage
+        log.critical(
+            "[%s] CRITICAL PIPELINE BLOCKAGE: %s filter blocking majority of signals. "
+            "conf→executed = %d → %d (%.0f%% end-to-end). "
+            "Dominant bottleneck: %s filter (%d → %d, %.0f%% pass).",
+            symbol, _w_name,
+            _n_conf, _n_exec, 100.0 * _n_exec / max(_n_conf, 1),
+            _w_name, _w_in, _w_out, 100.0 * _w_out / max(_w_in, 1),
+        )
+
     # ── Pass-through warnings ─────────────────────────────────────────────────
     if _n_sess > 0 and _n_queued < _n_sess * 0.20:
         log.warning(
@@ -467,8 +489,11 @@ def run_backtest(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _in_session(ts: pd.Timestamp, start_h: int, end_h: int) -> bool:
-    """True if `ts` falls within [start_h, end_h) UTC hours."""
+def _in_session(ts: pd.Timestamp, start_h: float, end_h: float) -> bool:
+    """True if `ts` falls within [start_h, end_h) UTC hours.
+
+    start_h and end_h support fractional values (e.g. 13.5 = 13:30 UTC).
+    """
     if start_h == 0 and end_h >= 24:
         return True
     h = ts.hour + ts.minute / 60.0
@@ -514,8 +539,8 @@ def _simulate_trades(
     """
     # ── Static config ────────────────────────────────────────────────────────
     delay         = int(cfg.get("execution_delay_bars", 1))
-    sess_start    = int(cfg.get("session_start_utc_hour", 0))
-    sess_end      = int(cfg.get("session_end_utc_hour", 24))
+    sess_start    = float(cfg.get("session_start_utc_hour", 0))
+    sess_end      = float(cfg.get("session_end_utc_hour", 24))
     atr_min       = float(cfg.get("atr_min_ticks", 0))
     atr_max       = float(cfg.get("atr_max_ticks", 1e9))
     blackouts     = cfg.get("news_blackout_windows", [])
