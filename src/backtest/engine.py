@@ -411,25 +411,44 @@ def run_backtest(
         symbol, _n_conf, _n_exec, _pct(_n_exec, _n_conf),
     )
 
+    # ── Pipeline health check (<5% pass-through) ──────────────────────────────
+    _overall_pct = 100.0 * _n_exec / max(_n_conf, 1) if _n_conf > 0 else 0.0
+    if _n_conf > 0 and _n_exec < _n_conf * 0.05:
+        log.warning(
+            "[%s] WARNING PIPELINE HEALTH\n"
+            "  %d confident signals\n"
+            "  %d in-session\n"
+            "  %d after ATR\n"
+            "  %d after trend\n"
+            "  %d queued\n"
+            "  %d executed\n"
+            "  Overall pass-through = %.1f%%",
+            symbol,
+            _n_conf, _n_sess, _n_atr, _n_trend, _n_queued, _n_exec, _overall_pct,
+        )
+
     # ── CRITICAL pipeline blockage check ─────────────────────────────────────
-    # If the overall confident→executed pass-through is < 10%, identify which
-    # single filter stage drops the most signals and surface a CRITICAL warning.
+    # Compute sequential drop at each stage; identify the dominant bottleneck.
     if _n_conf > 0 and _n_exec < _n_conf * 0.10:
-        # Map stage name → (input count, output count)
         _stages = [
             ("session",   _n_conf,  _n_sess),
-            ("ATR",       _n_atr and _n_sess, _n_atr),
+            ("blackout",  _n_sess,  _n_bo),
+            ("ATR",       _n_bo,    _n_atr),
             ("trend",     _n_atr,   _n_trend),
-            ("cooldown",  _n_trend, _n_cd),
+            ("risk/halt", _n_trend, _n_risk),
+            ("cooldown",  _n_risk,  _n_cd),
+            ("queue",     _n_cd,    _n_queued),
         ]
-        _worst_stage = max(_stages, key=lambda s: (s[1] - s[2]) if s[1] > 0 else 0)
+        _worst_stage = max(_stages, key=lambda s: s[1] - s[2])
         _w_name, _w_in, _w_out = _worst_stage
         log.critical(
-            "[%s] CRITICAL PIPELINE BLOCKAGE: %s filter blocking majority of signals. "
-            "conf→executed = %d → %d (%.0f%% end-to-end). "
-            "Dominant bottleneck: %s filter (%d → %d, %.0f%% pass).",
-            symbol, _w_name,
-            _n_conf, _n_exec, 100.0 * _n_exec / max(_n_conf, 1),
+            "[%s] CRITICAL PIPELINE BLOCKAGE\n"
+            "  Top bottleneck: %s filter (blocked %d signals)\n"
+            "  conf→executed = %d → %d (%.0f%% end-to-end)\n"
+            "  %s filter: %d → %d (%.0f%% pass)",
+            symbol,
+            _w_name, _w_in - _w_out,
+            _n_conf, _n_exec, _overall_pct,
             _w_name, _w_in, _w_out, 100.0 * _w_out / max(_w_in, 1),
         )
 

@@ -100,7 +100,11 @@ def _load_cfg(symbol: str) -> tuple[dict, dict]:
     return cfg, specs
 
 
-def _in_session(ts: pd.Timestamp, start_h: int, end_h: int) -> bool:
+def _in_session(ts: pd.Timestamp, start_h: float, end_h: float) -> bool:
+    """True if `ts` falls within [start_h, end_h) UTC hours.
+
+    Supports fractional values (e.g. 13.5 = 13:30 UTC).
+    """
     if start_h == 0 and end_h >= 24:
         return True
     h = ts.hour + ts.minute / 60.0
@@ -143,8 +147,8 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
     friction_per_side = slippage_pts + half_spread_pts
 
     delay          = int(cfg.get("execution_delay_bars", 1))
-    sess_start     = int(cfg.get("session_start_utc_hour", 0))
-    sess_end       = int(cfg.get("session_end_utc_hour", 24))
+    sess_start     = float(cfg.get("session_start_utc_hour", 0))
+    sess_end       = float(cfg.get("session_end_utc_hour", 24))
     atr_min        = float(cfg.get("atr_min_ticks", 0))
     atr_max        = float(cfg.get("atr_max_ticks", 1e9))
     blackouts      = cfg.get("news_blackout_windows", [])
@@ -680,7 +684,24 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
         symbol, _nc, _nex, _pp(_nex, _nc),
     )
 
-    # ── End-to-end pass-through warning (<10%) ────────────────────────────────
+    _overall_pct = 100.0 * _nex / max(_nc, 1) if _nc > 0 else 0.0
+
+    # ── Pipeline health check (<5% pass-through) ──────────────────────────────
+    if _nc > 0 and _nex < _nc * 0.05:
+        log.warning(
+            "[%s] WARNING PIPELINE HEALTH\n"
+            "  %d confident signals\n"
+            "  %d in-session\n"
+            "  %d after ATR\n"
+            "  %d after trend\n"
+            "  %d queued\n"
+            "  %d executed\n"
+            "  Overall pass-through = %.1f%%",
+            symbol,
+            _nc, _ns, _natr, _ntr, _nq, _nex, _overall_pct,
+        )
+
+    # ── CRITICAL pipeline blockage check (<10%) ───────────────────────────────
     if _nc > 0 and _nex < _nc * 0.10:
         _stages = [
             ("session",   _nc,    _ns),
@@ -688,15 +709,20 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
             ("ATR",       _nbo,   _natr),
             ("trend",     _natr,  _ntr),
             ("risk/halt", _ntr,   _nrisk),
-            ("cooldowns", _nrisk, _ncd),
-            ("queuing",   _ncd,   _nq),
+            ("cooldown",  _nrisk, _ncd),
+            ("queue",     _ncd,   _nq),
         ]
         _bottleneck = max(_stages, key=lambda s: s[1] - s[2])
-        log.warning(
-            "[%s] LOW END-TO-END PASS-THROUGH: %d confident signals → %d trades "
-            "(%.0f%% < 10%%). Top bottleneck: %s filter (blocked %d signals).",
-            symbol, _nc, _nex, 100 * _nex / max(_nc, 1),
-            _bottleneck[0], _bottleneck[1] - _bottleneck[2],
+        _bn, _bi, _bo = _bottleneck
+        log.critical(
+            "[%s] CRITICAL PIPELINE BLOCKAGE\n"
+            "  Top bottleneck: %s filter (blocked %d signals)\n"
+            "  conf→executed = %d → %d (%.0f%% end-to-end)\n"
+            "  %s filter: %d → %d (%.0f%% pass)",
+            symbol,
+            _bn, _bi - _bo,
+            _nc, _nex, _overall_pct,
+            _bn, _bi, _bo, 100.0 * _bo / max(_bi, 1),
         )
 
     # ── Pass-through warnings ─────────────────────────────────────────────────
