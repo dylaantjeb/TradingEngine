@@ -9,44 +9,35 @@ Steps
 4. Scale features with RobustScaler (persisted for inference).
 5. Optuna hyperparameter search — two selection modes:
      f1       (default): maximise macro-F1 on val split.
-     trading  (new):     two-level gate then balanced composite score.
+     trading  (new):     four inline hard gates then balanced composite score.
 6. Retrain best model on full train set.
 7. Persist model, scaler, and feature schema.
 
 How --select-by trading works
 ──────────────────────────────
-Each Optuna trial is evaluated in two stages:
+Each Optuna trial passes through FOUR inline hard gates.  If ANY gate fails,
+the trial receives _GATE_FAIL_SCORE (-1e9) and is excluded from consideration.
+No passing model can ever achieve a score that low, so Optuna will always prefer
+a gate-passing model over a gate-failing one.
 
-  STAGE 1 — Inline hard gates (enforced directly in the objective).
-    These are computed in the objective function itself, NOT delegated
-    to any helper. If either gate fails the trial receives _GATE_FAIL_SCORE
-    (-100.0) which is lower than any passing model can achieve, so Optuna
-    will never select it regardless of F1.
+  Gate 1: confident_trade_count  >= 50
+  Gate 2: trade_coverage         >= 3%   (confident_trades / total_val_bars)
+  Gate 3: directional_accuracy   >= 52%
+  Gate 4: profit_factor          >= 1.10
 
-      Gate 1: confident_trade_count >= 50
-      Gate 2: trade_coverage >= 3%  (confident_trades / total_val_bars)
+"Confident trade" = model confidence >= _TRADING_SCORE_MIN_CONF (0.65)
+                    AND predicted direction != flat.
 
-    "Confident trade" = model confidence >= _TRADING_SCORE_MIN_CONF (0.65)
-                        AND predicted direction != flat.
+If ALL n_trials fail the gates:
+  • The bad model is NOT saved.
+  • A fallback F1 study is run with the same budget.
+  • The fallback model IS saved, labelled selected_via=fallback_f1.
+  • A loud WARNING is printed.
 
-  STAGE 2 — Balanced composite score (only reached when both gates pass).
-    composite = 0.40 * macro_F1  +  0.60 * trading_quality
-
-    trading_quality is a five-component score bounded to [-10, 1]:
-      0.30 * directional_accuracy_confident
-      0.25 * normalized_profit_factor
-      0.20 * trade_coverage_score
-      0.15 * activity_score
-      0.10 * pnl_per_trade_score
-
-    Secondary hard constraints (checked inside trading_quality scorer):
-      • profit_factor >= 1.10   (else tq = _HC_PENALTY_MEDIUM = -3.0)
-      • directional_accuracy >= 52%   (else tq = _HC_PENALTY_MEDIUM = -3.0)
-
-After study.optimize(), if best_value <= _GATE_FAIL_SCORE + 1 it means
-ALL trials failed the hard gates — a warning is logged and the selected
-model will still be saved, but the caller is told to use --select-by f1
-instead or to lower the confidence threshold / acquire more data.
+After the study, selected model stats are always logged:
+  confident_trade_count, trade_coverage_pct, directional_accuracy,
+  validation_profit_factor, trading_quality, hard_constraints_passed,
+  selected_via.
 
 Artifacts
 ──────────
@@ -72,32 +63,25 @@ MIN_TRAIN_ROWS = 200
 VAL_FRACTION   = 0.20
 
 # Minimum confidence for a prediction to count as a "trade".
-# Matches the confidence gate in universe.yaml.
 _TRADING_SCORE_MIN_CONF = 0.65
 
 # Composite objective weights
 _COMPOSITE_F1_WEIGHT      = 0.40
 _COMPOSITE_TRADING_WEIGHT = 0.60
 
-# ── Hard-gate thresholds ──────────────────────────────────────────────────────
-# These are enforced at TWO levels:
-#   1. Inline in the Optuna objective (STAGE 1 gates) → _GATE_FAIL_SCORE
-#   2. Inside _compute_trading_stats (secondary gates)  → penalty values
+# ── Hard-gate thresholds (ALL four enforced inline in the Optuna objective) ────
 _HC_MIN_TRADES   = 50      # minimum confident non-flat predictions on val set
 _HC_MIN_COVERAGE = 0.03    # minimum fraction of val bars that are "trades" (3%)
-_HC_MIN_PF       = 1.10    # minimum profit factor (secondary gate)
-_HC_MIN_DIR_ACC  = 0.52    # minimum directional accuracy (secondary gate)
+_HC_MIN_PF       = 1.10    # minimum profit factor
+_HC_MIN_DIR_ACC  = 0.52    # minimum directional accuracy
 
-# Sentinel score returned by the Optuna objective when STAGE 1 gates fail.
-# Must be sufficiently negative that no passing model can match it.
-# The best possible composite for a passing model is ~0.40*1 + 0.60*1 = 1.0
-# so -100 guarantees Optuna will always prefer any passing model.
-_GATE_FAIL_SCORE = -100.0
+# Sentinel score returned when any STAGE 1 gate fails.
+# Must be so negative that Optuna can never prefer a failed trial over a passing
+# one.  The best possible composite is ~1.0, so -1e9 is unambiguous.
+_GATE_FAIL_SCORE = -1e9
 
-# Penalty values returned by _compute_trading_stats for secondary gate failures.
-# Negative so composite objective can distinguish them from passing models.
-_HC_PENALTY_SEVERE = -10.0   # trade_count < 50 or coverage < 3% (should not
-                               # reach here since STAGE 1 gates fire first)
+# Penalty values used by _compute_trading_stats (secondary check, safety net).
+_HC_PENALTY_SEVERE = -10.0   # trade_count < 50 or coverage < 3%
 _HC_PENALTY_MEDIUM = -3.0    # pf < 1.10 or dir_accuracy < 52%
 
 # Sub-component weights (sum to 1.0)
@@ -121,7 +105,7 @@ def train(
     symbol     : Symbol identifier (e.g. "ES").
     n_trials   : Number of Optuna trials.
     select_by  : 'f1' (maximise macro-F1) or 'trading' (balanced composite
-                 with hard gates for trade count and coverage).
+                 with four inline hard gates).
     """
     if select_by not in ("f1", "trading"):
         log.error("select_by must be 'f1' or 'trading', got %r", select_by)
@@ -214,20 +198,22 @@ def train(
     X_val_s   = scaler.transform(X_val)
 
     feature_names = list(X.columns)
-    n_val_bars    = len(X_val_s)      # total bars in validation window
+    n_val_bars    = len(X_val_s)
 
     # Raw val labels in {-1, 0, 1} — used by trading quality scorer
     y_val_raw = y_val.map(inv_label_map).values
 
     log.info(
-        "Validation set: %d bars  "
-        "Hard gates: count >= %d AND coverage >= %.0f%%",
-        n_val_bars, _HC_MIN_TRADES, _HC_MIN_COVERAGE * 100,
+        "Validation set: %d bars  |  Hard gates (ALL must pass): "
+        "count >= %d, coverage >= %.0f%%, dir_acc >= %.0f%%, PF >= %.2f",
+        n_val_bars,
+        _HC_MIN_TRADES, _HC_MIN_COVERAGE * 100,
+        _HC_MIN_DIR_ACC * 100, _HC_MIN_PF,
     )
 
-    # ── Optuna objective ───────────────────────────────────────────────────────
-    def objective(trial: "optuna.Trial") -> float:
-        params = {
+    # ── Shared param sampler (used by both trading and fallback studies) ───────
+    def _sample_params(trial: "optuna.Trial") -> dict:
+        return {
             "n_estimators":     trial.suggest_int("n_estimators", 50, 400),
             "max_depth":        trial.suggest_int("max_depth", 2, 6),
             "learning_rate":    trial.suggest_float("learning_rate", 1e-3, 0.15, log=True),
@@ -244,33 +230,49 @@ def train(
             "tree_method":      "hist",
             "random_state":     42,
         }
-        model = xgb.XGBClassifier(**params)
+
+    # ── Optuna trading objective ───────────────────────────────────────────────
+    def trading_objective(trial: "optuna.Trial") -> float:
+        model = xgb.XGBClassifier(**_sample_params(trial))
         model.fit(X_train_s, y_train, verbose=False)
 
         preds = model.predict(X_val_s)
         f1    = float(f1_score(y_val, preds, average="macro", zero_division=0))
 
-        if select_by == "f1":
-            return f1
-
-        # ── STAGE 1: Inline hard gates ────────────────────────────────────────
-        # Computed HERE in the objective, NOT delegated to any helper function.
-        # When these gates fail, return _GATE_FAIL_SCORE (-100.0) immediately.
-        # This sentinel is so negative that Optuna can never select a gated-out
-        # trial over any trial that passes, regardless of F1 score.
+        # ── STAGE 1: All four inline hard gates ───────────────────────────────
+        # Each gate returns _GATE_FAIL_SCORE (-1e9) immediately on failure.
+        # This sentinel is so negative that Optuna will NEVER select a failed
+        # trial over any passing trial, even if ALL trials fail and scores
+        # are all -1e9 (fallback logic catches that case after study.optimize).
         proba   = model.predict_proba(X_val_s)
-        _conf   = np.max(proba, axis=1)
-        _sig    = np.array([inv_label_map.get(int(e), 0)
-                            for e in np.argmax(proba, axis=1)])
-        _mask   = (_conf >= _TRADING_SCORE_MIN_CONF) & (_sig != 0)
-        n_conf  = int(_mask.sum())
-        cov     = n_conf / n_val_bars   # fraction of val bars that are trades
+        conf    = np.max(proba, axis=1)
+        sig     = np.array([inv_label_map.get(int(e), 0)
+                             for e in np.argmax(proba, axis=1)])
+        mask    = (conf >= _TRADING_SCORE_MIN_CONF) & (sig != 0)
+        n_conf  = int(mask.sum())
+        cov     = n_conf / n_val_bars
 
+        # Gate 1 — minimum trade count
         if n_conf < _HC_MIN_TRADES:
-            return _GATE_FAIL_SCORE     # too few trades — disqualified
+            return _GATE_FAIL_SCORE
 
+        # Gate 2 — minimum coverage
         if cov < _HC_MIN_COVERAGE:
-            return _GATE_FAIL_SCORE     # coverage below 3% — disqualified
+            return _GATE_FAIL_SCORE
+
+        # Gate 3 — minimum directional accuracy
+        sig_t   = sig[mask]
+        y_t     = y_val_raw[mask]
+        wins    = int(((sig_t == y_t) & (y_t != 0)).sum())
+        losses  = n_conf - wins
+        dir_acc = wins / n_conf
+        if dir_acc < _HC_MIN_DIR_ACC:
+            return _GATE_FAIL_SCORE
+
+        # Gate 4 — minimum profit factor
+        pf = min((wins / losses) if losses > 0 else float(wins), 5.0)
+        if pf < _HC_MIN_PF:
+            return _GATE_FAIL_SCORE
 
         # ── STAGE 2: Full balanced trading quality score ──────────────────────
         tq = _trading_quality_score(
@@ -278,28 +280,65 @@ def train(
         )
         return _COMPOSITE_F1_WEIGHT * f1 + _COMPOSITE_TRADING_WEIGHT * tq
 
+    # ── Optuna F1 objective (used as fallback and for select_by=f1) ───────────
+    def f1_objective(trial: "optuna.Trial") -> float:
+        model = xgb.XGBClassifier(**_sample_params(trial))
+        model.fit(X_train_s, y_train, verbose=False)
+        preds = model.predict(X_val_s)
+        return float(f1_score(y_val, preds, average="macro", zero_division=0))
+
+    # ── Run primary study ─────────────────────────────────────────────────────
     log.info("Running Optuna (%d trials, objective=%s) …", n_trials, select_by)
+
+    primary_objective = trading_objective if select_by == "trading" else f1_objective
     study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    study.optimize(primary_objective, n_trials=n_trials, show_progress_bar=False)
 
     best_score = study.best_value
 
-    # ── Warn if ALL trials failed the hard gates ───────────────────────────────
-    all_gates_failed = select_by == "trading" and best_score <= _GATE_FAIL_SCORE + 1.0
+    # ── Detect all-gates-failed and fall back to F1 ───────────────────────────
+    # A score of exactly _GATE_FAIL_SCORE means every single Optuna trial was
+    # disqualified.  We must NOT save that model.  Instead we fall back to a
+    # fresh F1 study so the user always gets a usable model.
+    all_gates_failed = select_by == "trading" and best_score <= _GATE_FAIL_SCORE * 0.5
+    selected_via: str
+
     if all_gates_failed:
         log.warning(
-            "ALL %d Optuna trials failed the hard-gate checks "
-            "(count >= %d  AND  coverage >= %.0f%%). "
-            "The model will still be saved but is likely too sparse for live trading. "
-            "Consider: --select-by f1, lower confidence threshold in universe.yaml, "
-            "or acquiring more data.",
-            n_trials, _HC_MIN_TRADES, _HC_MIN_COVERAGE * 100,
+            "=" * 70,
         )
+        log.warning(
+            "ALL %d Optuna trials failed the trading hard-gate checks.",
+            n_trials,
+        )
+        log.warning(
+            "  Required: count >= %d  AND  coverage >= %.0f%%  "
+            "AND  dir_acc >= %.0f%%  AND  PF >= %.2f",
+            _HC_MIN_TRADES, _HC_MIN_COVERAGE * 100,
+            _HC_MIN_DIR_ACC * 100, _HC_MIN_PF,
+        )
+        log.warning(
+            "  The sparse/invalid model will NOT be saved."
+        )
+        log.warning(
+            "  Running fallback F1 study (%d trials) — "
+            "consider --select-by f1 or acquire more data.",
+            n_trials,
+        )
+        log.warning("=" * 70)
 
-    best_params = study.best_params
+        fallback_study = optuna.create_study(direction="maximize")
+        fallback_study.optimize(f1_objective, n_trials=n_trials, show_progress_bar=False)
+        best_params = fallback_study.best_params
+        best_score  = fallback_study.best_value
+        selected_via = "fallback_f1"
+    else:
+        best_params  = study.best_params
+        selected_via = "trading" if select_by == "trading" else "f1"
+
     log.info(
-        "Best val score (obj=%s): %.4f  params: %s",
-        select_by, best_score, best_params,
+        "Selected model  |  objective=%s  |  score=%.4f  |  via=%s",
+        select_by, best_score, selected_via,
     )
 
     # ── Post-selection evaluation on val set ──────────────────────────────────
@@ -320,7 +359,7 @@ def train(
     val_stats = _compute_trading_stats(
         val_proba, y_val_raw, inv_label_map, n_val_bars=n_val_bars,
     )
-    _log_trading_stats(val_f1, val_stats)
+    _log_selected_model(val_f1, val_stats, selected_via)
 
     # ── Retrain on full dataset ────────────────────────────────────────────────
     final_model = xgb.XGBClassifier(**best_params)
@@ -334,8 +373,9 @@ def train(
     for p in (art_model, art_scaler, art_schema):
         p.parent.mkdir(parents=True, exist_ok=True)
 
-    joblib.dump(final_model, art_model)
-    joblib.dump(scaler,      art_scaler)
+    import joblib as _joblib  # already imported above; alias avoids redeclaration
+    _joblib.dump(final_model, art_model)
+    _joblib.dump(scaler,      art_scaler)
 
     hc_passed = val_stats["hard_constraints_passed"]
     schema = {
@@ -352,6 +392,7 @@ def train(
         "val_profit_factor":         round(val_stats["profit_factor"], 6),
         "hard_constraints_passed":   hc_passed,
         "all_gates_failed":          all_gates_failed,
+        "selected_via":              selected_via,
         "select_by":                 select_by,
         "n_trials":                  n_trials,
         "train_rows":                len(X_train),
@@ -362,10 +403,15 @@ def train(
     log.info("Scaler  -> %s", art_scaler)
     log.info("Schema  -> %s", art_schema)
 
-    hc_label        = "PASSED" if hc_passed else "FAILED"
-    all_gates_label = "  [WARNING: all Optuna trials failed hard gates]" if all_gates_failed else ""
+    hc_label = "PASSED" if hc_passed else "FAILED"
+    fallback_note = (
+        "  [FALLBACK: all trading trials failed gates — saved best F1 model]\n"
+        if all_gates_failed else ""
+    )
     print(
-        f"\nTraining complete.{all_gates_label}"
+        f"\nTraining complete."
+        f"\n{fallback_note}"
+        f"  Selected via           : {selected_via}"
         f"\n  Selection mode         : {select_by}"
         f"\n  Val macro-F1           : {val_f1:.4f}"
         f"\n  Val trading quality    : {val_stats['trading_quality']:.4f}"
@@ -397,18 +443,7 @@ def _trading_quality_score(
     min_conf: float = _TRADING_SCORE_MIN_CONF,
     n_val_bars: int | None = None,
 ) -> float:
-    """
-    Return the trading quality score component.
-
-    When STAGE 1 hard gates pass, this returns a value in [-10, 1].
-    A healthy model returns [0, 1].  Secondary gate failures return
-    _HC_PENALTY_MEDIUM or _HC_PENALTY_SEVERE (both negative).
-
-    This function is called AFTER the inline gates in the objective already
-    confirmed count >= 50 and coverage >= 3%, so the primary penalties
-    (_HC_PENALTY_SEVERE) should not be reached in normal Optuna runs.
-    They exist as a safety net for direct calls (e.g. from tests).
-    """
+    """Return the trading quality score component in [-10, 1]."""
     stats = _compute_trading_stats(
         proba, y_raw, inv_label_map, min_conf=min_conf, n_val_bars=n_val_bars,
     )
@@ -434,7 +469,7 @@ def _compute_trading_stats(
       n_wins                   — directional wins on confident predictions
       dir_accuracy             — n_wins / n_trades  (0.0 if n_trades == 0)
       profit_factor            — simplified PF, capped at 5
-      hard_constraints_passed  — bool: all HCs pass
+      hard_constraints_passed  — bool: all four HCs pass
       hard_constraint_failures — list[str] of failed constraint descriptions
       score_components         — dict of each sub-score (only when HCs pass)
       trading_quality          — final score; negative if any HC fails
@@ -463,7 +498,7 @@ def _compute_trading_stats(
         n_wins = n_losses = 0
         dir_acc = pf = 0.0
 
-    # ── Hard constraint checks ────────────────────────────────────────────────
+    # ── Hard constraint checks (all four) ─────────────────────────────────────
     penalty  = 0.0
     failures: list[str] = []
 
@@ -485,13 +520,13 @@ def _compute_trading_stats(
 
     hc_passed = len(failures) == 0
     base = {
-        "n_trades":                n_trades,
-        "n_val_bars":              n_val_bars,
-        "trade_coverage_pct":      round(coverage * 100, 4),
-        "n_wins":                  n_wins,
-        "dir_accuracy":            round(dir_acc, 6),
-        "profit_factor":           round(pf, 6),
-        "hard_constraints_passed": hc_passed,
+        "n_trades":                 n_trades,
+        "n_val_bars":               n_val_bars,
+        "trade_coverage_pct":       round(coverage * 100, 4),
+        "n_wins":                   n_wins,
+        "dir_accuracy":             round(dir_acc, 6),
+        "profit_factor":            round(pf, 6),
+        "hard_constraints_passed":  hc_passed,
         "hard_constraint_failures": failures,
     }
 
@@ -601,17 +636,19 @@ def _ppt_score(n_wins: int, n_trades: int) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _log_trading_stats(val_f1: float, stats: dict) -> None:
-    hc  = "PASSED" if stats["hard_constraints_passed"] else "FAILED"
+def _log_selected_model(val_f1: float, stats: dict, selected_via: str) -> None:
+    hc = "PASSED" if stats["hard_constraints_passed"] else "FAILED"
     log.info(
-        "Val trading stats  |  macro-F1=%.4f  |  HardConstraints=%s",
-        val_f1, hc,
+        "Selected model stats  |  macro-F1=%.4f  |  selected_via=%s  |  HC=%s",
+        val_f1, selected_via, hc,
     )
     log.info(
-        "  confident_trade_count   : %d / %d bars  (coverage=%.2f%%)  "
-        "[gate: >= %d  AND  >= %.0f%%]",
-        stats["n_trades"], stats["n_val_bars"], stats["trade_coverage_pct"],
-        _HC_MIN_TRADES, _HC_MIN_COVERAGE * 100,
+        "  confident_trade_count   : %d / %d bars",
+        stats["n_trades"], stats["n_val_bars"],
+    )
+    log.info(
+        "  trade_coverage_pct      : %.2f%%  [gate: >= %.0f%%]",
+        stats["trade_coverage_pct"], _HC_MIN_COVERAGE * 100,
     )
     log.info(
         "  directional_accuracy    : %.1f%%  [gate: >= %.0f%%]",
@@ -621,11 +658,17 @@ def _log_trading_stats(val_f1: float, stats: dict) -> None:
         "  validation_profit_factor: %.3f  [gate: >= %.2f]",
         stats["profit_factor"], _HC_MIN_PF,
     )
-    log.info("  trading_quality_score   : %.4f", stats["trading_quality"])
-
+    log.info(
+        "  trading_quality         : %.4f  (bounded [0,1] when all HCs pass)",
+        stats["trading_quality"],
+    )
+    log.info(
+        "  hard_constraints_passed : %s",
+        hc,
+    )
     if not stats["hard_constraints_passed"]:
         log.warning(
-            "  HARD CONSTRAINT FAILURES: %s",
+            "  HC FAILURES: %s",
             " | ".join(stats["hard_constraint_failures"]),
         )
     if stats.get("score_components"):
