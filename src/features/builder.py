@@ -259,3 +259,59 @@ def _vwap_raw(
     vwap = cum_tv / cum_v
     vwap[vwap == 0] = np.nan
     return vwap
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Regime classifier – public utility (not a model feature)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_REGIME_ATR_MIN             = 0.80   # ATR / rolling_mean(ATR, lookback) lower bound
+_REGIME_VOL_MIN             = 0.70   # vol_regime_20_60 lower bound
+_REGIME_TREND_SLOPE_MIN     = 0.08   # |EMA20_slope| / ATR_pts lower bound
+_REGIME_ATR_LOOKBACK        = 100    # bars for ATR rolling mean
+
+
+def compute_regime(
+    atr_ticks: pd.Series,
+    ema20_slope_abs: pd.Series,
+    vol_ratio: pd.Series,
+    lookback: int = _REGIME_ATR_LOOKBACK,
+    trend_slope_threshold: float = _REGIME_TREND_SLOPE_MIN,
+    atr_regime_min: float = _REGIME_ATR_MIN,
+    vol_regime_min: float = _REGIME_VOL_MIN,
+) -> pd.Series:
+    """
+    Classify each bar into a market regime.
+
+    Parameters
+    ----------
+    atr_ticks            : ATR expressed in ticks (or any consistent price unit).
+    ema20_slope_abs      : |EMA(20) - EMA(20).shift(5)| in the same unit as atr_ticks.
+    vol_ratio            : Short/long realised-vol ratio (e.g. vol_regime_20_60).
+    lookback             : Rolling window for ATR percentile baseline.
+    trend_slope_threshold: |slope| / ATR must exceed this to classify as trend.
+    atr_regime_min       : ATR / rolling_mean(ATR) threshold; below = low_vol.
+    vol_regime_min       : vol_ratio threshold; below = low_vol.
+
+    Returns
+    -------
+    pd.Series of int8:
+       1  = trend   (tradeable — adequate vol, strong directional slope)
+       0  = chop    (blocked  — adequate vol but directionless)
+      -1  = low_vol (blocked  — insufficient volatility)
+    """
+    atr_mean   = atr_ticks.rolling(lookback, min_periods=20).mean()
+    atr_regime = (atr_ticks / atr_mean.replace(0, np.nan)).fillna(1.0)
+
+    atr_safe       = atr_ticks.replace(0, np.nan)
+    trend_strength = (ema20_slope_abs / atr_safe).fillna(0.0)
+
+    vol = vol_ratio.fillna(1.0)
+
+    low_vol_mask = (atr_regime < atr_regime_min) | (vol < vol_regime_min)
+    trend_mask   = (~low_vol_mask) & (trend_strength >= trend_slope_threshold)
+
+    regime = pd.Series(0, index=atr_ticks.index, dtype=np.int8)
+    regime[low_vol_mask] = -1
+    regime[trend_mask]   =  1
+    return regime

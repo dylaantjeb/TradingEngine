@@ -340,6 +340,35 @@ def run_backtest(
         atr_ticks_series / atr_ticks_series.rolling(100, min_periods=20).mean()
     ).fillna(1.0)  # default 1.0 (pass) when history is insufficient
 
+    # ── Regime classifier ────────────────────────────────────────────────────────
+    # Classify each bar: trend (1) = tradeable, chop (0) = blocked,
+    # low_vol (-1) = blocked.  New entries are only allowed in trend regime.
+    # Uses: ATR regime, |EMA(20) slope| / ATR, vol_regime_20_60 feature.
+    _regime_ema20      = close_prices.ewm(span=20, adjust=False).mean()
+    _regime_slope_abs  = (_regime_ema20 - _regime_ema20.shift(5)).abs().reindex(common_idx).fillna(0.0)
+    _atr_pts           = (atr_ticks_series * tick_size).replace(0, np.nan)
+    _trend_str         = (_regime_slope_abs / _atr_pts).fillna(0.0)
+    if "vol_regime_20_60" in features.columns:
+        _vol_regime = features["vol_regime_20_60"].reindex(common_idx).fillna(1.0)
+    else:
+        _vol_regime = pd.Series(1.0, index=common_idx)
+    _is_low_vol    = (atr_regime_series < 0.8) | (_vol_regime < 0.7)
+    _is_trend      = (~_is_low_vol) & (_trend_str >= 0.08)
+    regime_series  = pd.Series(
+        np.where(_is_trend, 1, np.where(_is_low_vol, -1, 0)), index=common_idx,
+    )
+    _rn_trend  = int((regime_series == 1).sum())
+    _rn_chop   = int((regime_series == 0).sum())
+    _rn_lv     = int((regime_series == -1).sum())
+    _rn_total  = len(regime_series)
+    log.info(
+        "[%s] Regime distribution: trend=%d (%.1f%%) | chop=%d (%.1f%%) | low_vol=%d (%.1f%%)",
+        symbol,
+        _rn_trend,  100 * _rn_trend / max(_rn_total, 1),
+        _rn_chop,   100 * _rn_chop  / max(_rn_total, 1),
+        _rn_lv,     100 * _rn_lv    / max(_rn_total, 1),
+    )
+
     # ── Simulate trades ─────────────────────────────────────────────────────────
     trades, equity_curve, cost_summary = _simulate_trades(
         signals            = sig_series,
@@ -353,6 +382,7 @@ def run_backtest(
         close_prices       = close_prices,
         ema_series         = ema_series,
         atr_regime_series  = atr_regime_series,
+        regime_series      = regime_series,
     )
 
     # ── Metrics ─────────────────────────────────────────────────────────────────
@@ -373,10 +403,14 @@ def run_backtest(
     _n_sess    = flt.get("n_after_session",      0)
     _n_bo      = flt.get("n_after_blackout",     0)
     _n_atr     = flt.get("n_after_atr",          0)
+    _n_regime  = flt.get("n_after_regime",       0)
+    _n_chop_b  = flt.get("n_chop_blocked",       0)
+    _n_lv_b    = flt.get("n_low_vol_blocked",    0)
     _n_trend   = flt.get("n_after_trend",        0)
     _n_risk    = flt.get("n_after_risk",         0)
     _n_cd      = flt.get("n_after_cooldowns",    0)
     _n_queued  = flt.get("n_entries_queued",     0)
+    _n_trend_e = flt.get("n_trend_entries",      0)
     _n_exec    = len(trades)
 
     def _pct(num, den):
@@ -403,8 +437,14 @@ def run_backtest(
         symbol, _n_bo, _n_atr, _pct(_n_atr, _n_bo),
     )
     log.info(
+        "[%s]   → after regime    : %5d → %5d  (%s pass)  "
+        "[chop_blocked=%d  low_vol_blocked=%d  trend_entries=%d]",
+        symbol, _n_atr, _n_regime, _pct(_n_regime, _n_atr),
+        _n_chop_b, _n_lv_b, _n_trend_e,
+    )
+    log.info(
         "[%s]   → after trend     : %5d → %5d  (%s pass)",
-        symbol, _n_atr, _n_trend, _pct(_n_trend, _n_atr),
+        symbol, _n_regime, _n_trend, _pct(_n_trend, _n_regime),
     )
     log.info(
         "[%s]   → after risk/halt : %5d → %5d  (%s pass)",
@@ -435,25 +475,29 @@ def run_backtest(
             "  %d confident signals\n"
             "  %d in-session\n"
             "  %d after ATR\n"
+            "  %d after regime  (chop_blk=%d  lv_blk=%d)\n"
             "  %d after trend\n"
-            "  %d queued\n"
+            "  %d queued  (trend_entries=%d)\n"
             "  %d executed\n"
             "  Overall pass-through = %.1f%%",
             symbol,
-            _n_conf, _n_sess, _n_atr, _n_trend, _n_queued, _n_exec, _overall_pct,
+            _n_conf, _n_sess, _n_atr,
+            _n_regime, _n_chop_b, _n_lv_b,
+            _n_trend, _n_queued, _n_trend_e, _n_exec, _overall_pct,
         )
 
     # ── CRITICAL pipeline blockage check ─────────────────────────────────────
     # Compute sequential drop at each stage; identify the dominant bottleneck.
     if _n_conf > 0 and _n_exec < _n_conf * 0.10:
         _stages = [
-            ("session",   _n_conf,  _n_sess),
-            ("blackout",  _n_sess,  _n_bo),
-            ("ATR",       _n_bo,    _n_atr),
-            ("trend",     _n_atr,   _n_trend),
-            ("risk/halt", _n_trend, _n_risk),
-            ("cooldown",  _n_risk,  _n_cd),
-            ("queue",     _n_cd,    _n_queued),
+            ("session",   _n_conf,   _n_sess),
+            ("blackout",  _n_sess,   _n_bo),
+            ("ATR",       _n_bo,     _n_atr),
+            ("regime",    _n_atr,    _n_regime),
+            ("trend",     _n_regime, _n_trend),
+            ("risk/halt", _n_trend,  _n_risk),
+            ("cooldown",  _n_risk,   _n_cd),
+            ("queue",     _n_cd,     _n_queued),
         ]
         _worst_stage = max(_stages, key=lambda s: s[1] - s[2])
         _w_name, _w_in, _w_out = _worst_stage
@@ -563,6 +607,7 @@ def _simulate_trades(
     close_prices: Optional[pd.Series] = None,
     ema_series: Optional[pd.Series] = None,
     atr_regime_series: Optional[pd.Series] = None,
+    regime_series: Optional[pd.Series] = None,
 ) -> tuple[list[dict], pd.Series, dict]:
     """
     Bar-by-bar simulation with 1-bar execution delay, full cost model,
@@ -632,6 +677,10 @@ def _simulate_trades(
     if atr_regime_series is not None:
         atr_regime_arr = atr_regime_series.reindex(signals.index).values.astype(np.float64)
 
+    regime_arr = None
+    if regime_series is not None:
+        regime_arr = regime_series.reindex(signals.index).values.astype(np.int8)
+
     equity_arr = np.zeros(n, dtype=np.float64)
     trades: list[dict] = []
 
@@ -672,10 +721,14 @@ def _simulate_trades(
         "n_after_session":     0,   # survived session window
         "n_after_blackout":    0,   # survived news blackout
         "n_after_atr":         0,   # survived ATR range filter
-        "n_after_trend":       0,   # survived trend (EMA) filter
+        "n_after_regime":      0,   # survived regime classifier (trend only)
+        "n_chop_blocked":      0,   # blocked: chop regime (adequate vol, no slope)
+        "n_low_vol_blocked":   0,   # blocked: low-vol regime (ATR or vol too low)
+        "n_after_trend":       0,   # survived EMA slope direction filter
         "n_after_risk":        0,   # survived risk/halt gate (kill-switch, daily halt)
         "n_after_cooldowns":   0,   # survived cooldowns + holding + daily cap
         "n_entries_queued":    0,   # target != position — new entry queued
+        "n_trend_entries":     0,   # queued entries that occurred in trend regime
     }
 
     # ── Helpers ──────────────────────────────────────────────────────────────
@@ -842,30 +895,34 @@ def _simulate_trades(
                     _regime_t = atr_regime_arr[i] if atr_regime_arr is not None else 1.0
                     if atr_min <= atr_t <= atr_max and _regime_t >= 0.8:
                         flt["n_after_atr"] += 1
-                        _trend_ok = True
-                        if trend_filter_on and ema_arr is not None:
-                            _et = ema_arr[i]
-                            if not np.isnan(_et):
-                                # ema_arr now holds EMA slope (EMA - EMA.shift(5))
-                                if (_conf_sig == 1 and _et <= 0) or \
-                                   (_conf_sig == -1 and _et >= 0):
-                                    _trend_ok = False
-                        if _trend_ok:
-                            flt["n_after_trend"] += 1
-                            _risk_ok = not (
-                                (kill_switch_active or daily_halt) and
-                                (position == 0 or _conf_sig * position < 0)
-                            )
-                            if _risk_ok:
-                                flt["n_after_risk"] += 1
-                                # State-dependent: cooldowns, holding, daily cap
-                                _cd_ok = (
-                                    not (loss_cooldown_left > 0 and position == 0) and
-                                    not (cooldown_left > 0 and position == 0) and
-                                    not (daily_trade_count >= max_tpd and _conf_sig != position)
+                        # Regime classifier gate
+                        _regime_val = int(regime_arr[i]) if regime_arr is not None else 1
+                        if _regime_val == 1:
+                            flt["n_after_regime"] += 1
+                            _trend_ok = True
+                            if trend_filter_on and ema_arr is not None:
+                                _et = ema_arr[i]
+                                if not np.isnan(_et):
+                                    # ema_arr holds EMA slope (EMA - EMA.shift(5))
+                                    if (_conf_sig == 1 and _et <= 0) or \
+                                       (_conf_sig == -1 and _et >= 0):
+                                        _trend_ok = False
+                            if _trend_ok:
+                                flt["n_after_trend"] += 1
+                                _risk_ok = not (
+                                    (kill_switch_active or daily_halt) and
+                                    (position == 0 or _conf_sig * position < 0)
                                 )
-                                if _cd_ok:
-                                    flt["n_after_cooldowns"] += 1
+                                if _risk_ok:
+                                    flt["n_after_risk"] += 1
+                                    # State-dependent: cooldowns, holding, daily cap
+                                    _cd_ok = (
+                                        not (loss_cooldown_left > 0 and position == 0) and
+                                        not (cooldown_left > 0 and position == 0) and
+                                        not (daily_trade_count >= max_tpd and _conf_sig != position)
+                                    )
+                                    if _cd_ok:
+                                        flt["n_after_cooldowns"] += 1
 
         # Filter 2: Session filter — soft block: outside session trades at 50% size.
         # _in_sess tracked here for sizing; signal is NOT zeroed out.
@@ -878,10 +935,24 @@ def _simulate_trades(
         if _in_blackout(ts, blackouts):
             sig = 0
 
-        # Filter 4: ATR filter + volatility regime
+        # Filter 4: ATR range check
         if not (atr_min <= atr_t <= atr_max):
             sig = 0
+
+        # Filter 4.5: Regime classifier — allow new entries only in trend regime.
+        # chop (0) and low_vol (-1) are blocked; trend (1) passes.
+        # When regime_arr not provided, fall back to legacy ATR regime check.
+        elif regime_arr is not None:
+            _rval = int(regime_arr[i])
+            if _rval != 1:
+                if sig != 0:
+                    if _rval == 0:
+                        flt["n_chop_blocked"] += 1
+                    else:
+                        flt["n_low_vol_blocked"] += 1
+                sig = 0
         else:
+            # Legacy fallback: ATR regime only (no full regime classifier)
             _regime_t = atr_regime_arr[i] if atr_regime_arr is not None else 1.0
             if _regime_t < 0.8:
                 sig = 0   # skip trading in low-volatility chop
@@ -966,6 +1037,8 @@ def _simulate_trades(
                 if target != 0:
                     daily_trade_count += 1
                     flt["n_entries_queued"] += 1
+                    if regime_arr is not None and int(regime_arr[i]) == 1:
+                        flt["n_trend_entries"] += 1
 
         equity_arr[i] = equity
 

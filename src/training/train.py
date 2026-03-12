@@ -101,6 +101,10 @@ _GATE_FAIL_SCORE = -1e9
 _HC_PENALTY_SEVERE = -10.0
 _HC_PENALTY_MEDIUM = -3.0
 
+# Regime gates — applied when a regime_arr is provided to _compute_trading_stats.
+_HC_REGIME_CHOP_MAX    = 0.40   # max fraction of confident trades in chop regime
+_HC_REGIME_TREND_PF    = 1.30   # min directional PF among trend-regime trades
+
 # Sub-component weights (sum to 1.0)
 _W_DIR_ACC  = 0.30
 _W_NORM_PF  = 0.25
@@ -254,6 +258,30 @@ def train(
         _sess_mask_val = np.ones(n_val_bars, dtype=bool)
         _n_val_sess    = n_val_bars
 
+    # ── Regime mask for validation set ───────────────────────────────────────
+    # Classify val bars as trend (1) or non-trend (0) using raw feature values.
+    # "Trend" = EMA slope in top 60% of magnitude AND vol_regime >= 0.70.
+    # Percentile-based (within val set) to avoid dependency on close prices
+    # or rolling ATR history that is unavailable in the split features.
+    _has_slope  = "ema20_slope" in X_val.columns
+    _has_vol    = "vol_regime_20_60" in X_val.columns
+    if _has_slope:
+        _slope_abs = X_val["ema20_slope"].abs()
+        _slope_thresh = float(_slope_abs.quantile(0.40))   # bottom 40% = chop
+        _slope_ok = _slope_abs >= _slope_thresh
+    else:
+        _slope_ok = pd.Series(True, index=X_val.index)
+    if _has_vol:
+        _vol_ok = X_val["vol_regime_20_60"].fillna(1.0) >= 0.70
+    else:
+        _vol_ok = pd.Series(True, index=X_val.index)
+    val_regime_arr = np.where(_slope_ok & _vol_ok, 1, 0).astype(np.int8)
+    log.info(
+        "Regime mask (val): trend=%d (%.1f%%) | non-trend=%d (%.1f%%)",
+        int((val_regime_arr == 1).sum()), 100 * (val_regime_arr == 1).mean(),
+        int((val_regime_arr == 0).sum()), 100 * (val_regime_arr == 0).mean(),
+    )
+
     # ── Shared param sampler ──────────────────────────────────────────────────
     def _sample_params(trial: "optuna.Trial") -> dict:
         return {
@@ -311,6 +339,25 @@ def train(
             return _GATE_FAIL_SCORE
         if pf < _HC_MIN_PF:
             return _GATE_FAIL_SCORE
+
+        # ── STAGE 1a: Regime quality gate ─────────────────────────────────────
+        # Reject if too many confident trades land in non-trend (chop) regime,
+        # or if trend-regime directional PF is below the minimum.
+        trade_positions = np.where(mask)[0]
+        _chop_trades    = int((val_regime_arr[trade_positions] == 0).sum())
+        _chop_ratio     = _chop_trades / max(n_conf, 1)
+        if _chop_ratio > _HC_REGIME_CHOP_MAX:
+            return _GATE_FAIL_SCORE
+
+        _trend_mask_t  = mask & (val_regime_arr == 1)
+        _n_trend_conf  = int(_trend_mask_t.sum())
+        if _n_trend_conf > 0:
+            _t_sig   = sig[_trend_mask_t];  _t_y = y_val_raw[_trend_mask_t]
+            _t_wins  = int(((_t_sig == _t_y) & (_t_y != 0)).sum())
+            _t_loss  = _n_trend_conf - _t_wins
+            _trend_pf = _t_wins / max(_t_loss, 1e-9)
+            if _trend_pf < _HC_REGIME_TREND_PF:
+                return _GATE_FAIL_SCORE
 
         # ── STAGE 1b: Execution-realism gate (session-filtered coverage) ──────
         # Among confident signals, check that enough fall within the trading
@@ -458,6 +505,7 @@ def train(
     val_stats = _compute_trading_stats(
         val_proba, y_val_raw, inv_label_map,
         min_conf=best_threshold, n_val_bars=n_val_bars,
+        regime_arr=val_regime_arr,
     )
 
     # Compute session coverage factor for the final selected model
@@ -522,6 +570,10 @@ def train(
         "select_by":                 select_by,
         "n_trials":                  n_trials,
         "train_rows":                len(X_train),
+        # Regime diagnostics
+        "val_regime_trend_bars":     int((val_regime_arr == 1).sum()),
+        "val_regime_chop_bars":      int((val_regime_arr == 0).sum()),
+        "val_regime_trend_pct":      round(float((val_regime_arr == 1).mean()) * 100, 2),
     }
     art_schema.write_text(json.dumps(schema, indent=2))
 
@@ -630,6 +682,7 @@ def _compute_trading_stats(
     inv_label_map: dict,
     min_conf: float = _DEFAULT_THRESHOLD,
     n_val_bars: int | None = None,
+    regime_arr: np.ndarray | None = None,
 ) -> dict:
     """
     Compute the full set of trading-quality statistics.
@@ -688,6 +741,28 @@ def _compute_trading_stats(
     if dir_acc < _HC_MIN_DIR_ACC:
         failures.append(f"dir_accuracy={dir_acc:.1%} < {_HC_MIN_DIR_ACC:.0%}")
         penalty = max(penalty, abs(_HC_PENALTY_MEDIUM))
+
+    # Regime quality gates (optional — only when regime_arr is provided)
+    if regime_arr is not None and n_trades > 0:
+        _trade_pos  = np.where(trade_mask)[0]
+        _chop_cnt   = int((regime_arr[_trade_pos] == 0).sum())
+        _chop_ratio = _chop_cnt / n_trades
+        if _chop_ratio > _HC_REGIME_CHOP_MAX:
+            failures.append(f"chop_trade_ratio={_chop_ratio:.1%} > {_HC_REGIME_CHOP_MAX:.0%}")
+            penalty = max(penalty, abs(_HC_PENALTY_SEVERE))
+
+        _trend_tm  = trade_mask & (regime_arr == 1)
+        _n_trend_t = int(_trend_tm.sum())
+        if _n_trend_t > 0:
+            _tw   = int(((signals[_trend_tm] == y_raw[_trend_tm]) & (y_raw[_trend_tm] != 0)).sum())
+            _tl   = _n_trend_t - _tw
+            _tpf  = _tw / max(_tl, 1e-9)
+            if _tpf < _HC_REGIME_TREND_PF:
+                failures.append(f"trend_regime_pf={_tpf:.3f} < {_HC_REGIME_TREND_PF:.2f}")
+                penalty = max(penalty, abs(_HC_PENALTY_MEDIUM))
+        elif n_trades > 0:
+            failures.append("no_trend_regime_trades")
+            penalty = max(penalty, abs(_HC_PENALTY_SEVERE))
 
     hc_passed = len(failures) == 0
     base = {

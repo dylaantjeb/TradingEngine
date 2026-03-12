@@ -124,6 +124,10 @@ class FoldResult:
     oos_dir_accuracy:        float = 0.0
     oos_profit_factor:       float = 0.0
     weak_fold:               bool  = False
+    # Regime diagnostics (populated from _simulate_trades filter_counters)
+    n_trend_entries:         int   = 0
+    n_chop_blocked:          int   = 0
+    n_low_vol_blocked:       int   = 0
 
 
 @dataclass
@@ -299,6 +303,7 @@ def run_walk_forward(
             exec_filter_counters=_exec_flt,
         )
 
+        _fold_flt = metrics.get("filter_counters", {})
         fr = FoldResult(
             fold_idx=fold_idx,
             mode=mode,
@@ -328,6 +333,9 @@ def run_walk_forward(
             oos_dir_accuracy=oos_stats["dir_accuracy"],
             oos_profit_factor=oos_stats["profit_factor"],
             weak_fold=weak_fold,
+            n_trend_entries=_fold_flt.get("n_trend_entries",   0),
+            n_chop_blocked=_fold_flt.get("n_chop_blocked",    0),
+            n_low_vol_blocked=_fold_flt.get("n_low_vol_blocked", 0),
         )
         folds.append(fr)
 
@@ -787,6 +795,10 @@ def _log_fold_oos_stats(
         _ns   = fc.get("n_after_session",      0)
         _nbo  = fc.get("n_after_blackout",     0)
         _natr = fc.get("n_after_atr",          0)
+        _nreg = fc.get("n_after_regime",       0)
+        _nchb = fc.get("n_chop_blocked",       0)
+        _nlvb = fc.get("n_low_vol_blocked",    0)
+        _nte  = fc.get("n_trend_entries",      0)
         _ntr  = fc.get("n_after_trend",        0)
         _nrk  = fc.get("n_after_risk",         0)
         _ncd  = fc.get("n_after_cooldowns",    0)
@@ -795,16 +807,17 @@ def _log_fold_oos_stats(
 
         log.info(
             "Fold %d backtest pipeline (%d bars)  |  "
-            "conf=%d  →sess=%d(%s)  →atr=%d(%s)  →trend=%d(%s)"
-            "  →risk=%d(%s)  →cd=%d(%s)  →q=%d(%s)  →exec=%d(%s)",
+            "conf=%d  →sess=%d(%s)  →atr=%d(%s)  →regime=%d(%s)[chop_blk=%d lv_blk=%d]"
+            "  →trend=%d(%s)  →risk=%d(%s)  →cd=%d(%s)  →q=%d(%s)[trend_entries=%d]  →exec=%d(%s)",
             fold_num, _nt,
             _nc,
             _ns,   _pct(_ns,   _nc),
             _natr, _pct(_natr, _ns),
-            _ntr,  _pct(_ntr,  _natr),
+            _nreg, _pct(_nreg, _natr), _nchb, _nlvb,
+            _ntr,  _pct(_ntr,  _nreg),
             _nrk,  _pct(_nrk,  _ntr),
             _ncd,  _pct(_ncd,  _nrk),
-            _nq,   _pct(_nq,   _ncd),
+            _nq,   _pct(_nq,   _ncd), _nte,
             _nex,  _pct(_nex,  _nq),
         )
 
@@ -845,7 +858,8 @@ def _top_bottleneck(fc: dict) -> str:
         ("session",   fc.get("n_confident_signals", 0), fc.get("n_after_session",   0)),
         ("blackout",  fc.get("n_after_session",     0), fc.get("n_after_blackout",  0)),
         ("ATR",       fc.get("n_after_blackout",    0), fc.get("n_after_atr",       0)),
-        ("trend",     fc.get("n_after_atr",         0), fc.get("n_after_trend",     0)),
+        ("regime",    fc.get("n_after_atr",         0), fc.get("n_after_regime",    0)),
+        ("trend",     fc.get("n_after_regime",      0), fc.get("n_after_trend",     0)),
         ("risk/halt", fc.get("n_after_trend",       0), fc.get("n_after_risk",      0)),
         ("cooldowns", fc.get("n_after_risk",        0), fc.get("n_after_cooldowns", 0)),
         ("queuing",   fc.get("n_after_cooldowns",   0), fc.get("n_entries_queued",  0)),
@@ -930,17 +944,38 @@ def _backtest_on_slice(
     if cfg.get("trend_filter_enabled", False) and full_ema is not None:
         ema_series = full_ema
 
+    # ATR regime series (needed by both legacy fallback and regime classifier)
+    atr_regime_fold = (atr_ticks / atr_ticks.rolling(100, min_periods=20).mean()).fillna(1.0)
+
+    # Regime classifier — trend (1) / chop (0) / low_vol (-1)
+    _ema20_fold     = close_prices.ewm(span=20, adjust=False).mean()
+    _slope_abs_fold = (_ema20_fold - _ema20_fold.shift(5)).abs()
+    _atr_pts_fold   = (atr_ticks * tick_size).replace(0, np.nan)
+    _trend_str_fold = (_slope_abs_fold / _atr_pts_fold).fillna(0.0)
+    if "vol_regime_20_60" in test_df.columns:
+        _vol_reg_fold = test_df["vol_regime_20_60"].fillna(1.0)
+    else:
+        _vol_reg_fold = pd.Series(1.0, index=test_df.index)
+    _is_lv_fold    = (atr_regime_fold < 0.8) | (_vol_reg_fold < 0.7)
+    _is_trend_fold = (~_is_lv_fold) & (_trend_str_fold >= 0.08)
+    regime_fold    = pd.Series(
+        np.where(_is_trend_fold, 1, np.where(_is_lv_fold, -1, 0)),
+        index=test_df.index,
+    )
+
     trades, equity_curve, cost_summary = _simulate_trades(
-        signals      = sig_series,
-        open_prices  = open_prices,
-        atr_ticks    = atr_ticks,
-        cfg          = cfg,
-        friction_pts = friction_pts,
-        commission_rt= commission_rt,
-        multiplier   = multiplier,
-        conf_series  = conf_series,
-        close_prices = close_prices,
-        ema_series   = ema_series,
+        signals           = sig_series,
+        open_prices       = open_prices,
+        atr_ticks         = atr_ticks,
+        cfg               = cfg,
+        friction_pts      = friction_pts,
+        commission_rt     = commission_rt,
+        multiplier        = multiplier,
+        conf_series       = conf_series,
+        close_prices      = close_prices,
+        ema_series        = ema_series,
+        atr_regime_series = atr_regime_fold,
+        regime_series     = regime_fold,
     )
 
     metrics = _compute_metrics(
@@ -999,11 +1034,50 @@ def _aggregate(folds: list[FoldResult]) -> dict:
     n_pf_below_one = sum(1 for pf in pfs if pf < 1.0)
     _too_many_losing_folds = n_pf_below_one > 2
 
+    # Regime consistency gate (Gate 4a + 4b from the spec).
+    # Only active when folds carry actual regime data (n_trend_entries recorded).
+    # When all folds have zero trend_entries (e.g. no regime_series was passed),
+    # these gates are skipped to preserve backward compatibility with tests/folds
+    # that were run without the regime classifier.
+    _regime_data_present = any(
+        f.n_trend_entries > 0 or f.n_chop_blocked > 0 or f.n_low_vol_blocked > 0
+        for f in folds
+    )
+
+    # Gate 4a: fewer than 3 folds have positive PnL in trend regime.
+    #   Since we only trade in trend regime, profitable == positive trend PnL.
+    n_profitable_trend = sum(1 for f in folds if f.profitable)
+    _too_few_trend_profitable = _regime_data_present and n_profitable_trend < 3
+
+    # Gate 4b: more than 2 folds are "chop-dominated" — market offered few
+    #   trend opportunities (regime blocked >> trend entries), so the model
+    #   cannot get enough exposure to prove its edge.
+    n_chop_dominated = sum(
+        1 for f in folds
+        if f.n_chop_blocked > 2 * max(f.n_trend_entries, 1)
+    )
+    _too_many_chop_dominated = _regime_data_present and n_chop_dominated > 2
+
     if _too_many_losing_folds:
         log.warning(
             "WALK-FORWARD REJECTION: %d / %d folds have PF < 1.0 (> 2 allowed). "
             "Model is unstable across regimes — verdict forced to NOT READY.",
             n_pf_below_one, n,
+        )
+        verdict = "NOT READY"
+    elif _too_few_trend_profitable:
+        log.warning(
+            "WALK-FORWARD REGIME GATE A: only %d / %d folds profitable in trend "
+            "regime (need >= 3) — verdict forced to NOT READY.",
+            n_profitable_trend, n,
+        )
+        verdict = "NOT READY"
+    elif _too_many_chop_dominated:
+        log.warning(
+            "WALK-FORWARD REGIME GATE B: %d / %d folds are chop-dominated "
+            "(chop_blocked > 2× trend_entries) — model cannot get sufficient trend "
+            "exposure. Verdict forced to NOT READY.",
+            n_chop_dominated, n,
         )
         verdict = "NOT READY"
     elif (
@@ -1052,6 +1126,11 @@ def _aggregate(folds: list[FoldResult]) -> dict:
         "pnl_cv":                 pnl_cv,
         "t_stat_pnl":             t_stat,
         "funded_ready":           verdict,
+        # Regime consistency
+        "n_profitable_trend_folds":  n_profitable_trend,
+        "n_chop_dominated_folds":    n_chop_dominated,
+        "regime_gate_a_passed":      not _too_few_trend_profitable,
+        "regime_gate_b_passed":      not _too_many_chop_dominated,
         "stability":              verdict,   # legacy alias
         "n_folds":                n,
     }
@@ -1177,6 +1256,23 @@ def _print_summary(result: WalkForwardSummary) -> None:
                pf_ok, f"{agg['avg_profit_factor']:.3f}", lbl)
     _pass_fail(f"  PnL CV <= {_FUNDED_MAX_CV:.1f}", cv_ok, pnl_cv_str, lbl)
     _pass_fail(f"  PnL t-stat >= {_FUNDED_MIN_TSTAT:.2f}", tst_ok, t_stat_str, lbl)
+
+    print(f"\n  {'REGIME CONSISTENCY GATES':-<{W - 4}}")
+    rga_ok = agg.get("regime_gate_a_passed", True)
+    rgb_ok = agg.get("regime_gate_b_passed", True)
+    n_pt   = agg.get("n_profitable_trend_folds", agg["n_profitable_folds"])
+    n_cd   = agg.get("n_chop_dominated_folds", 0)
+    _pass_fail("  Trend-regime profitable folds >= 3", rga_ok, f"{n_pt} / {agg['n_folds']}", lbl)
+    _pass_fail("  Chop-dominated folds <= 2",          rgb_ok, f"{n_cd} / {agg['n_folds']}", lbl)
+    print(f"\n  {'Fold regime breakdown (trend_entries | chop_blk | lv_blk)':-<{W - 4}}")
+    for f in result.folds:
+        print(
+            f"  Fold {f.fold_idx}  trend_entries={f.n_trend_entries:>4}  "
+            f"chop_blocked={f.n_chop_blocked:>4}  "
+            f"low_vol_blocked={f.n_low_vol_blocked:>4}  "
+            f"profitable={'Y' if f.profitable else 'N'}"
+        )
+
     print(f"{bar}\n")
 
 
