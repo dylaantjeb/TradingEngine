@@ -132,7 +132,7 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
     csv_path  : Raw OHLCV CSV from `fetch` (must have open column).
     bar_delay : Optional sleep between bars in seconds (0 = max speed).
     """
-    model, scaler, feature_names, inv_label_map = _load_artifacts(symbol)
+    model, scaler, feature_names, inv_label_map, schema_threshold = _load_artifacts(symbol)
     cfg, specs = _load_cfg(symbol)
 
     tick_size         = float(specs.get("tick_size", cfg.get("tick_size", 0.25)))
@@ -152,9 +152,25 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
     min_hold       = int(cfg.get("min_holding_bars", 1))
     cooldown_cfg   = int(cfg.get("cooldown_bars_after_exit", 0))
 
-    # Confidence thresholds (from config)
-    min_long_conf  = float(cfg.get("min_long_confidence", 0.0))
-    min_short_conf = float(cfg.get("min_short_confidence", 0.0))
+    # Confidence threshold: prefer schema value (set during training) over config.
+    # The schema threshold is co-selected with the model, so it matches exactly
+    # what was used during validation.  Fall back to config if schema has none.
+    if schema_threshold > 0.0:
+        min_long_conf  = schema_threshold
+        min_short_conf = schema_threshold
+        log.info(
+            "Using confidence threshold from training schema: %.2f "
+            "(overrides config min_long/short_confidence)",
+            schema_threshold,
+        )
+    else:
+        min_long_conf  = float(cfg.get("min_long_confidence", 0.0))
+        min_short_conf = float(cfg.get("min_short_confidence", 0.0))
+        log.info(
+            "No schema threshold found; using config: "
+            "min_long=%.2f  min_short=%.2f",
+            min_long_conf, min_short_conf,
+        )
 
     # Trend filter
     trend_filter_on  = bool(cfg.get("trend_filter_enabled", False))
@@ -205,6 +221,27 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
     pred_enc_all = np.argmax(proba_all, axis=1)
     conf_all     = np.max(proba_all, axis=1)
     signal_all   = np.array([inv_label_map[str(e)] for e in pred_enc_all])
+
+    # Pre-filter confidence coverage diagnostic
+    _conf_threshold_diag = min_long_conf  # same for long/short
+    if _conf_threshold_diag > 0.0:
+        _conf_mask = conf_all >= _conf_threshold_diag
+        _sig_mask  = signal_all != 0
+        _n_conf    = int((_conf_mask & _sig_mask).sum())
+        _n_total   = len(conf_all)
+        _pct       = 100.0 * _n_conf / max(_n_total, 1)
+        log.info(
+            "[%s] Confidence coverage: %d / %d bars (%.1f%%) have "
+            "confidence >= %.2f and non-flat signal (before session/ATR/trend filters)",
+            symbol, _n_conf, _n_total, _pct, _conf_threshold_diag,
+        )
+        if _pct < 0.5:
+            log.warning(
+                "[%s] Very low confidence coverage (%.1f%%) — "
+                "model may be under-confident on this dataset. "
+                "Consider retraining or lowering the threshold.",
+                symbol, _pct,
+            )
 
     # ATR in ticks
     raw_close_aligned = raw_df["close"].reindex(all_features.index)
@@ -566,6 +603,14 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
     except KeyboardInterrupt:
         print("\n  Stopped by user.")
 
+    # Post-run sanity safeguard: warn if trades are far below expected
+    if _n_conf > 0 and len(trades) < max(5, _n_conf // 10):
+        log.warning(
+            "[%s] Only %d trade(s) executed but %d bars had confident signals. "
+            "Session/ATR/trend/risk filters may be too restrictive.",
+            symbol, len(trades), _n_conf,
+        )
+
     _print_summary(symbol, trades, equity, gross_pnl_total, total_cost_total, bar_count)
 
 
@@ -627,6 +672,18 @@ def _load_artifacts(symbol: str):
 
     feature_names: list[str]      = schema["feature_names"]
     inv_label_map: dict[str, int] = {k: int(v) for k, v in schema["inv_label_map"].items()}
+    conf_threshold: float         = float(schema.get("selected_conf_threshold", 0.0))
 
-    log.info("Loaded model (%d features) and scaler for %s", len(feature_names), symbol)
-    return model, scaler, feature_names, inv_label_map
+    log.info(
+        "Loaded model (%d features) and scaler for %s  |  "
+        "select_by=%-8s  threshold=%.2f  "
+        "val_trades=%s  val_coverage=%.1f%%  val_dir_acc=%.1f%%  val_PF=%.3f",
+        len(feature_names), symbol,
+        schema.get("select_by", "unknown"),
+        conf_threshold,
+        schema.get("val_confident_trades", "?"),
+        float(schema.get("val_trade_coverage_pct", 0)) * 100,
+        float(schema.get("val_dir_accuracy", 0)) * 100,
+        float(schema.get("val_profit_factor", 0)),
+    )
+    return model, scaler, feature_names, inv_label_map, conf_threshold
