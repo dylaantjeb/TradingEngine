@@ -350,30 +350,83 @@ def run_backtest(
 
     _print_metrics_table(symbol, metrics)
 
-    # ── Per-filter execution summary ─────────────────────────────────────────
-    flt = cost_summary.get("filter_counters", {})
-    _n_conf = flt.get("n_confident_signals", 0)
-    _n_exec = flt.get("n_entries_queued", 0)
-    _passthrough = f"{100*_n_exec/_n_conf:.1f}%" if _n_conf > 0 else "n/a"
+    # ── Sequential execution pipeline breakdown ───────────────────────────────
+    flt        = cost_summary.get("filter_counters", {})
+    _n_total   = flt.get("n_total_bars",        0)
+    _n_conf    = flt.get("n_confident_signals",  0)
+    _n_sess    = flt.get("n_after_session",      0)
+    _n_bo      = flt.get("n_after_blackout",     0)
+    _n_atr     = flt.get("n_after_atr",          0)
+    _n_trend   = flt.get("n_after_trend",        0)
+    _n_risk    = flt.get("n_after_risk",         0)
+    _n_cd      = flt.get("n_after_cooldowns",    0)
+    _n_queued  = flt.get("n_entries_queued",     0)
+    _n_exec    = len(trades)
+
+    def _pct(num, den):
+        return f"{100*num/den:.0f}%" if den > 0 else "n/a"
+
     log.info(
-        "[%s] Execution filter summary  |  "
-        "confident_signals=%d  entries_queued=%d  pass_through=%s",
-        symbol, _n_conf, _n_exec, _passthrough,
+        "[%s] Execution pipeline (%d total bars):",
+        symbol, _n_total,
     )
     log.info(
-        "[%s]   blocked_session=%d  blocked_atr=%d  blocked_trend=%d  "
-        "blocked_risk=%d  blocked_loss_cd=%d  blocked_exit_cd=%d  "
-        "blocked_daily_cap=%d  blocked_in_position=%d",
-        symbol,
-        flt.get("blocked_session", 0),
-        flt.get("blocked_atr", 0),
-        flt.get("blocked_trend", 0),
-        flt.get("blocked_risk", 0),
-        flt.get("blocked_loss_cd", 0),
-        flt.get("blocked_exit_cd", 0),
-        flt.get("blocked_daily_cap", 0),
-        flt.get("blocked_in_position", 0),
+        "[%s]   confident signals : %5d        (%s of bars)",
+        symbol, _n_conf, _pct(_n_conf, _n_total),
     )
+    log.info(
+        "[%s]   → after session   : %5d → %5d  (%s pass)",
+        symbol, _n_conf, _n_sess, _pct(_n_sess, _n_conf),
+    )
+    log.info(
+        "[%s]   → after blackout  : %5d → %5d  (%s pass)",
+        symbol, _n_sess, _n_bo, _pct(_n_bo, _n_sess),
+    )
+    log.info(
+        "[%s]   → after ATR       : %5d → %5d  (%s pass)",
+        symbol, _n_bo, _n_atr, _pct(_n_atr, _n_bo),
+    )
+    log.info(
+        "[%s]   → after trend     : %5d → %5d  (%s pass)",
+        symbol, _n_atr, _n_trend, _pct(_n_trend, _n_atr),
+    )
+    log.info(
+        "[%s]   → after risk/halt : %5d → %5d  (%s pass)",
+        symbol, _n_trend, _n_risk, _pct(_n_risk, _n_trend),
+    )
+    log.info(
+        "[%s]   → after cooldowns : %5d → %5d  (%s pass)",
+        symbol, _n_risk, _n_cd, _pct(_n_cd, _n_risk),
+    )
+    log.info(
+        "[%s]   → entries queued  : %5d → %5d  (%s pass)",
+        symbol, _n_cd, _n_queued, _pct(_n_queued, _n_cd),
+    )
+    log.info(
+        "[%s]   → trades executed : %5d → %5d  (%s of queued)",
+        symbol, _n_queued, _n_exec, _pct(_n_exec, _n_queued),
+    )
+    log.info(
+        "[%s]   OVERALL: conf→executed = %d → %d  (%s end-to-end pass-through)",
+        symbol, _n_conf, _n_exec, _pct(_n_exec, _n_conf),
+    )
+
+    # ── Pass-through warnings ─────────────────────────────────────────────────
+    if _n_sess > 0 and _n_queued < _n_sess * 0.20:
+        log.warning(
+            "[%s] LOW PIPELINE YIELD: only %d queued entries from %d in-session "
+            "confident signals (%.0f%% < 20%% threshold). "
+            "Consider loosening: cooldown_bars_after_exit, cooldown_bars_after_loss, "
+            "min_holding_bars, max_trades_per_day, or max_consecutive_losses.",
+            symbol, _n_queued, _n_sess, 100*_n_queued/max(_n_sess, 1),
+        )
+    if _n_queued > 0 and _n_exec < _n_queued * 0.10:
+        log.warning(
+            "[%s] EXECUTION UNDERPERFORMANCE: only %d trades executed from %d queued "
+            "entries (%.0f%% < 10%% threshold). "
+            "The delay=1 bar fill or position-already-open logic may be losing orders.",
+            symbol, _n_exec, _n_queued, 100*_n_exec/max(_n_queued, 1),
+        )
 
     # Post-run sanity safeguard: warn if trades are far below what validation suggested
     _val_trades = int(schema.get("val_confident_trades", 0))
@@ -544,21 +597,20 @@ def _simulate_trades(
     daily_halt_count   = 0
 
     # ── Per-filter block counters ─────────────────────────────────────────────
-    # For every bar where a confident non-flat signal was present, we count
-    # which filters would independently block that signal.  Note: a single bar
-    # can be counted in multiple buckets (filters are checked independently).
+    # Sequential pipeline: each stage counts how many confident signals survive
+    # after applying that filter *and all previous filters* in order.
+    # n_after_cooldowns counts bars where cooldown/holding/daily-cap would pass
+    # at that instant (state-dependent, checked on the same per-bar state).
     flt = {
+        "n_total_bars":        0,   # total bars processed
         "n_confident_signals": 0,   # conf >= threshold AND raw_sig != 0
-        "n_entries_queued":    0,   # target != position (new entry queued)
-        "blocked_session":     0,
-        "blocked_blackout":    0,
-        "blocked_atr":         0,
-        "blocked_trend":       0,
-        "blocked_risk":        0,
-        "blocked_loss_cd":     0,
-        "blocked_exit_cd":     0,
-        "blocked_daily_cap":   0,
-        "blocked_in_position": 0,   # already holding a position same direction
+        "n_after_session":     0,   # survived session window
+        "n_after_blackout":    0,   # survived news blackout
+        "n_after_atr":         0,   # survived ATR range filter
+        "n_after_trend":       0,   # survived trend (EMA) filter
+        "n_after_risk":        0,   # survived risk/halt gate (kill-switch, daily halt)
+        "n_after_cooldowns":   0,   # survived cooldowns + holding + daily cap
+        "n_entries_queued":    0,   # target != position — new entry queued
     }
 
     # ── Helpers ──────────────────────────────────────────────────────────────
@@ -705,38 +757,44 @@ def _simulate_trades(
             elif sig == -1 and conf_t < min_short_conf:
                 sig = 0
 
-        # ── Record confident signal for filter-counter diagnostics ───────────
-        # After confidence gate: if signal is still non-zero, check every
-        # subsequent filter independently (a bar may be counted in multiple
-        # buckets — this shows which filters are most active).
+        # ── Sequential pipeline diagnostics ──────────────────────────────────
+        # Track how many confident signals survive each filter in order.
+        # Each stage is only counted if all prior stages passed.
+        flt["n_total_bars"] += 1
         _conf_sig = int(sig)   # save post-confidence value
         if _conf_sig != 0:
             flt["n_confident_signals"] += 1
             atr_t = atr_arr[i]
-            if not _in_session(ts, sess_start, sess_end):
-                flt["blocked_session"] += 1
-            if _in_blackout(ts, blackouts):
-                flt["blocked_blackout"] += 1
-            if not (atr_min <= atr_t <= atr_max):
-                flt["blocked_atr"] += 1
-            if trend_filter_on and ema_arr is not None and close_arr is not None:
-                ema_t   = ema_arr[i]
-                close_t = close_arr[i]
-                if not (np.isnan(ema_t) or np.isnan(close_t)):
-                    if (_conf_sig == 1 and close_t < ema_t) or \
-                       (_conf_sig == -1 and close_t > ema_t):
-                        flt["blocked_trend"] += 1
-            if kill_switch_active or daily_halt:
-                if position == 0 or _conf_sig * position < 0:
-                    flt["blocked_risk"] += 1
-            if loss_cooldown_left > 0 and position == 0:
-                flt["blocked_loss_cd"] += 1
-            if cooldown_left > 0 and position == 0:
-                flt["blocked_exit_cd"] += 1
-            if daily_trade_count >= max_tpd and _conf_sig != position:
-                flt["blocked_daily_cap"] += 1
-            if position != 0 and _conf_sig == position:
-                flt["blocked_in_position"] += 1
+            _sess_ok = _in_session(ts, sess_start, sess_end)
+            if _sess_ok:
+                flt["n_after_session"] += 1
+                if not _in_blackout(ts, blackouts):
+                    flt["n_after_blackout"] += 1
+                    if atr_min <= atr_t <= atr_max:
+                        flt["n_after_atr"] += 1
+                        _trend_ok = True
+                        if trend_filter_on and ema_arr is not None and close_arr is not None:
+                            _et = ema_arr[i];  _ct = close_arr[i]
+                            if not (np.isnan(_et) or np.isnan(_ct)):
+                                if (_conf_sig == 1 and _ct < _et) or \
+                                   (_conf_sig == -1 and _ct > _et):
+                                    _trend_ok = False
+                        if _trend_ok:
+                            flt["n_after_trend"] += 1
+                            _risk_ok = not (
+                                (kill_switch_active or daily_halt) and
+                                (position == 0 or _conf_sig * position < 0)
+                            )
+                            if _risk_ok:
+                                flt["n_after_risk"] += 1
+                                # State-dependent: cooldowns, holding, daily cap
+                                _cd_ok = (
+                                    not (loss_cooldown_left > 0 and position == 0) and
+                                    not (cooldown_left > 0 and position == 0) and
+                                    not (daily_trade_count >= max_tpd and _conf_sig != position)
+                                )
+                                if _cd_ok:
+                                    flt["n_after_cooldowns"] += 1
 
         # Filter 2: Session filter
         if not _in_session(ts, sess_start, sess_end):

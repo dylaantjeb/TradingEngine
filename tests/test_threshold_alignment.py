@@ -545,9 +545,10 @@ class TestExecutionFilterCounters:
         _, _, cost = _simulate_trades(sig, open_, atr, cfg, 0.0, 3.0, 50.0,
                                       conf_series=conf, close_prices=close)
         flt = cost["filter_counters"]
-        for key in ("n_confident_signals", "n_entries_queued",
-                    "blocked_session", "blocked_atr", "blocked_trend",
-                    "blocked_risk", "blocked_exit_cd", "blocked_daily_cap"):
+        # Sequential pipeline keys (replaced old independent blocked_* keys)
+        for key in ("n_total_bars", "n_confident_signals", "n_entries_queued",
+                    "n_after_session", "n_after_blackout", "n_after_atr",
+                    "n_after_trend", "n_after_risk", "n_after_cooldowns"):
             assert key in flt, f"Missing filter counter key: {key}"
 
     def test_session_block_counted_correctly(self):
@@ -581,13 +582,15 @@ class TestExecutionFilterCounters:
         trades, _, cost = _simulate_trades(sig, open_, atr, cfg, 0.0, 3.0, 50.0,
                                            conf_series=conf, close_prices=close)
         flt = cost["filter_counters"]
-        assert flt["blocked_session"] == 20, (
-            f"All 20 bars should be blocked by session; got {flt['blocked_session']}"
+        # Sequential: n_confident_signals=20, n_after_session=0 (all OOH)
+        assert flt["n_confident_signals"] == 20
+        assert flt["n_after_session"] == 0, (
+            f"All 20 OOH bars should fail session; n_after_session={flt['n_after_session']}"
         )
         assert len(trades) == 0
 
     def test_atr_block_counted_correctly(self):
-        """Bars with ATR=0 (below min_ticks=4) must be counted in blocked_atr."""
+        """Bars with ATR=0 (below min_ticks=4) must be counted at the ATR stage."""
         import pandas as pd
         from src.backtest.engine import _simulate_trades
 
@@ -616,8 +619,13 @@ class TestExecutionFilterCounters:
         _, _, cost = _simulate_trades(sig, open_, atr, cfg, 0.0, 3.0, 50.0,
                                       conf_series=conf, close_prices=close)
         flt = cost["filter_counters"]
-        assert flt["blocked_atr"] == 10, (
-            f"All 10 bars should be blocked by ATR; got {flt['blocked_atr']}"
+        # Sequential: all 10 pass session (10:00 UTC inside 0-24), none pass ATR
+        assert flt["n_confident_signals"] == 10
+        assert flt["n_after_session"] == 10, (
+            f"All bars should pass session (0-24h window); got {flt['n_after_session']}"
+        )
+        assert flt["n_after_atr"] == 0, (
+            f"All 10 bars should fail ATR stage; n_after_atr={flt['n_after_atr']}"
         )
 
 
