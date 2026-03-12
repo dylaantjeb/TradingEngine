@@ -73,7 +73,7 @@ VAL_FRACTION   = 0.20
 # ── Confidence threshold candidates ───────────────────────────────────────────
 # Evaluated during model selection; best is stored in schema and used at
 # inference time by backtest and live-paper engines.
-_THRESHOLD_CANDIDATES: list[float] = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75]
+_THRESHOLD_CANDIDATES: list[float] = [0.55, 0.60, 0.65, 0.70, 0.75]
 _DEFAULT_THRESHOLD = 0.65   # fallback when no candidate passes all gates
 
 # ── Composite objective weights ────────────────────────────────────────────────

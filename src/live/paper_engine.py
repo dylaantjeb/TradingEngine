@@ -680,6 +680,25 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
         symbol, _nc, _nex, _pp(_nex, _nc),
     )
 
+    # ── End-to-end pass-through warning (<10%) ────────────────────────────────
+    if _nc > 0 and _nex < _nc * 0.10:
+        _stages = [
+            ("session",   _nc,    _ns),
+            ("blackout",  _ns,    _nbo),
+            ("ATR",       _nbo,   _natr),
+            ("trend",     _natr,  _ntr),
+            ("risk/halt", _ntr,   _nrisk),
+            ("cooldowns", _nrisk, _ncd),
+            ("queuing",   _ncd,   _nq),
+        ]
+        _bottleneck = max(_stages, key=lambda s: s[1] - s[2])
+        log.warning(
+            "[%s] LOW END-TO-END PASS-THROUGH: %d confident signals → %d trades "
+            "(%.0f%% < 10%%). Top bottleneck: %s filter (blocked %d signals).",
+            symbol, _nc, _nex, 100 * _nex / max(_nc, 1),
+            _bottleneck[0], _bottleneck[1] - _bottleneck[2],
+        )
+
     # ── Pass-through warnings ─────────────────────────────────────────────────
     if _ns > 0 and _nq < _ns * 0.20:
         log.warning(
