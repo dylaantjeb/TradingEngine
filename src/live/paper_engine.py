@@ -266,6 +266,31 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
     _atr_series = pd.Series(atr_ticks_all, index=all_features.index)
     _atr_regime_all = (_atr_series / _atr_series.rolling(100, min_periods=20).mean()).fillna(1.0).values
 
+    # Regime classifier: trend (1) / chop (0) / low_vol (-1)
+    # Uses EMA(20) slope magnitude / ATR_pts and vol_regime_20_60 feature.
+    _ema20_close   = raw_close_aligned.ewm(span=20, adjust=False).mean()
+    _ema20_slope_a = (_ema20_close - _ema20_close.shift(5)).abs()
+    _atr_pts_s     = _atr_series * tick_size
+    _trend_str_s   = (_ema20_slope_a / _atr_pts_s.replace(0, np.nan)).fillna(0.0)
+    if "vol_regime_20_60" in all_features.columns:
+        _vol_reg_s = all_features["vol_regime_20_60"].fillna(1.0)
+    else:
+        _vol_reg_s = pd.Series(1.0, index=all_features.index)
+    _atr_reg_s    = pd.Series(_atr_regime_all, index=all_features.index)
+    _is_lv_s      = (_atr_reg_s < 0.8) | (_vol_reg_s < 0.7)
+    _is_trend_s   = (~_is_lv_s) & (_trend_str_s >= 0.08)
+    _regime_all   = np.where(_is_trend_s, 1, np.where(_is_lv_s, -1, 0)).astype(np.int8)
+    _rn_t  = int((_regime_all == 1).sum())
+    _rn_c  = int((_regime_all == 0).sum())
+    _rn_lv = int((_regime_all == -1).sum())
+    log.info(
+        "[%s] Regime distribution: trend=%d (%.1f%%) | chop=%d (%.1f%%) | low_vol=%d (%.1f%%)",
+        symbol,
+        _rn_t,  100 * _rn_t  / max(len(_regime_all), 1),
+        _rn_c,  100 * _rn_c  / max(len(_regime_all), 1),
+        _rn_lv, 100 * _rn_lv / max(len(_regime_all), 1),
+    )
+
     feat_idx    = all_features.index
     feat_ts_set = set(feat_idx)
 
@@ -319,10 +344,14 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
         "n_after_session":     0,
         "n_after_blackout":    0,
         "n_after_atr":         0,
+        "n_after_regime":      0,
+        "n_chop_blocked":      0,
+        "n_low_vol_blocked":   0,
         "n_after_trend":       0,
         "n_after_risk":        0,
         "n_after_cooldowns":   0,
         "n_entries_queued":    0,
+        "n_trend_entries":     0,
     }
 
     last_signal     = 0
@@ -468,6 +497,7 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
                 atr_ticks  = float(atr_ticks_all[feat_cursor])
                 ema_val    = float(ema_all[feat_cursor]) if ema_all is not None else float("nan")
                 atr_regime = float(_atr_regime_all[feat_cursor])
+                regime_val = int(_regime_all[feat_cursor])
                 feat_cursor += 1
             else:
                 raw_sig    = 0
@@ -475,6 +505,7 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
                 atr_ticks  = 0.0
                 ema_val    = float("nan")
                 atr_regime = 1.0
+                regime_val = 1   # default pass when no feature data
 
             sig = raw_sig
 
@@ -508,28 +539,30 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
                         flt["n_after_blackout"] += 1
                         if atr_min <= atr_ticks <= atr_max and atr_regime >= 0.8:
                             flt["n_after_atr"] += 1
-                            _tr_ok = True
-                            if trend_filter_on and not np.isnan(ema_val):
-                                # ema_val is now slope (EMA - EMA.shift(5))
-                                if (_conf_sig == 1 and ema_val <= 0) or \
-                                   (_conf_sig == -1 and ema_val >= 0):
-                                    _tr_ok = False
-                            if _tr_ok:
-                                flt["n_after_trend"] += 1
-                                _risk_ok = not (
-                                    (kill_switch_active or daily_halt) and
-                                    (position == 0 or _conf_sig * position < 0)
-                                )
-                                if _risk_ok:
-                                    flt["n_after_risk"] += 1
-                                    _cd_ok = (
-                                        not (loss_cooldown_left > 0 and position == 0) and
-                                        not (cooldown_left > 0 and position == 0) and
-                                        not (daily_trade_count >= max_tpd and
-                                             _conf_sig != position)
+                            if regime_val == 1:  # trend regime only
+                                flt["n_after_regime"] += 1
+                                _tr_ok = True
+                                if trend_filter_on and not np.isnan(ema_val):
+                                    # ema_val is now slope (EMA - EMA.shift(5))
+                                    if (_conf_sig == 1 and ema_val <= 0) or \
+                                       (_conf_sig == -1 and ema_val >= 0):
+                                        _tr_ok = False
+                                if _tr_ok:
+                                    flt["n_after_trend"] += 1
+                                    _risk_ok = not (
+                                        (kill_switch_active or daily_halt) and
+                                        (position == 0 or _conf_sig * position < 0)
                                     )
-                                    if _cd_ok:
-                                        flt["n_after_cooldowns"] += 1
+                                    if _risk_ok:
+                                        flt["n_after_risk"] += 1
+                                        _cd_ok = (
+                                            not (loss_cooldown_left > 0 and position == 0) and
+                                            not (cooldown_left > 0 and position == 0) and
+                                            not (daily_trade_count >= max_tpd and
+                                                 _conf_sig != position)
+                                        )
+                                        if _cd_ok:
+                                            flt["n_after_cooldowns"] += 1
 
             # Filter 2: Session — soft block: 50% size outside session
             sess_ok = _in_session(ts, sess_start, sess_end)
@@ -543,13 +576,24 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
             if not bo_ok:
                 sig = 0
 
-            # Filter 4: ATR + volatility regime
+            # Filter 4: ATR range check
             atr_ok = (atr_min <= atr_ticks <= atr_max)
-            regime_ok = atr_regime >= 0.8
             _check(f"atr({atr_ticks:.1f})", atr_ok)
-            _check(f"regime({atr_regime:.2f})", regime_ok)
-            if not atr_ok or not regime_ok:
+            if not atr_ok:
                 sig = 0
+
+            # Filter 4.5: Regime classifier — block chop and low_vol entries
+            if sig != 0:
+                if regime_val != 1:
+                    if regime_val == 0:
+                        flt["n_chop_blocked"] += 1
+                        _check(f"regime_chop({atr_regime:.2f})", False)
+                    else:
+                        flt["n_low_vol_blocked"] += 1
+                        _check(f"regime_lv({atr_regime:.2f})", False)
+                    sig = 0
+                else:
+                    _check(f"regime_trend({atr_regime:.2f})", True)
 
             # Filter 5: Trend slope filter (ema_val is EMA slope, not raw EMA)
             # Long allowed when slope > 0; short allowed when slope < 0.
@@ -637,6 +681,8 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
                     if target != 0:
                         daily_trade_count += 1
                         flt["n_entries_queued"] += 1
+                        if regime_val == 1:
+                            flt["n_trend_entries"] += 1
 
             # ── Per-bar diagnostics (debug level) ─────────────────────────────
             if log.isEnabledFor(logging.DEBUG):
@@ -677,6 +723,10 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
     _ns    = flt.get("n_after_session",      0)
     _nbo   = flt.get("n_after_blackout",     0)
     _natr  = flt.get("n_after_atr",          0)
+    _nreg  = flt.get("n_after_regime",       0)
+    _nchb  = flt.get("n_chop_blocked",       0)
+    _nlvb  = flt.get("n_low_vol_blocked",    0)
+    _nte   = flt.get("n_trend_entries",      0)
     _ntr   = flt.get("n_after_trend",        0)
     _nrisk = flt.get("n_after_risk",         0)
     _ncd   = flt.get("n_after_cooldowns",    0)
@@ -691,7 +741,11 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
     log.info("[%s]   → after session   : %5d → %5d  (%s pass)", symbol, _nc, _ns, _pp(_ns, _nc))
     log.info("[%s]   → after blackout  : %5d → %5d  (%s pass)", symbol, _ns, _nbo, _pp(_nbo, _ns))
     log.info("[%s]   → after ATR       : %5d → %5d  (%s pass)", symbol, _nbo, _natr, _pp(_natr, _nbo))
-    log.info("[%s]   → after trend     : %5d → %5d  (%s pass)", symbol, _natr, _ntr, _pp(_ntr, _natr))
+    log.info(
+        "[%s]   → after regime    : %5d → %5d  (%s pass)  [chop_blk=%d  lv_blk=%d  trend_entries=%d]",
+        symbol, _natr, _nreg, _pp(_nreg, _natr), _nchb, _nlvb, _nte,
+    )
+    log.info("[%s]   → after trend     : %5d → %5d  (%s pass)", symbol, _nreg, _ntr, _pp(_ntr, _nreg))
     log.info("[%s]   → after risk/halt : %5d → %5d  (%s pass)", symbol, _ntr, _nrisk, _pp(_nrisk, _ntr))
     log.info("[%s]   → after cooldowns : %5d → %5d  (%s pass)", symbol, _nrisk, _ncd, _pp(_ncd, _nrisk))
     log.info("[%s]   → entries queued  : %5d → %5d  (%s pass)", symbol, _ncd, _nq, _pp(_nq, _ncd))
@@ -710,12 +764,13 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
             "  %d confident signals\n"
             "  %d in-session\n"
             "  %d after ATR\n"
+            "  %d after regime  (chop_blk=%d  lv_blk=%d)\n"
             "  %d after trend\n"
-            "  %d queued\n"
+            "  %d queued  (trend_entries=%d)\n"
             "  %d executed\n"
             "  Overall pass-through = %.1f%%",
             symbol,
-            _nc, _ns, _natr, _ntr, _nq, _nex, _overall_pct,
+            _nc, _ns, _natr, _nreg, _nchb, _nlvb, _ntr, _nq, _nte, _nex, _overall_pct,
         )
 
     # ── CRITICAL pipeline blockage check (<10%) ───────────────────────────────
@@ -724,7 +779,8 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
             ("session",   _nc,    _ns),
             ("blackout",  _ns,    _nbo),
             ("ATR",       _nbo,   _natr),
-            ("trend",     _natr,  _ntr),
+            ("regime",    _natr,  _nreg),
+            ("trend",     _nreg,  _ntr),
             ("risk/halt", _ntr,   _nrisk),
             ("cooldown",  _nrisk, _ncd),
             ("queue",     _ncd,   _nq),
