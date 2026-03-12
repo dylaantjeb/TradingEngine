@@ -266,7 +266,9 @@ def run_backtest(
     _short_col = _inv_lookup.get(-1, 0)
     _long_col  = _inv_lookup.get(1, 2)
     _edge = proba[:, _long_col] - proba[:, _short_col]
-    signal = np.where(_edge > 0.15, 1, np.where(_edge < -0.15, -1, 0)).astype(np.int8)
+    # Confidence gap filter: abs(prob_up - prob_down) > 0.20 required for a trade.
+    # Raises the conviction bar beyond simple argmax — weak predictions stay flat.
+    signal = np.where(_edge > 0.20, 1, np.where(_edge < -0.20, -1, 0)).astype(np.int8)
     confidence = np.max(proba, axis=1)
 
     # ── Load raw prices (need 'open' for next-bar fills) ──────────────────────
@@ -320,25 +322,37 @@ def run_backtest(
         features["atr_14"].reindex(common_idx) * close_prices / tick_size
     ).fillna(0)
 
-    # ── EMA for trend filter ────────────────────────────────────────────────────
+    # ── EMA slope for trend filter ───────────────────────────────────────────────
+    # Uses slope = EMA(N) - EMA(N).shift(5) instead of close-vs-EMA.
+    # Longs allowed when slope > 0 (uptrend); shorts when slope < 0 (downtrend).
+    # Softer than price-vs-EMA: catches the trend direction rather than position.
     ema_series = None
     if cfg.get("trend_filter_enabled", False):
         ema_period = int(cfg.get("trend_filter_ema_period", 200))
-        ema_series = close_prices.ewm(span=ema_period, adjust=False).mean()
-        log.info("Trend filter enabled: EMA(%d)", ema_period)
+        _raw_ema = close_prices.ewm(span=ema_period, adjust=False).mean()
+        ema_series = _raw_ema - _raw_ema.shift(5)   # slope = delta over 5 bars
+        log.info("Trend filter enabled: EMA(%d) slope", ema_period)
+
+    # ── ATR volatility regime ────────────────────────────────────────────────────
+    # volatility_regime = ATR / rolling_mean(ATR, 100)
+    # Skip trading when regime < 0.8 to avoid low-volatility chop.
+    atr_regime_series = (
+        atr_ticks_series / atr_ticks_series.rolling(100, min_periods=20).mean()
+    ).fillna(1.0)  # default 1.0 (pass) when history is insufficient
 
     # ── Simulate trades ─────────────────────────────────────────────────────────
     trades, equity_curve, cost_summary = _simulate_trades(
-        signals       = sig_series,
-        open_prices   = open_prices,
-        atr_ticks     = atr_ticks_series,
-        cfg           = cfg,
-        friction_pts  = friction_per_side,
-        commission_rt = commission_rt,
-        multiplier    = multiplier,
-        conf_series   = conf_series,
-        close_prices  = close_prices,
-        ema_series    = ema_series,
+        signals            = sig_series,
+        open_prices        = open_prices,
+        atr_ticks          = atr_ticks_series,
+        cfg                = cfg,
+        friction_pts       = friction_per_side,
+        commission_rt      = commission_rt,
+        multiplier         = multiplier,
+        conf_series        = conf_series,
+        close_prices       = close_prices,
+        ema_series         = ema_series,
+        atr_regime_series  = atr_regime_series,
     )
 
     # ── Metrics ─────────────────────────────────────────────────────────────────
@@ -548,6 +562,7 @@ def _simulate_trades(
     conf_series: Optional[pd.Series] = None,
     close_prices: Optional[pd.Series] = None,
     ema_series: Optional[pd.Series] = None,
+    atr_regime_series: Optional[pd.Series] = None,
 ) -> tuple[list[dict], pd.Series, dict]:
     """
     Bar-by-bar simulation with 1-bar execution delay, full cost model,
@@ -613,6 +628,10 @@ def _simulate_trades(
     if ema_series is not None:
         ema_arr = ema_series.reindex(signals.index).values.astype(np.float64)
 
+    atr_regime_arr = None
+    if atr_regime_series is not None:
+        atr_regime_arr = atr_regime_series.reindex(signals.index).values.astype(np.float64)
+
     equity_arr = np.zeros(n, dtype=np.float64)
     trades: list[dict] = []
 
@@ -661,8 +680,11 @@ def _simulate_trades(
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
-    def _size(atr_t: float) -> int:
-        """Compute position size (contracts) based on sizing method."""
+    def _size(atr_t: float, session_factor: float = 1.0) -> int:
+        """Compute position size (contracts) based on sizing method.
+
+        session_factor: 1.0 inside session, 0.5 outside (soft session weight).
+        """
         if ps_method == "fixed_dollar_risk":
             atr_pts  = atr_t * tick_size
             stop_pts = atr_pts * atr_stop_mult
@@ -681,7 +703,7 @@ def _simulate_trades(
                 n_c = 1
         else:  # "fixed"
             n_c = fixed_contracts
-        return max(1, min(n_c, max_contracts))
+        return max(1, min(int(n_c * session_factor), max_contracts))
 
     def _update_risk(net_pnl: float, ts) -> None:
         nonlocal equity, daily_pnl, peak_equity, consecutive_losses, consec_losses_max
@@ -796,6 +818,7 @@ def _simulate_trades(
 
         # Filter 1: Confidence gating
         conf_t = 0.0
+        _session_factor = 1.0   # updated in Filter 2; used for sizing
         if conf_arr is not None:
             conf_t = conf_arr[i] if not np.isnan(conf_arr[i]) else 0.0
             if sig == 1 and conf_t < min_long_conf:
@@ -808,22 +831,24 @@ def _simulate_trades(
         # Each stage is only counted if all prior stages passed.
         flt["n_total_bars"] += 1
         _conf_sig = int(sig)   # save post-confidence value
+        atr_t = atr_arr[i]
         if _conf_sig != 0:
             flt["n_confident_signals"] += 1
-            atr_t = atr_arr[i]
             _sess_ok = _in_session(ts, sess_start, sess_end)
             if _sess_ok:
                 flt["n_after_session"] += 1
                 if not _in_blackout(ts, blackouts):
                     flt["n_after_blackout"] += 1
-                    if atr_min <= atr_t <= atr_max:
+                    _regime_t = atr_regime_arr[i] if atr_regime_arr is not None else 1.0
+                    if atr_min <= atr_t <= atr_max and _regime_t >= 0.8:
                         flt["n_after_atr"] += 1
                         _trend_ok = True
-                        if trend_filter_on and ema_arr is not None and close_arr is not None:
-                            _et = ema_arr[i];  _ct = close_arr[i]
-                            if not (np.isnan(_et) or np.isnan(_ct)):
-                                if (_conf_sig == 1 and _ct < _et) or \
-                                   (_conf_sig == -1 and _ct > _et):
+                        if trend_filter_on and ema_arr is not None:
+                            _et = ema_arr[i]
+                            if not np.isnan(_et):
+                                # ema_arr now holds EMA slope (EMA - EMA.shift(5))
+                                if (_conf_sig == 1 and _et <= 0) or \
+                                   (_conf_sig == -1 and _et >= 0):
                                     _trend_ok = False
                         if _trend_ok:
                             flt["n_after_trend"] += 1
@@ -842,27 +867,34 @@ def _simulate_trades(
                                 if _cd_ok:
                                     flt["n_after_cooldowns"] += 1
 
-        # Filter 2: Session filter
-        if not _in_session(ts, sess_start, sess_end):
-            sig = 0
+        # Filter 2: Session filter — soft block: outside session trades at 50% size.
+        # _in_sess tracked here for sizing; signal is NOT zeroed out.
+        _in_sess = _in_session(ts, sess_start, sess_end)
+        _session_factor = 1.0 if _in_sess else 0.5
+        # Diagnostic counter still tracks strict session (how many would pass fully)
+        # — existing flt["n_after_session"] counts only in-session signals.
 
         # Filter 3: News blackout
         if _in_blackout(ts, blackouts):
             sig = 0
 
-        # Filter 4: ATR filter
-        atr_t = atr_arr[i]
+        # Filter 4: ATR filter + volatility regime
         if not (atr_min <= atr_t <= atr_max):
             sig = 0
+        else:
+            _regime_t = atr_regime_arr[i] if atr_regime_arr is not None else 1.0
+            if _regime_t < 0.8:
+                sig = 0   # skip trading in low-volatility chop
 
-        # Filter 5: Trend filter (close vs EMA)
-        if trend_filter_on and ema_arr is not None and close_arr is not None:
-            ema_t   = ema_arr[i]
-            close_t = close_arr[i]
-            if not (np.isnan(ema_t) or np.isnan(close_t)):
-                if sig == 1 and close_t < ema_t:    # long blocked (below EMA)
+        # Filter 5: Trend slope filter (EMA slope, not close-vs-EMA)
+        # ema_arr now holds EMA(N) - EMA(N).shift(5) — the 5-bar slope.
+        # Long allowed when slope > 0; short allowed when slope < 0.
+        if trend_filter_on and ema_arr is not None:
+            ema_t = ema_arr[i]
+            if not np.isnan(ema_t):
+                if sig == 1 and ema_t <= 0:    # long blocked — downsloping EMA
                     sig = 0
-                elif sig == -1 and close_t > ema_t: # short blocked (above EMA)
+                elif sig == -1 and ema_t >= 0: # short blocked — upsloping EMA
                     sig = 0
 
         # Filter 6: Risk gate — kill switch / daily halt
@@ -921,7 +953,7 @@ def _simulate_trades(
                     _update_risk(net_pnl, ts)
                     position = 0
                 if target != 0:
-                    n_c         = _size(atr_t)
+                    n_c         = _size(atr_t, _session_factor)
                     entry_price     = o + target * friction_pts
                     position        = target
                     entry_idx       = i
@@ -930,7 +962,7 @@ def _simulate_trades(
             # Normal delayed execution: queue for next bar
             if target != position and i < n - 1:
                 pending_target    = target
-                pending_contracts = _size(atr_t) if target != 0 else entry_contracts
+                pending_contracts = _size(atr_t, _session_factor) if target != 0 else entry_contracts
                 if target != 0:
                     daily_trade_count += 1
                     flt["n_entries_queued"] += 1

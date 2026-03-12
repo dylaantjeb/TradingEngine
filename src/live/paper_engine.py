@@ -226,7 +226,8 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
     _short_col   = _inv_lookup.get(-1, 0)
     _long_col    = _inv_lookup.get(1, 2)
     _edge_all    = proba_all[:, _long_col] - proba_all[:, _short_col]
-    signal_all   = np.where(_edge_all > 0.15, 1, np.where(_edge_all < -0.15, -1, 0)).astype(np.int8)
+    # Confidence gap filter: abs(edge) > 0.20 required — matches engine.py
+    signal_all   = np.where(_edge_all > 0.20, 1, np.where(_edge_all < -0.20, -1, 0)).astype(np.int8)
     conf_all     = np.max(proba_all, axis=1)
 
     # Pre-filter confidence coverage diagnostic
@@ -254,17 +255,22 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
     raw_close_aligned = raw_df["close"].reindex(all_features.index)
     atr_ticks_all = (all_features["atr_14"].values * raw_close_aligned.values) / tick_size
 
-    # EMA for trend filter
+    # EMA slope for trend filter (matches engine.py: EMA - EMA.shift(5))
     ema_all = None
     if trend_filter_on:
-        ema_all = raw_close_aligned.ewm(span=trend_ema_period, adjust=False).mean().values
-        log.info("Trend filter enabled: EMA(%d)", trend_ema_period)
+        _raw_ema_s = raw_close_aligned.ewm(span=trend_ema_period, adjust=False).mean()
+        ema_all = (_raw_ema_s - _raw_ema_s.shift(5)).values
+        log.info("Trend filter enabled: EMA(%d) slope", trend_ema_period)
+
+    # ATR volatility regime: ATR / rolling_mean(ATR, 100) — skip if < 0.8
+    _atr_series = pd.Series(atr_ticks_all, index=all_features.index)
+    _atr_regime_all = (_atr_series / _atr_series.rolling(100, min_periods=20).mean()).fillna(1.0).values
 
     feat_idx    = all_features.index
     feat_ts_set = set(feat_idx)
 
     # ── Position sizing helper ─────────────────────────────────────────────────
-    def _size(atr_t: float) -> int:
+    def _size(atr_t: float, session_factor: float = 1.0) -> int:
         if ps_method == "fixed_dollar_risk":
             atr_pts  = atr_t * tick_size
             stop_pts = atr_pts * atr_stop_mult
@@ -277,7 +283,7 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
             n_c = int(r_usd / (stop_pts * multiplier)) if stop_pts > 0 else 1
         else:
             n_c = fixed_contracts
-        return max(1, min(n_c, max_contracts))
+        return max(1, min(int(n_c * session_factor), max_contracts))
 
     # ── State ──────────────────────────────────────────────────────────────────
     position         = 0
@@ -461,12 +467,14 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
                 confidence = float(conf_all[feat_cursor])
                 atr_ticks  = float(atr_ticks_all[feat_cursor])
                 ema_val    = float(ema_all[feat_cursor]) if ema_all is not None else float("nan")
+                atr_regime = float(_atr_regime_all[feat_cursor])
                 feat_cursor += 1
             else:
                 raw_sig    = 0
                 confidence = 0.0
                 atr_ticks  = 0.0
                 ema_val    = float("nan")
+                atr_regime = 1.0
 
             sig = raw_sig
 
@@ -476,6 +484,8 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
 
             def _check(name: str, passed: bool) -> None:
                 (filters_passed if passed else filters_failed).append(name)
+
+            _session_factor = 1.0  # updated in Filter 2; used for position sizing
 
             # Filter 1: Confidence gating
             conf_ok = True
@@ -496,12 +506,13 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
                     flt["n_after_session"] += 1
                     if not _in_blackout(ts, blackouts):
                         flt["n_after_blackout"] += 1
-                        if atr_min <= atr_ticks <= atr_max:
+                        if atr_min <= atr_ticks <= atr_max and atr_regime >= 0.8:
                             flt["n_after_atr"] += 1
                             _tr_ok = True
                             if trend_filter_on and not np.isnan(ema_val):
-                                if (_conf_sig == 1 and close_px < ema_val) or \
-                                   (_conf_sig == -1 and close_px > ema_val):
+                                # ema_val is now slope (EMA - EMA.shift(5))
+                                if (_conf_sig == 1 and ema_val <= 0) or \
+                                   (_conf_sig == -1 and ema_val >= 0):
                                     _tr_ok = False
                             if _tr_ok:
                                 flt["n_after_trend"] += 1
@@ -520,11 +531,11 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
                                     if _cd_ok:
                                         flt["n_after_cooldowns"] += 1
 
-            # Filter 2: Session
+            # Filter 2: Session — soft block: 50% size outside session
             sess_ok = _in_session(ts, sess_start, sess_end)
+            _session_factor = 1.0 if sess_ok else 0.5
             _check("session", sess_ok)
-            if not sess_ok:
-                sig = 0
+            # Signal NOT zeroed out — size halved instead (see _size calls below)
 
             # Filter 3: Blackout
             bo_ok = not _in_blackout(ts, blackouts)
@@ -532,20 +543,23 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
             if not bo_ok:
                 sig = 0
 
-            # Filter 4: ATR
+            # Filter 4: ATR + volatility regime
             atr_ok = (atr_min <= atr_ticks <= atr_max)
+            regime_ok = atr_regime >= 0.8
             _check(f"atr({atr_ticks:.1f})", atr_ok)
-            if not atr_ok:
+            _check(f"regime({atr_regime:.2f})", regime_ok)
+            if not atr_ok or not regime_ok:
                 sig = 0
 
-            # Filter 5: Trend filter
+            # Filter 5: Trend slope filter (ema_val is EMA slope, not raw EMA)
+            # Long allowed when slope > 0; short allowed when slope < 0.
             if trend_filter_on and not np.isnan(ema_val):
                 trend_ok = True
-                if sig == 1 and close_px < ema_val:
+                if sig == 1 and ema_val <= 0:
                     trend_ok = False
-                elif sig == -1 and close_px > ema_val:
+                elif sig == -1 and ema_val >= 0:
                     trend_ok = False
-                _check(f"trend_ema(close={close_px:.1f},ema={ema_val:.1f})", trend_ok)
+                _check(f"trend_slope({ema_val:.4f})", trend_ok)
                 if not trend_ok:
                     sig = 0
 
@@ -611,7 +625,7 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
                         _update_risk(net_pnl, ts)
                         position = 0
                     if target != 0:
-                        n_c         = _size(atr_ticks)
+                        n_c         = _size(atr_ticks, _session_factor)
                         entry_price     = o + target * friction_per_side
                         position        = target
                         entry_bar_num   = bar_count
@@ -619,7 +633,7 @@ def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
             else:
                 if target != position and raw_i < n_raw - 1:
                     pending_target    = target
-                    pending_contracts = _size(atr_ticks) if target != 0 else entry_contracts
+                    pending_contracts = _size(atr_ticks, _session_factor) if target != 0 else entry_contracts
                     if target != 0:
                         daily_trade_count += 1
                         flt["n_entries_queued"] += 1

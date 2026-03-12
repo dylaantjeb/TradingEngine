@@ -137,61 +137,64 @@ class TestConfidenceGating:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestTrendFilter:
-    def test_long_below_ema_blocked(self):
-        """Long signal when close < EMA must be blocked."""
+    # NOTE: ema_series now carries EMA slope (EMA - EMA.shift(5)), not raw EMA.
+    # Long blocked when slope <= 0 (downtrend); short blocked when slope >= 0.
+
+    def test_long_negative_slope_blocked(self):
+        """Long signal when EMA slope <= 0 (downtrend) must be blocked."""
         n   = 20
         idx = _idx(n)
         sig   = pd.Series(np.ones(n, dtype=np.int8), index=idx)
         sig.iloc[-3:] = 0
         op    = pd.Series(4900.0, index=idx)
         close = pd.Series(4900.0, index=idx)
-        ema   = pd.Series(5000.0, index=idx)   # close < EMA → long blocked
+        ema   = pd.Series(-1.0, index=idx)   # negative slope → long blocked
 
         trades, _, _ = _run(sig, op, close=close, ema=ema,
                             trend_filter_enabled=True)
-        assert len(trades) == 0, "Long when close < EMA must be blocked"
+        assert len(trades) == 0, "Long when EMA slope <= 0 must be blocked"
 
-    def test_short_above_ema_blocked(self):
-        """Short signal when close > EMA must be blocked."""
+    def test_short_positive_slope_blocked(self):
+        """Short signal when EMA slope >= 0 (uptrend) must be blocked."""
         n   = 20
         idx = _idx(n)
         sig   = pd.Series(np.full(n, -1, dtype=np.int8), index=idx)
         sig.iloc[-3:] = 0
         op    = pd.Series(5100.0, index=idx)
         close = pd.Series(5100.0, index=idx)
-        ema   = pd.Series(5000.0, index=idx)   # close > EMA → short blocked
+        ema   = pd.Series(1.0, index=idx)   # positive slope → short blocked
 
         trades, _, _ = _run(sig, op, close=close, ema=ema,
                             trend_filter_enabled=True)
-        assert len(trades) == 0, "Short when close > EMA must be blocked"
+        assert len(trades) == 0, "Short when EMA slope >= 0 must be blocked"
 
-    def test_long_above_ema_allowed(self):
-        """Long signal when close > EMA must be allowed."""
+    def test_long_positive_slope_allowed(self):
+        """Long signal when EMA slope > 0 (uptrend) must be allowed."""
         n   = 20
         idx = _idx(n)
         sig   = pd.Series(np.ones(n, dtype=np.int8), index=idx)
         sig.iloc[-3:] = 0
         op    = pd.Series(5100.0, index=idx)
         close = pd.Series(5100.0, index=idx)
-        ema   = pd.Series(5000.0, index=idx)   # close > EMA → long OK
+        ema   = pd.Series(1.0, index=idx)   # positive slope → long OK
 
         trades, _, _ = _run(sig, op, close=close, ema=ema,
                             trend_filter_enabled=True)
-        assert len(trades) >= 1, "Long when close > EMA must be allowed"
+        assert len(trades) >= 1, "Long when EMA slope > 0 must be allowed"
 
     def test_trend_filter_disabled_no_effect(self):
-        """With trend_filter_enabled=False, close/EMA are ignored."""
+        """With trend_filter_enabled=False, EMA slope is ignored."""
         n   = 20
         idx = _idx(n)
         sig   = pd.Series(np.ones(n, dtype=np.int8), index=idx)
         sig.iloc[-3:] = 0
         op    = pd.Series(4900.0, index=idx)
         close = pd.Series(4900.0, index=idx)
-        ema   = pd.Series(5000.0, index=idx)   # would block longs if enabled
+        ema   = pd.Series(-1.0, index=idx)   # would block longs if enabled
 
         trades, _, _ = _run(sig, op, close=close, ema=ema,
                             trend_filter_enabled=False)
-        assert len(trades) >= 1, "Trend filter disabled: longs must pass despite close < EMA"
+        assert len(trades) >= 1, "Trend filter disabled: longs must pass despite negative slope"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

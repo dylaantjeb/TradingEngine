@@ -33,10 +33,10 @@ live-paper engines.
 
 Trading hard gates (all four enforced inline in the Optuna objective)
 ──────────────────────────────────────────────────────────────────────
-  Gate 1: confident_trade_count  >= 50        (SEVERE penalty if <50)
+  Gate 1: confident_trade_count  >= 100       (SEVERE penalty if <100)
   Gate 2: trade_coverage         >= 3%        (SEVERE penalty if <3%)
-  Gate 3: directional_accuracy   >= 52%       (MEDIUM penalty if <52%)
-  Gate 4: profit_factor          >= 1.10      (MEDIUM penalty if <1.10)
+  Gate 3: directional_accuracy   >= 55%       (MEDIUM penalty if <55%)
+  Gate 4: profit_factor          >= 1.30      (MEDIUM penalty if <1.30)
 
 "Confident trade" = model confidence >= selected threshold
                     AND predicted direction != flat.
@@ -86,10 +86,13 @@ _COMPOSITE_ROBUST_WEIGHT  = 0.10  # bonus for threshold stability
 _COMPOSITE_SESSION_WEIGHT = 0.10  # bonus for in-session signal concentration
 
 # ── Hard-gate thresholds ───────────────────────────────────────────────────────
-_HC_MIN_TRADES   = 50
+# Raised to prefer models that are active enough and profitable enough OOS.
+# trade_count >= 100 ensures enough sample to validate edge.
+# PF >= 1.30 and dir_acc >= 55% reduce overfitting to lucky folds.
+_HC_MIN_TRADES   = 100
 _HC_MIN_COVERAGE = 0.03
-_HC_MIN_PF       = 1.10
-_HC_MIN_DIR_ACC  = 0.52
+_HC_MIN_PF       = 1.30
+_HC_MIN_DIR_ACC  = 0.55
 
 # Sentinel score returned when any STAGE 1 gate fails.
 _GATE_FAIL_SCORE = -1e9
