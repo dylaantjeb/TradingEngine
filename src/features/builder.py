@@ -24,6 +24,14 @@ Volume
   vol_ratio                             volume / 20-bar rolling mean volume
   vwap_dev                              (close - session VWAP) / session VWAP
 
+Microstructure
+  vwap_distance                         (close - VWAP) / ATR14
+  momentum_3                            close - close[3 bars ago]
+  momentum_6                            close - close[6 bars ago]
+  range_ratio                           (high - low) / ATR14
+  ema20_slope                           EMA(20) - EMA(20)[5 bars ago]
+  volume_delta                          volume - volume[1 bar ago]
+
 Time
   hour_sin, hour_cos                    cyclical encoding of bar hour
   dow_sin,  dow_cos                     cyclical encoding of day-of-week
@@ -121,7 +129,40 @@ def build_features(
     cols["vol_ratio"] = v_arr / vol_mean
 
     # ── VWAP deviation (optimised: avoids groupby for single-date buffers) ────
-    cols["vwap_dev"] = _vwap_deviation_fast(h_arr, l_arr, c_arr, v_arr, idx)
+    _vwap_arr = _vwap_raw(h_arr, l_arr, c_arr, v_arr, idx)
+    _vwap_safe = _vwap_arr.copy()
+    _vwap_safe[_vwap_safe == 0] = np.nan
+    cols["vwap_dev"] = (c_arr - _vwap_safe) / _vwap_safe
+
+    # ── Microstructure features ───────────────────────────────────────────────
+    _atr_raw = atr.values
+    _atr_safe = _atr_raw.copy()
+    _atr_safe[_atr_safe == 0] = np.nan
+
+    cols["vwap_distance"] = (c_arr - _vwap_arr) / _atr_safe
+
+    _mom3 = np.empty(n_rows)
+    _mom3[:3] = np.nan
+    _mom3[3:] = c_arr[3:] - c_arr[:-3]
+    cols["momentum_3"] = _mom3
+
+    _mom6 = np.empty(n_rows)
+    _mom6[:6] = np.nan
+    _mom6[6:] = c_arr[6:] - c_arr[:-6]
+    cols["momentum_6"] = _mom6
+
+    cols["range_ratio"] = (h_arr - l_arr) / _atr_safe
+
+    _ema20 = c_series.ewm(span=20, adjust=False).mean().values
+    _ema20_slope = np.empty(n_rows)
+    _ema20_slope[:5] = np.nan
+    _ema20_slope[5:] = _ema20[5:] - _ema20[:-5]
+    cols["ema20_slope"] = _ema20_slope
+
+    _vol_delta = np.empty(n_rows)
+    _vol_delta[0] = np.nan
+    _vol_delta[1:] = v_arr[1:] - v_arr[:-1]
+    cols["volume_delta"] = _vol_delta
 
     # ── Time features (pure numpy, no pandas) ─────────────────────────────────
     hour = idx.hour + idx.minute / 60.0
@@ -181,7 +222,7 @@ def _atr(
     return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 
-def _vwap_deviation_fast(
+def _vwap_raw(
     high: np.ndarray,
     low: np.ndarray,
     close: np.ndarray,
@@ -190,7 +231,7 @@ def _vwap_deviation_fast(
 ) -> np.ndarray:
     """
     Intraday VWAP that resets each calendar day.
-    Returns (close - vwap) / vwap as a numpy array.
+    Returns the raw VWAP price array (NaN where volume is zero).
 
     Optimised: uses numpy cumsum with day-boundary resets instead of
     pandas groupby().transform(), which is the main bottleneck.
@@ -199,21 +240,14 @@ def _vwap_deviation_fast(
     typical = (high + low + close) / 3.0
     tv = typical * volume
 
-    # Detect day boundaries (where date changes)
     dates = idx.date
-    day_change = np.empty(n, dtype=bool)
-    day_change[0] = True
-    for i in range(1, n):
-        day_change[i] = dates[i] != dates[i - 1]
-
-    # Cumsum with resets at day boundaries
     cum_tv = np.empty(n, dtype=np.float64)
     cum_v = np.empty(n, dtype=np.float64)
     running_tv = 0.0
     running_v = 0.0
 
     for i in range(n):
-        if day_change[i]:
+        if i == 0 or dates[i] != dates[i - 1]:
             running_tv = 0.0
             running_v = 0.0
         running_tv += tv[i] if np.isfinite(tv[i]) else 0.0
@@ -224,4 +258,4 @@ def _vwap_deviation_fast(
     cum_v[cum_v == 0] = np.nan
     vwap = cum_tv / cum_v
     vwap[vwap == 0] = np.nan
-    return (close - vwap) / vwap
+    return vwap

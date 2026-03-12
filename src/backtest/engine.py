@@ -262,9 +262,11 @@ def run_backtest(
     X_df = features[feature_names]
     X_scaled = scaler.transform(X_df)
     proba = model.predict_proba(X_scaled)
-    pred_encoded = np.argmax(proba, axis=1)
-    lookup = np.array([inv_label_map[str(k)] for k in range(len(inv_label_map))], dtype=np.int8)
-    signal = lookup[pred_encoded]
+    _inv_lookup = {inv_label_map[str(k)]: k for k in range(len(inv_label_map))}
+    _short_col = _inv_lookup.get(-1, 0)
+    _long_col  = _inv_lookup.get(1, 2)
+    _edge = proba[:, _long_col] - proba[:, _short_col]
+    signal = np.where(_edge > 0.15, 1, np.where(_edge < -0.15, -1, 0)).astype(np.int8)
     confidence = np.max(proba, axis=1)
 
     # ── Load raw prices (need 'open' for next-bar fills) ──────────────────────
