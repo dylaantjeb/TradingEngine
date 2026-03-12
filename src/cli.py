@@ -154,6 +154,7 @@ def cmd_walk_forward(args: argparse.Namespace) -> None:
         step_bars=args.step_bars,
         split_pct=args.split_pct,
         n_trials=n_trials,
+        select_by=getattr(args, "select_by", "f1"),
         save_report=True,
     )
 
@@ -358,6 +359,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_wf.add_argument(
         "--no-optuna", dest="no_optuna", action="store_true",
         help="Skip Optuna; use fast fixed hyperparameters (recommended for many folds)",
+    )
+    p_wf.add_argument(
+        "--select-by", dest="select_by", default="f1",
+        choices=["f1", "trading"],
+        help=(
+            "Per-fold model selection objective: "
+            "'f1' (macro-F1, default) or 'trading' (composite with four hard gates; "
+            "confidence threshold co-selected per fold). "
+            "Mirrors the --select-by flag on the train command."
+        ),
     )
     p_wf.set_defaults(func=cmd_walk_forward)
 

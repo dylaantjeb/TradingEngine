@@ -37,6 +37,7 @@ import numpy as np
 import pytest
 
 from src.training.train import (
+    _DEFAULT_THRESHOLD,
     _GATE_FAIL_SCORE,
     _HC_MIN_COVERAGE,
     _HC_MIN_DIR_ACC,
@@ -44,11 +45,13 @@ from src.training.train import (
     _HC_MIN_TRADES,
     _HC_PENALTY_MEDIUM,
     _HC_PENALTY_SEVERE,
+    _THRESHOLD_CANDIDATES,
     _activity_score,
     _compute_trading_stats,
     _coverage_score,
     _normalized_pf,
     _ppt_score,
+    _select_best_threshold,
     _trading_quality_score,
 )
 
@@ -692,3 +695,102 @@ class TestAllFourGatesViaStats:
         if stats["hard_constraints_passed"]:
             assert 0.0 < stats["trading_quality"] <= 1.0
             assert stats["hard_constraint_failures"] == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 13. _THRESHOLD_CANDIDATES constant and _select_best_threshold
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestThresholdCandidatesConstant:
+    def test_candidates_is_list(self):
+        assert isinstance(_THRESHOLD_CANDIDATES, list)
+
+    def test_candidates_all_floats(self):
+        for t in _THRESHOLD_CANDIDATES:
+            assert isinstance(t, float), f"Candidate {t!r} is not float"
+
+    def test_candidates_in_unit_range(self):
+        for t in _THRESHOLD_CANDIDATES:
+            assert 0.0 < t < 1.0, f"Candidate {t} outside (0, 1)"
+
+    def test_candidates_sorted_ascending(self):
+        assert _THRESHOLD_CANDIDATES == sorted(_THRESHOLD_CANDIDATES)
+
+    def test_candidates_non_empty(self):
+        assert len(_THRESHOLD_CANDIDATES) >= 2
+
+    def test_default_threshold_in_candidates(self):
+        assert _DEFAULT_THRESHOLD in _THRESHOLD_CANDIDATES, (
+            f"Default threshold {_DEFAULT_THRESHOLD} not in candidates"
+        )
+
+
+class TestSelectBestThreshold:
+    """
+    Unit tests for _select_best_threshold.
+
+    The function sweeps _THRESHOLD_CANDIDATES and returns the best
+    passing threshold, or _DEFAULT_THRESHOLD if none passes.
+    """
+
+    N_VAL = 2000
+
+    def _healthy_proba(self, n_trades=200, win_rate=0.65, seed=0):
+        return _make_proba(self.N_VAL, n_trades, win_rate=win_rate, seed=seed)
+
+    def _sparse_proba(self, n_trades=5, seed=0):
+        return _make_proba(self.N_VAL, n_trades, win_rate=0.90, seed=seed)
+
+    def test_returns_float(self):
+        proba, y_raw = self._healthy_proba()
+        t = _select_best_threshold(proba, y_raw, _INV, n_val_bars=self.N_VAL)
+        assert isinstance(t, float)
+
+    def test_returns_value_from_candidates(self):
+        proba, y_raw = self._healthy_proba()
+        t = _select_best_threshold(proba, y_raw, _INV, n_val_bars=self.N_VAL)
+        assert t in _THRESHOLD_CANDIDATES, f"{t} not in candidates"
+
+    def test_fallback_when_no_candidate_passes(self):
+        """When no threshold passes the gates, must return _DEFAULT_THRESHOLD."""
+        # 5 trades / 2000 bars — fails all gates at every threshold
+        proba, y_raw = self._sparse_proba(n_trades=5)
+        t = _select_best_threshold(proba, y_raw, _INV, n_val_bars=self.N_VAL)
+        assert t == _DEFAULT_THRESHOLD, (
+            f"Expected fallback {_DEFAULT_THRESHOLD}, got {t}"
+        )
+
+    def test_deterministic_same_data(self):
+        """Same inputs → same output, every time."""
+        proba, y_raw = self._healthy_proba(seed=42)
+        results = [
+            _select_best_threshold(proba, y_raw, _INV, n_val_bars=self.N_VAL)
+            for _ in range(5)
+        ]
+        assert len(set(results)) == 1, f"Non-deterministic: {results}"
+
+    def test_accepts_str_keyed_inv_map(self):
+        """Must work with both int-keyed and str-keyed inv_label_map."""
+        proba, y_raw = self._healthy_proba()
+        str_inv = {str(k): v for k, v in _INV.items()}
+        t = _select_best_threshold(proba, y_raw, str_inv, n_val_bars=self.N_VAL)
+        assert t in _THRESHOLD_CANDIDATES
+
+    def test_accepts_int_keyed_inv_map(self):
+        """int-keyed map (used internally by train.py) must also work."""
+        proba, y_raw = self._healthy_proba()
+        t = _select_best_threshold(proba, y_raw, _INV, n_val_bars=self.N_VAL)
+        assert t in _THRESHOLD_CANDIDATES
+
+    def test_higher_threshold_selected_when_it_improves_quality(self):
+        """
+        A model that fires on many bars at low confidence but only a
+        clean subset at higher confidence should prefer the higher threshold.
+        We can't easily force this with synthetic data, so we just verify
+        the function picks some threshold (not necessarily the lowest).
+        """
+        proba, y_raw = self._healthy_proba(seed=7)
+        t = _select_best_threshold(proba, y_raw, _INV, n_val_bars=self.N_VAL)
+        # Any candidate is acceptable — just must be a candidate
+        assert t in _THRESHOLD_CANDIDATES

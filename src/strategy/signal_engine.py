@@ -30,7 +30,10 @@ from src.utils.time_utils import in_blackout, in_session
 
 log = logging.getLogger(__name__)
 
-CONFIDENCE_THRESHOLD = 0.50
+# Module-level default used only when no schema is available.
+# At runtime the threshold stored in artifacts/schema/<SYM>_features.json
+# (key: selected_conf_threshold) takes precedence.
+CONFIDENCE_THRESHOLD = 0.65
 
 
 @dataclass
@@ -72,8 +75,12 @@ class SignalEngine:
     ):
         self.symbol = symbol
         arts = artifacts_dir or Path("artifacts")
-        self._model, self._scaler, self._feature_names, self._inv_label_map = (
+        self._model, self._scaler, self._feature_names, self._inv_label_map, self._conf_threshold = (
             _load_artifacts(symbol, arts)
+        )
+        log.info(
+            "SignalEngine [%s] loaded  |  conf_threshold=%.2f",
+            symbol, self._conf_threshold,
         )
         self._cfg = get_config()
 
@@ -128,7 +135,7 @@ class SignalEngine:
         confidence = float(proba[pred_enc])
         raw_signal = self._inv_label_map[str(pred_enc)]
 
-        if confidence < CONFIDENCE_THRESHOLD:
+        if confidence < self._conf_threshold:
             raw_signal = 0
 
         # ── ATR and regime ─────────────────────────────────────────────────────
@@ -151,11 +158,11 @@ class SignalEngine:
         filters_failed: list[str] = []
         sig = raw_signal
 
-        # Confidence
-        if confidence >= CONFIDENCE_THRESHOLD:
+        # Confidence (uses threshold loaded from schema at init time)
+        if confidence >= self._conf_threshold:
             filters_passed.append("confidence")
         else:
-            filters_failed.append(f"confidence({confidence:.2f}<{CONFIDENCE_THRESHOLD})")
+            filters_failed.append(f"confidence({confidence:.2f}<{self._conf_threshold:.2f})")
             sig = 0
 
         # Session
@@ -252,9 +259,11 @@ def _load_artifacts(symbol: str, arts: Path):
     with open(schema_p) as f:
         schema = json.load(f)
 
-    feature_names: list[str]       = schema["feature_names"]
-    inv_label_map: dict[str, int]  = {k: int(v) for k, v in schema["inv_label_map"].items()}
-    return model, scaler, feature_names, inv_label_map
+    feature_names: list[str]      = schema["feature_names"]
+    inv_label_map: dict[str, int] = {k: int(v) for k, v in schema["inv_label_map"].items()}
+    # Load the threshold selected during training; fall back to module default
+    conf_threshold: float = float(schema.get("selected_conf_threshold", CONFIDENCE_THRESHOLD))
+    return model, scaler, feature_names, inv_label_map, conf_threshold
 
 
 def _get_contributions(

@@ -218,8 +218,28 @@ def run_backtest(
     with open(schema_path) as f:
         schema = json.load(f)
 
-    feature_names: list[str] = schema["feature_names"]
+    feature_names: list[str]      = schema["feature_names"]
     inv_label_map: dict[str, int] = {k: int(v) for k, v in schema["inv_label_map"].items()}
+
+    # Load threshold selected during training and override the universe.yaml
+    # confidence gates, so backtest uses exactly the same threshold as inference.
+    saved_threshold = float(schema.get("selected_conf_threshold", 0.0))
+    if saved_threshold > 0.0:
+        cfg["min_long_confidence"]  = saved_threshold
+        cfg["min_short_confidence"] = saved_threshold
+
+    # Log all schema metadata so user can see what was saved during training
+    log.info(
+        "[%s] Schema  select_by=%-8s  threshold=%.2f  "
+        "val_trades=%s  val_coverage=%.1f%%  val_dir_acc=%.1f%%  val_PF=%.3f",
+        symbol,
+        schema.get("select_by", "unknown"),
+        saved_threshold,
+        schema.get("val_confident_trades", "?"),
+        float(schema.get("val_trade_coverage_pct", 0)) * 100,
+        float(schema.get("val_dir_accuracy", 0)) * 100,
+        float(schema.get("val_profit_factor", 0)),
+    )
 
     # ── Load features ───────────────────────────────────────────────────────────
     try:
@@ -271,6 +291,28 @@ def run_backtest(
                     else prices["close"].reindex(common_idx)
     close_prices  = prices["close"].reindex(common_idx)
 
+    # Pre-filter confidence coverage diagnostic: how many bars would trade
+    # before session/ATR/trend filters are applied.
+    _threshold_diag = cfg.get("min_long_confidence", 0.0)
+    if _threshold_diag > 0.0:
+        _conf_mask  = conf_series.values >= _threshold_diag
+        _sig_mask   = sig_series.values != 0
+        _n_conf     = int((_conf_mask & _sig_mask).sum())
+        _n_bars     = len(conf_series)
+        _pct        = 100.0 * _n_conf / max(_n_bars, 1)
+        log.info(
+            "[%s] Confidence coverage: %d / %d bars (%.1f%%) have "
+            "confidence >= %.2f and non-flat signal (before session/ATR/trend filters)",
+            symbol, _n_conf, _n_bars, _pct, _threshold_diag,
+        )
+        if _pct < 0.5:
+            log.warning(
+                "[%s] Very low confidence coverage (%.1f%%) — "
+                "model may be under-confident on this dataset. "
+                "Consider retraining or lowering the threshold.",
+                symbol, _pct,
+            )
+
     # ATR in ticks: atr_14 feature is atr_pts/close
     atr_ticks_series = (
         features["atr_14"].reindex(common_idx) * close_prices / tick_size
@@ -307,6 +349,20 @@ def run_backtest(
     metrics["n_trades"] = len(trades)
 
     _print_metrics_table(symbol, metrics)
+
+    # Post-run sanity safeguard: warn if trades are far below what validation suggested
+    _val_trades = int(schema.get("val_confident_trades", 0))
+    _val_coverage = float(schema.get("val_trade_coverage_pct", 0))
+    if _val_trades > 0 and _val_coverage > 0:
+        _expected = max(1, int(_val_coverage * len(features)))
+        _actual   = len(trades)
+        if _actual < max(5, _expected // 10):
+            log.warning(
+                "[%s] Only %d trade(s) executed (validation suggested ~%d). "
+                "Selected threshold may be too restrictive for deployment — "
+                "check confidence coverage log above or retrain.",
+                symbol, _actual, _expected,
+            )
 
     # ── Save report ─────────────────────────────────────────────────────────────
     report_dir  = Path("artifacts/reports")
