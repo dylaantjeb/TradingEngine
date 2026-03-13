@@ -114,6 +114,38 @@ def cmd_train(args: argparse.Namespace) -> None:
     )
 
 
+def _load_profile_overrides(symbol: str, profile_name: str) -> tuple[dict, list | None]:
+    """
+    Load exec_cfg_overrides and threshold_candidates for a named profile.
+    Returns (overrides_dict, threshold_candidates_or_None).
+    Exits with code 1 if the profile file or profile name is not found.
+    """
+    from src.backtest.profile_eval import load_profiles, _profile_to_cfg_overrides
+
+    try:
+        profiles = load_profiles(symbol)
+    except FileNotFoundError as exc:
+        log.error("%s", exc)
+        sys.exit(1)
+
+    if profile_name not in profiles:
+        log.error(
+            "Profile '%s' not found in config/profiles/%s_profiles.yaml.\n"
+            "  Available profiles: %s",
+            profile_name, symbol, ", ".join(profiles.keys()),
+        )
+        sys.exit(1)
+
+    profile    = profiles[profile_name]
+    overrides  = _profile_to_cfg_overrides(profile)
+    thresholds = profile.get("threshold_candidates", None)
+    log.info(
+        "Profile [%s] loaded — overrides: %s  threshold_candidates: %s",
+        profile_name, list(overrides.keys()), thresholds,
+    )
+    return overrides, thresholds
+
+
 def cmd_backtest(args: argparse.Namespace) -> None:
     """Run vectorised backtest and print metrics."""
     import yaml
@@ -122,7 +154,18 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     with open(args.universe) as f:
         universe_cfg = yaml.safe_load(f)
 
+    profile_name = getattr(args, "profile", None)
+
     for symbol in universe_cfg.get("symbols", []):
+        cfg_overrides: dict | None = None
+        if profile_name == "production":
+            from src.deployment import get_exec_cfg_overrides
+            cfg_overrides = get_exec_cfg_overrides(symbol)
+            log.info("[%s] Backtest using PRODUCTION deployment artifact", symbol)
+        elif profile_name:
+            cfg_overrides, _ = _load_profile_overrides(symbol, profile_name)
+            log.info("[%s] Backtest using profile [%s]", symbol, profile_name)
+
         log.info("Backtesting %s …", symbol)
         run_backtest(
             symbol=symbol,
@@ -130,6 +173,7 @@ def cmd_backtest(args: argparse.Namespace) -> None:
             max_trades_per_day=args.max_trades_per_day,
             slippage_ticks_per_side=args.slippage_ticks,
             commission_per_side_usd=args.commission,
+            cfg_overrides=cfg_overrides,
         )
 
 
@@ -137,7 +181,30 @@ def cmd_live_paper(args: argparse.Namespace) -> None:
     """Simulate live paper trading by streaming rows from a CSV file."""
     from src.live.paper_engine import run_paper
 
-    run_paper(symbol=args.symbol, csv_path=Path(args.input))
+    profile_name = getattr(args, "profile", None)
+    cfg_overrides: dict | None = None
+    threshold_candidates: list | None = None
+
+    if profile_name == "production":
+        # --profile production: load from the locked deployment artifact
+        from src.deployment import get_exec_cfg_overrides, get_threshold_candidates
+        cfg_overrides        = get_exec_cfg_overrides(args.symbol)
+        threshold_candidates = get_threshold_candidates(args.symbol)
+        log.info(
+            "[%s] live-paper using PRODUCTION deployment artifact "
+            "(exec overrides: %s)",
+            args.symbol, list(cfg_overrides.keys()),
+        )
+    elif profile_name:
+        cfg_overrides, threshold_candidates = _load_profile_overrides(
+            args.symbol, profile_name
+        )
+
+    run_paper(
+        symbol=args.symbol,
+        csv_path=Path(args.input),
+        cfg_overrides=cfg_overrides,
+    )
 
 
 def cmd_walk_forward(args: argparse.Namespace) -> None:
@@ -145,6 +212,24 @@ def cmd_walk_forward(args: argparse.Namespace) -> None:
     from src.backtest.walk_forward import run_walk_forward
 
     n_trials = 0 if getattr(args, "no_optuna", False) else args.trials
+
+    profile_name = getattr(args, "profile", None)
+    exec_overrides: dict | None = None
+    threshold_candidates: list | None = None
+
+    if profile_name == "production":
+        from src.deployment import get_exec_cfg_overrides, get_threshold_candidates
+        exec_overrides       = get_exec_cfg_overrides(args.symbol)
+        threshold_candidates = get_threshold_candidates(args.symbol)
+        log.info(
+            "[%s] walk-forward using PRODUCTION deployment artifact "
+            "(exec overrides: %s  thresholds: %s)",
+            args.symbol, list(exec_overrides.keys()), threshold_candidates,
+        )
+    elif profile_name:
+        exec_overrides, threshold_candidates = _load_profile_overrides(
+            args.symbol, profile_name
+        )
 
     run_walk_forward(
         symbol=args.symbol,
@@ -156,7 +241,89 @@ def cmd_walk_forward(args: argparse.Namespace) -> None:
         n_trials=n_trials,
         select_by=getattr(args, "select_by", "f1"),
         save_report=True,
+        exec_cfg_overrides=exec_overrides,
+        threshold_candidates=threshold_candidates,
     )
+
+
+def cmd_forward_test(args: argparse.Namespace) -> None:
+    """
+    Forward-test the ACCEPTED production winner.
+
+    Loads the production deployment artifact, verifies the deployment state is
+    ACCEPTED or higher, runs walk-forward with the exact config that was accepted,
+    and prints a pass/fail verdict.
+
+    This is the ONLY correct way to validate the strategy before going live:
+      python -m src.cli forward-test --symbol ES
+    """
+    from src.backtest.walk_forward import run_walk_forward
+    from src.deployment import (
+        load_or_fail, get_exec_cfg_overrides, get_threshold_candidates,
+        DeploymentState, update_deployment_state,
+    )
+
+    artifact = load_or_fail(args.symbol)
+    state_str = artifact.get("deployment_state", "RESEARCH")
+    state = DeploymentState(state_str)
+    if not state.is_deployable():
+        log.error(
+            "[%s] Deployment state is '%s' — not deployable.\n"
+            "  Run evaluate-profiles first, or manually advance the state.",
+            args.symbol, state_str,
+        )
+        sys.exit(1)
+
+    exec_overrides       = get_exec_cfg_overrides(args.symbol)
+    threshold_candidates = get_threshold_candidates(args.symbol)
+    profile_name         = artifact.get("profile_name", "unknown")
+
+    log.info(
+        "[%s] forward-test — profile=[%s]  state=%s  overrides=%s",
+        args.symbol, profile_name, state_str, list(exec_overrides.keys()),
+    )
+
+    n_trials = 0 if getattr(args, "no_optuna", False) else args.trials
+
+    wf = run_walk_forward(
+        symbol=args.symbol,
+        mode=getattr(args, "mode", "rolling"),
+        train_bars=args.train_bars,
+        test_bars=args.test_bars,
+        step_bars=getattr(args, "step_bars", None),
+        split_pct=getattr(args, "split_pct", 0.8),
+        n_trials=n_trials,
+        select_by=getattr(args, "select_by", "f1"),
+        save_report=True,
+        exec_cfg_overrides=exec_overrides,
+        threshold_candidates=threshold_candidates,
+    )
+
+    # Verdict
+    agg = wf.aggregate if hasattr(wf, "aggregate") else {}
+    folds = wf.folds if hasattr(wf, "folds") else []
+    n_profitable = sum(1 for f in folds if f.profitable)
+    total_pnl    = sum(f.net_pnl for f in folds)
+    avg_pf_vals  = [f.profit_factor for f in folds]
+    avg_pf       = sum(avg_pf_vals) / len(avg_pf_vals) if avg_pf_vals else 0.0
+
+    print(f"\n{'='*70}")
+    print(f"  FORWARD-TEST RESULT — {args.symbol}  [profile: {profile_name}]")
+    print(f"{'='*70}")
+    print(f"  Deployment state   : {state_str}")
+    print(f"  Profitable folds   : {n_profitable}/{len(folds)}")
+    print(f"  Total PnL          : ${total_pnl:+.0f}")
+    print(f"  Avg profit factor  : {avg_pf:.2f}")
+
+    if n_profitable >= 3 and avg_pf >= 1.2 and total_pnl > 0:
+        print(f"\n  VERDICT: PASS — strategy holding up in forward test.")
+        if state == DeploymentState.ACCEPTED and getattr(args, "promote", False):
+            update_deployment_state(args.symbol, DeploymentState.FORWARD_DEPLOYED)
+            print(f"  State promoted: ACCEPTED → FORWARD_DEPLOYED")
+    else:
+        print(f"\n  VERDICT: FAIL — re-run evaluate-profiles before going live.")
+
+    print(f"{'='*70}\n")
 
 
 def cmd_evaluate_profiles(args: argparse.Namespace) -> None:
@@ -341,12 +508,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--commission", dest="commission", type=float, default=None,
         help="Commission per contract per side USD (default from config, usually 1.50)",
     )
+    p_bt.add_argument(
+        "--profile", dest="profile", default=None, metavar="PROFILE_NAME",
+        help=(
+            "Apply named execution profile from config/profiles/<symbol>_profiles.yaml. "
+            "Use 'production' to load the locked deployment artifact. "
+            "Overrides session_blocks, ATR limits, trend filter, throttles, etc."
+        ),
+    )
     p_bt.set_defaults(func=cmd_backtest)
 
     # ── live-paper ─────────────────────────────────────────────────────────────
     p_live = sub.add_parser("live-paper", help="Paper-trade simulation from CSV stream")
     p_live.add_argument("--symbol", required=True)
     p_live.add_argument("--input", required=True, help="Path to CSV to stream")
+    p_live.add_argument(
+        "--profile", dest="profile", default=None, metavar="PROFILE_NAME",
+        help=(
+            "Apply named execution profile overrides. "
+            "Use 'production' to load the locked deployment artifact "
+            "(recommended for all production runs). "
+            "Without --profile, falls back to config/universe.yaml defaults."
+        ),
+    )
     p_live.set_defaults(func=cmd_live_paper)
 
     # ── walk-forward ───────────────────────────────────────────────────────────
@@ -397,7 +581,51 @@ def build_parser() -> argparse.ArgumentParser:
             "Mirrors the --select-by flag on the train command."
         ),
     )
+    p_wf.add_argument(
+        "--profile", dest="profile", default=None, metavar="PROFILE_NAME",
+        help=(
+            "Apply named execution profile from config/profiles/<symbol>_profiles.yaml. "
+            "Use 'production' to load the locked deployment artifact. "
+            "Without --profile the universe.yaml defaults are used (generic walk-forward)."
+        ),
+    )
     p_wf.set_defaults(func=cmd_walk_forward)
+
+    # ── forward-test ───────────────────────────────────────────────────────────
+    p_ft = sub.add_parser(
+        "forward-test",
+        help=(
+            "Validate the accepted production winner on new data. "
+            "Requires a deployment artifact from evaluate-profiles."
+        ),
+    )
+    p_ft.add_argument("--symbol", required=True)
+    p_ft.add_argument(
+        "--train-bars", dest="train_bars", type=int, default=10_000,
+        help="Bars in each training window (default 10000)",
+    )
+    p_ft.add_argument(
+        "--test-bars", dest="test_bars", type=int, default=2_000,
+        help="Bars in each test window (default 2000)",
+    )
+    p_ft.add_argument(
+        "--trials", type=int, default=10,
+        help="Optuna trials per fold (default 10)",
+    )
+    p_ft.add_argument(
+        "--no-optuna", dest="no_optuna", action="store_true",
+        help="Skip Optuna; use fast fixed hyperparameters",
+    )
+    p_ft.add_argument(
+        "--select-by", dest="select_by", default="f1",
+        choices=["f1", "trading"],
+        help="Per-fold model selection objective (default f1)",
+    )
+    p_ft.add_argument(
+        "--promote", action="store_true",
+        help="If verdict PASS, advance deployment state ACCEPTED → FORWARD_DEPLOYED",
+    )
+    p_ft.set_defaults(func=cmd_forward_test)
 
     # ── evaluate-profiles ──────────────────────────────────────────────────────
     p_ep = sub.add_parser(
