@@ -82,12 +82,18 @@ profiles:
 
   regime_strict:
     description: >
-      Strict regime confirmation. High threshold, both session blocks required,
-      strong slope gate. Only trade in clear trending regimes.
+      Strict regime confirmation. High threshold, strong slope gate.
+      Block 1 only (12:30–16:00 UTC, US open / European close).
+      Block 2 (18:00–21:30 UTC) removed: walk-forward analysis shows
+      block2_pnl = -1812 vs block1_pnl = +1604 across folds — the
+      afternoon session produces tail losses that destroy expectancy,
+      inflate CV, and suppress t-stat below the acceptance threshold.
+      Removing Block 2 eliminates those entries at source without
+      affecting existing Block 1 positions, which can still exit
+      freely after 16:00 UTC.
     threshold_candidates: [0.70, 0.75]
     session_blocks:
-      - [12.5, 16.0]
-      - [18.0, 21.5]
+      - [12.5, 16.0]   # Block 1 only: 12:30–16:00 UTC (US open)
     atr_min_ticks: 6
     atr_max_ticks: 100
     trend_filter_enabled: true
