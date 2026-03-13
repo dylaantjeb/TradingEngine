@@ -62,21 +62,35 @@ profiles:
 
   trend_aggressive:
     description: >
-      Trend-following with lower threshold and shorter EMA. More signals,
-      lower per-trade precision. Good for trending markets.
-    threshold_candidates: [0.65, 0.70]
+      PRODUCTION CANDIDATE — hardened from loose sieve to disciplined
+      quality filter. Original settings (threshold 0.65, ATR floor 3,
+      slope 0.08, EMA 10, 10 trades/day) passed every marginal trade
+      and diluted avg_pf to 1.12 despite a strong t_stat=2.79 / CV=0.80.
+      Diagnosis: the edge is real and consistent; it was being buried
+      under weak signals. Each change below targets one specific source
+      of PF dilution:
+        Block 2 removed → eliminates -738 block2 drag (vs +2593 block1).
+        Threshold raised to [0.70, 0.75] → drops 0.65 noise tier.
+        ATR floor 3→6 → requires meaningful market activity at entry.
+        ATR cap 200→150 → blocks outlier-vol bars where slippage dominates.
+        EMA period 10→20 → stable short-term trend context (~100min on 5m).
+        Slope 0.08→0.18 → requires real directional commitment, not drift.
+        cooldown_after_exit 3→6 → stops re-entering the same failed setup.
+        cooldown_after_loss 5→10 → loss = suspect regime; wait for reset.
+        max_trades_per_day 10→4 → only best setups of the session.
+        min_holding_bars 2→4 → 2-bar flips are noise; let the trade develop.
+    threshold_candidates: [0.70, 0.75]
     session_blocks:
-      - [12.5, 16.0]
-      - [18.0, 21.5]
-    atr_min_ticks: 3
-    atr_max_ticks: 200
+      - [12.5, 16.0]   # Block 1 only: 12:30–16:00 UTC (US open)
+    atr_min_ticks: 6
+    atr_max_ticks: 150
     trend_filter_enabled: true
-    trend_filter_ema_period: 10
-    trend_slope_min_atr_frac: 0.08
-    cooldown_bars_after_exit: 3
-    cooldown_bars_after_loss: 5
-    max_trades_per_day: 10
-    min_holding_bars: 2
+    trend_filter_ema_period: 20
+    trend_slope_min_atr_frac: 0.18
+    cooldown_bars_after_exit: 6
+    cooldown_bars_after_loss: 10
+    max_trades_per_day: 4
+    min_holding_bars: 4
 
   # ── Regime profiles ─────────────────────────────────────────────────────────
 
