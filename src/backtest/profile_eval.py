@@ -234,11 +234,16 @@ def _evaluate_profile(
     b2_trades = sum(f.block2_n_trades for f in folds)
 
     # Regime / fold quality
+    # Uses the same 2× multiplier as walk_forward._aggregate (line ~1111):
+    #   n_chop_dominated counts a fold only when chop blocks exceed TWICE the
+    #   trend entries, matching the "regime blocked >> trend entries" intent.
+    # The previous formula used 1× and was stricter than the actual WF gate,
+    # causing false rejections when the WF gate itself would have passed.
     trend_profitable = sum(
         1 for f in folds if f.n_trend_entries > 0 and f.profitable
     )
     chop_dominated = sum(
-        1 for f in folds if f.n_chop_blocked > max(f.n_trend_entries, 1)
+        1 for f in folds if f.n_chop_blocked > 2 * max(f.n_trend_entries, 1)
     )
     weak_folds = sum(1 for f in folds if f.weak_fold)
 
