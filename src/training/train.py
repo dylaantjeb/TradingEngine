@@ -119,6 +119,7 @@ def train(
     symbol: str,
     n_trials: int = 20,
     select_by: str = "f1",
+    seed: int = 42,
 ) -> None:
     """
     Full training pipeline for `symbol`.
@@ -129,6 +130,8 @@ def train(
     n_trials   : Number of Optuna trials.
     select_by  : 'f1' (maximise macro-F1) or 'trading' (composite with four
                  inline hard gates, threshold co-optimised).
+    seed       : Master random seed for Optuna sampler and XGBoost.
+                 Set identically on every run for reproducible results.
     """
     if select_by not in ("f1", "trading"):
         log.error("select_by must be 'f1' or 'trading', got %r", select_by)
@@ -301,7 +304,7 @@ def train(
             "eval_metric":      "mlogloss",
             "verbosity":        0,
             "tree_method":      "hist",
-            "random_state":     42,
+            "random_state":     seed,
         }
 
     # ── Trading objective ──────────────────────────────────────────────────────
@@ -429,9 +432,12 @@ def train(
         return float(f1_score(y_val, preds, average="macro", zero_division=0))
 
     # ── Run primary study ─────────────────────────────────────────────────────
-    log.info("Running Optuna (%d trials, objective=%s) …", n_trials, select_by)
+    log.info("Running Optuna (%d trials, objective=%s, seed=%d) …", n_trials, select_by, seed)
     primary_objective = trading_objective if select_by == "trading" else f1_objective
-    study = optuna.create_study(direction="maximize")
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=seed),
+    )
     study.optimize(primary_objective, n_trials=n_trials, show_progress_bar=False)
 
     best_score = study.best_value
@@ -459,7 +465,10 @@ def train(
         )
         log.warning("=" * 70)
 
-        fallback_study = optuna.create_study(direction="maximize")
+        fallback_study = optuna.create_study(
+            direction="maximize",
+            sampler=optuna.samplers.TPESampler(seed=seed + 1),
+        )
         fallback_study.optimize(f1_objective, n_trials=n_trials, show_progress_bar=False)
         best_params  = fallback_study.best_params
         best_score   = fallback_study.best_value
@@ -486,7 +495,7 @@ def train(
         "eval_metric":  "mlogloss",
         "verbosity":    0,
         "tree_method":  "hist",
-        "random_state": 42,
+        "random_state": seed,
     })
     eval_model = xgb.XGBClassifier(**best_params)
     eval_model.fit(X_train_s, y_train, verbose=False)

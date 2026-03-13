@@ -158,6 +158,7 @@ def _evaluate_profile(
     train_bars: int,
     test_bars: int,
     run_backtest: bool,
+    seed: int = 42,
 ) -> ProfileScore:
     """Run walk-forward for one profile and return a ProfileScore."""
     from src.backtest.walk_forward import run_walk_forward
@@ -170,8 +171,8 @@ def _evaluate_profile(
     exec_overrides       = _profile_to_cfg_overrides(profile)
 
     log.info(
-        "Evaluating profile [%s] – threshold_candidates=%s  overrides=%s",
-        profile_name, threshold_candidates, list(exec_overrides.keys()),
+        "Evaluating profile [%s] – seed=%d  threshold_candidates=%s  overrides=%s",
+        profile_name, seed, threshold_candidates, list(exec_overrides.keys()),
     )
 
     try:
@@ -185,6 +186,7 @@ def _evaluate_profile(
             save_report=False,
             exec_cfg_overrides=exec_overrides,
             threshold_candidates=threshold_candidates,
+            seed=seed,
         )
     except Exception as exc:
         log.error("Profile [%s] walk-forward failed: %s", profile_name, exc)
@@ -401,7 +403,12 @@ def print_scoreboard(results: list[ProfileScore], symbol: str) -> None:
         print(f"  All {len(results)} profiles failed at least one acceptance gate.\n")
 
 
-def save_artifacts(symbol: str, results: list[ProfileScore]) -> None:
+def save_artifacts(
+    symbol: str,
+    results: list[ProfileScore],
+    seed: int = 42,
+    acceptance_check_runs: int = 1,
+) -> None:
     """Write JSON + CSV summaries to artifacts/reports/ and (if winner) production artifact."""
     out_dir = Path("artifacts/reports")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -450,20 +457,26 @@ def save_artifacts(symbol: str, results: list[ProfileScore]) -> None:
         except Exception:
             winner_profile = {}
         exec_overrides = _profile_to_cfg_overrides(winner_profile)
+        # Retrieve seed/reproducibility metadata attached by evaluate_all_profiles
+        eval_seed      = winner.__dict__.get("_eval_seed", seed)
+        check_runs     = winner.__dict__.get("_acceptance_check_runs", acceptance_check_runs)
         metrics = {
-            "profitable_folds":      winner.profitable_folds,
-            "n_folds":               winner.n_folds,
-            "avg_pf":                winner.avg_pf,
-            "t_stat":                winner.t_stat,
-            "pnl_cv":                winner.pnl_cv,
-            "avg_sharpe":            winner.avg_sharpe,
-            "avg_expectancy":        winner.avg_expectancy,
-            "total_pnl":             winner.total_pnl,
-            "composite_score":       winner.composite_score,
-            "block1_total_pnl":      winner.block1_total_pnl,
-            "block2_total_pnl":      winner.block2_total_pnl,
+            "profitable_folds":       winner.profitable_folds,
+            "n_folds":                winner.n_folds,
+            "avg_pf":                 winner.avg_pf,
+            "t_stat":                 winner.t_stat,
+            "pnl_cv":                 winner.pnl_cv,
+            "avg_sharpe":             winner.avg_sharpe,
+            "avg_expectancy":         winner.avg_expectancy,
+            "total_pnl":              winner.total_pnl,
+            "composite_score":        winner.composite_score,
+            "block1_total_pnl":       winner.block1_total_pnl,
+            "block2_total_pnl":       winner.block2_total_pnl,
             "trend_profitable_folds": winner.trend_profitable_folds,
-            "chop_dominated_folds":  winner.chop_dominated_folds,
+            "chop_dominated_folds":   winner.chop_dominated_folds,
+            "evaluation_seed":        eval_seed,
+            "acceptance_check_runs":  check_runs,
+            "reproducibility_verified": check_runs >= 2,
         }
         dep_path = write_deployment_artifact(
             symbol=symbol,
@@ -491,24 +504,36 @@ def evaluate_all_profiles(
     train_bars: int = 10_000,
     test_bars: int = 2_000,
     run_backtest: bool = False,
+    seed: int = 42,
+    acceptance_check_runs: int = 1,
 ) -> list[ProfileScore]:
     """
     Evaluate all profiles for `symbol` and return ranked ProfileScore list.
 
     Parameters
     ----------
-    symbol       : Symbol (must have data/processed/ parquets + model artifacts).
-    n_trials     : Optuna trials per fold per profile (0 = fast fixed params).
-    select_by    : 'f1' | 'trading' — per-fold selection objective.
-    train_bars   : Walk-forward training window size.
-    test_bars    : Walk-forward test window size.
-    run_backtest : If True, also run standalone backtest per profile (slower).
+    symbol               : Symbol (must have data/processed/ parquets + model artifacts).
+    n_trials             : Optuna trials per fold per profile (0 = fast fixed params).
+    select_by            : 'f1' | 'trading' — per-fold selection objective.
+    train_bars           : Walk-forward training window size.
+    test_bars            : Walk-forward test window size.
+    run_backtest         : If True, also run standalone backtest per profile (slower).
+    seed                 : Master random seed.  Each profile gets a unique sub-seed
+                           (seed + profile_idx * 100_000) to ensure inter-profile
+                           independence while maintaining intra-profile determinism.
+    acceptance_check_runs: 1 (default) = single run.  2 = also verify the winner
+                           on seed+1; write artifact only if the same profile is
+                           accepted on both seeds.  Prevents stochastic optimizer
+                           drift from producing false positives.
     """
     profiles = load_profiles(symbol)
 
     results: list[ProfileScore] = []
-    for name, profile in profiles.items():
-        log.info("─── Profile [%s] ───", name)
+    for profile_idx, (name, profile) in enumerate(profiles.items()):
+        # Each profile uses a well-separated sub-seed so that fold-level randomness
+        # in one profile cannot accidentally mirror another profile's sequence.
+        profile_seed = seed + profile_idx * 100_000
+        log.info("─── Profile [%s]  profile_seed=%d ───", name, profile_seed)
         ps = _evaluate_profile(
             symbol=symbol,
             profile_name=name,
@@ -518,6 +543,7 @@ def evaluate_all_profiles(
             train_bars=train_bars,
             test_bars=test_bars,
             run_backtest=run_backtest,
+            seed=profile_seed,
         )
         results.append(ps)
         _status = "ACCEPTED" if ps.accepted else f"REJECTED ({len(ps.rejection_reasons)} gate(s))"
@@ -528,6 +554,79 @@ def evaluate_all_profiles(
         )
 
     results = _rank_profiles(results)
+
+    # ── Reproducibility check ─────────────────────────────────────────────────
+    # When acceptance_check_runs >= 2, re-run the winner with seed+1.  The
+    # same profile must be accepted on the second seed or no artifact is written.
+    if acceptance_check_runs >= 2:
+        winner1 = pick_winner(results)
+        if winner1 is not None:
+            verify_seed = seed + 1
+            log.info(
+                "Reproducibility check: re-running winner [%s] with seed=%d …",
+                winner1.profile_name, verify_seed,
+            )
+            try:
+                # Locate the profile in the dict so we have its original index
+                profiles_list = list(profiles.items())
+                winner_idx = next(
+                    i for i, (n, _) in enumerate(profiles_list)
+                    if n == winner1.profile_name
+                )
+                winner_profile_seed = verify_seed + winner_idx * 100_000
+                ps2 = _evaluate_profile(
+                    symbol=symbol,
+                    profile_name=winner1.profile_name,
+                    profile=profiles[winner1.profile_name],
+                    n_trials=n_trials,
+                    select_by=select_by,
+                    train_bars=train_bars,
+                    test_bars=test_bars,
+                    run_backtest=run_backtest,
+                    seed=winner_profile_seed,
+                )
+                if ps2.accepted:
+                    log.info(
+                        "Reproducibility check PASSED: [%s] accepted on both "
+                        "seed=%d and seed=%d",
+                        winner1.profile_name, seed, verify_seed,
+                    )
+                    # Annotate the original winner with reproducibility confirmation
+                    winner1.rejection_reasons = [
+                        r for r in winner1.rejection_reasons
+                        if not r.startswith("REPRODUCIBILITY")
+                    ]
+                else:
+                    log.warning(
+                        "Reproducibility check FAILED: [%s] accepted on seed=%d "
+                        "but REJECTED on seed=%d (%s). "
+                        "Marking as NOT accepted to prevent false-positive deployment.",
+                        winner1.profile_name, seed, verify_seed,
+                        "; ".join(ps2.rejection_reasons),
+                    )
+                    # Revoke acceptance — this profile is stochastically marginal
+                    winner1.accepted = False
+                    winner1.rejection_reasons.append(
+                        f"REPRODUCIBILITY_FAILED: rejected on verify_seed={verify_seed} "
+                        f"({'; '.join(ps2.rejection_reasons)})"
+                    )
+                    results = _rank_profiles(results)
+            except Exception as exc:
+                log.error(
+                    "Reproducibility check error for [%s]: %s — skipping check, "
+                    "winner remains accepted.",
+                    winner1.profile_name, exc,
+                )
+        else:
+            log.info(
+                "Reproducibility check skipped: no winner found in primary run."
+            )
+
+    # Attach evaluation metadata so save_artifacts can record it
+    for r in results:
+        r.__dict__["_eval_seed"] = seed
+        r.__dict__["_acceptance_check_runs"] = acceptance_check_runs
+
     return results
 
 

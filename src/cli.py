@@ -16,6 +16,17 @@ configure_logging()
 log = logging.getLogger("cli")
 
 
+def _seed_everything(seed: int) -> None:
+    """Seed Python random, NumPy, and set PYTHONHASHSEED for reproducibility."""
+    import os
+    import random as _random
+    import numpy as _np
+    _random.seed(seed)
+    _np.random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    log.info("Global seeds set: seed=%d  (random, numpy, PYTHONHASHSEED)", seed)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Sub-command handlers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -278,9 +289,12 @@ def cmd_forward_test(args: argparse.Namespace) -> None:
     threshold_candidates = get_threshold_candidates(args.symbol)
     profile_name         = artifact.get("profile_name", "unknown")
 
+    seed = getattr(args, "seed", 42)
+    _seed_everything(seed)
+
     log.info(
-        "[%s] forward-test — profile=[%s]  state=%s  overrides=%s",
-        args.symbol, profile_name, state_str, list(exec_overrides.keys()),
+        "[%s] forward-test — profile=[%s]  state=%s  seed=%d  overrides=%s",
+        args.symbol, profile_name, state_str, seed, list(exec_overrides.keys()),
     )
 
     n_trials = 0 if getattr(args, "no_optuna", False) else args.trials
@@ -297,6 +311,7 @@ def cmd_forward_test(args: argparse.Namespace) -> None:
         save_report=True,
         exec_cfg_overrides=exec_overrides,
         threshold_candidates=threshold_candidates,
+        seed=seed,
     )
 
     # Verdict
@@ -335,6 +350,11 @@ def cmd_evaluate_profiles(args: argparse.Namespace) -> None:
         pick_winner,
     )
 
+    seed             = getattr(args, "seed", 42)
+    check_runs       = getattr(args, "acceptance_check_runs", 1)
+
+    _seed_everything(seed)
+
     results = evaluate_all_profiles(
         symbol=args.symbol,
         n_trials=args.trials,
@@ -342,10 +362,16 @@ def cmd_evaluate_profiles(args: argparse.Namespace) -> None:
         train_bars=args.train_bars,
         test_bars=args.test_bars,
         run_backtest=not getattr(args, "no_backtest", True),
+        seed=seed,
+        acceptance_check_runs=check_runs,
     )
 
     print_scoreboard(results, symbol=args.symbol)
-    save_artifacts(args.symbol, results)
+    save_artifacts(
+        args.symbol, results,
+        seed=seed,
+        acceptance_check_runs=check_runs,
+    )
 
     winner = pick_winner(results)
     if winner is None:
@@ -625,6 +651,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--promote", action="store_true",
         help="If verdict PASS, advance deployment state ACCEPTED → FORWARD_DEPLOYED",
     )
+    p_ft.add_argument(
+        "--seed", type=int, default=42,
+        help=(
+            "Master random seed matching the one used during evaluate-profiles "
+            "(recorded in the deployment artifact). Default 42."
+        ),
+    )
     p_ft.set_defaults(func=cmd_forward_test)
 
     # ── evaluate-profiles ──────────────────────────────────────────────────────
@@ -653,6 +686,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_ep.add_argument(
         "--no-backtest", dest="no_backtest", action="store_true",
         help="Skip standalone backtest per profile (default: skip)",
+    )
+    p_ep.add_argument(
+        "--seed", type=int, default=42,
+        help=(
+            "Master random seed for Optuna TPESampler and XGBoost across all folds "
+            "and profiles. Each profile gets seed + profile_idx*100000; each fold "
+            "gets profile_seed + fold_idx*1000. Default 42."
+        ),
+    )
+    p_ep.add_argument(
+        "--acceptance-check-runs", dest="acceptance_check_runs", type=int, default=1,
+        metavar="N",
+        help=(
+            "Reproducibility check: run the winner profile a second time with "
+            "seed+1 and require it to also pass acceptance. "
+            "1 = single run (default), 2 = reproducibility check required. "
+            "Prevents stochastic optimizer drift from producing false positives."
+        ),
     )
     p_ep.set_defaults(func=cmd_evaluate_profiles)
 
