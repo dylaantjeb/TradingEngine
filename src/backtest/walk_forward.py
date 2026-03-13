@@ -165,6 +165,7 @@ def run_walk_forward(
     save_report: bool = True,
     exec_cfg_overrides: Optional[dict] = None,
     threshold_candidates: Optional[list] = None,
+    seed: int = 42,
 ) -> WalkForwardSummary:
     """
     Run walk-forward / OOS validation.
@@ -185,6 +186,9 @@ def run_walk_forward(
                            universe.yaml config (e.g. session_blocks, atr_min_ticks).
     threshold_candidates : Override confidence threshold sweep list per fold.
                            Passed to _select_best_threshold and Optuna objective.
+    seed                 : Master random seed for Optuna TPESampler and XGBoost.
+                           Each fold uses seed + fold_idx * 1000 (deterministic,
+                           non-correlated across folds).  Default 42.
     """
     if mode not in ("rolling", "expanding", "split"):
         raise ValueError(f"mode must be 'rolling', 'expanding', or 'split', got {mode!r}")
@@ -265,10 +269,12 @@ def run_walk_forward(
         )
 
         # ── Train (in-memory) ──────────────────────────────────────────────
+        fold_seed = seed + fold_idx * 1000
         try:
             model, scaler, inv_label_map, conf_threshold = _train_on_slice(
                 train_df, feature_names, n_trials, select_by,
                 threshold_candidates=threshold_candidates,
+                seed=fold_seed,
             )
         except Exception as exc:
             log.warning("Fold %d  training failed: %s — skipping", fold_idx, exc)
@@ -431,6 +437,7 @@ def _train_on_slice(
     n_trials: int = 0,
     select_by: str = "f1",
     threshold_candidates: Optional[list] = None,
+    seed: int = 42,
 ) -> tuple:
     """
     Train XGBoost + RobustScaler on train_df in memory.
@@ -482,6 +489,7 @@ def _train_on_slice(
             X_scaled, y_enc, y_raw, int_inv_map, n_trials, select_by,
             val_index=X_df.index,
             threshold_candidates=threshold_candidates,
+            seed=seed,
         )
     else:
         # Conservative fixed hyperparameters for OOS robustness
@@ -496,7 +504,7 @@ def _train_on_slice(
             reg_lambda=3.0,
             gamma=1.0,
             eval_metric="mlogloss",
-            random_state=42,
+            random_state=seed,
             verbosity=0,
         )
         model.fit(X_scaled, y_enc)
@@ -529,6 +537,7 @@ def _optuna_train(
     select_by: str = "f1",
     val_index=None,
     threshold_candidates: Optional[list] = None,
+    seed: int = 42,
 ) -> tuple:
     """
     Optuna hyperparameter search within a training slice.
@@ -538,6 +547,9 @@ def _optuna_train(
     When select_by='trading', threshold is co-optimised via Optuna.
     val_index: DatetimeIndex of the full training slice — used to derive
                inner-val timestamps for session-aware scoring.
+    seed: Controls Optuna TPESampler and final XGBoost random_state.
+          Pass fold_seed = master_seed + fold_idx * 1000 for per-fold
+          determinism without cross-fold correlation.
     """
     import optuna
     import xgboost as xgb
@@ -639,7 +651,10 @@ def _optuna_train(
             + _COMPOSITE_SESSION_WEIGHT * sess_factor
         )
 
-    study = optuna.create_study(direction="maximize")
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=seed),
+    )
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
 
     best_params = dict(study.best_params)
@@ -660,7 +675,7 @@ def _optuna_train(
     model = xgb.XGBClassifier(
         **best_params,
         eval_metric="mlogloss",
-        random_state=42,
+        random_state=seed,
         verbosity=0,
     )
     model.fit(X_scaled, y_enc)

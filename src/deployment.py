@@ -95,22 +95,35 @@ def write_deployment_artifact(
     Called by ``profile_eval.save_artifacts()`` when a winner is found.
     Human operators may later call ``update_deployment_state()`` to advance
     the state through the lifecycle.
+
+    The artifact stores ``evaluation_seed`` (from metrics) so that forward-test
+    and re-evaluation can use the identical seed, enabling exact reproduction.
     """
     _PRODUCTION_DIR.mkdir(parents=True, exist_ok=True)
     path = _deployment_path(symbol)
 
     artifact = {
-        "symbol":              symbol,
-        "profile_name":        profile_name,
-        "deployment_state":    state.value,
-        "accepted_at":         datetime.now(timezone.utc).isoformat(),
-        "profile_config":      profile_config,
-        "exec_cfg_overrides":  exec_cfg_overrides,
-        "metrics":             metrics,
-        "config_hash":         _hash_cfg(exec_cfg_overrides),
+        "symbol":                    symbol,
+        "profile_name":              profile_name,
+        "deployment_state":          state.value,
+        "accepted_at":               datetime.now(timezone.utc).isoformat(),
+        "profile_config":            profile_config,
+        "exec_cfg_overrides":        exec_cfg_overrides,
+        "metrics":                   metrics,
+        "config_hash":               _hash_cfg(exec_cfg_overrides),
+        # Seed snapshot — use this in forward-test and any re-evaluation to
+        # exactly reproduce the accepted run.
+        "evaluation_seed":           metrics.get("evaluation_seed", 42),
+        "reproducibility_verified":  metrics.get("reproducibility_verified", False),
+        "acceptance_check_runs":     metrics.get("acceptance_check_runs", 1),
     }
     path.write_text(json.dumps(artifact, indent=2, default=str))
-    log.info("Deployment artifact written → %s", path)
+    log.info(
+        "Deployment artifact written → %s  [seed=%s  reproducibility_verified=%s]",
+        path,
+        artifact["evaluation_seed"],
+        artifact["reproducibility_verified"],
+    )
     return path
 
 
@@ -151,6 +164,12 @@ def get_threshold_candidates(symbol: str) -> Optional[list]:
     """Return threshold_candidates from the production artifact (None if absent)."""
     artifact = load_or_fail(symbol)
     return artifact.get("profile_config", {}).get("threshold_candidates", None)
+
+
+def get_evaluation_seed(symbol: str) -> int:
+    """Return the evaluation seed recorded in the production artifact (default 42)."""
+    artifact = load_or_fail(symbol)
+    return int(artifact.get("evaluation_seed", 42))
 
 
 def update_deployment_state(symbol: str, new_state: DeploymentState) -> None:
@@ -243,6 +262,14 @@ def run_health_checks(
                 failures.append(
                     f"CONFIG_HASH_MISMATCH: artifact may have been manually edited "
                     f"(stored={stored_hash})"
+                )
+            # Warn (not fail) if reproducibility was not verified
+            if not artifact.get("reproducibility_verified", False):
+                log.warning(
+                    "[%s] Deployment artifact was accepted on a single seed "
+                    "(reproducibility_verified=false). "
+                    "Consider re-running: evaluate-profiles --acceptance-check-runs 2",
+                    symbol,
                 )
 
     # ── Check 5: Session blocks defined ──────────────────────────────────────
