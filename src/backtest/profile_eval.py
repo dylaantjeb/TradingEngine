@@ -402,7 +402,7 @@ def print_scoreboard(results: list[ProfileScore], symbol: str) -> None:
 
 
 def save_artifacts(symbol: str, results: list[ProfileScore]) -> None:
-    """Write JSON + CSV summaries to artifacts/reports/."""
+    """Write JSON + CSV summaries to artifacts/reports/ and (if winner) production artifact."""
     out_dir = Path("artifacts/reports")
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -438,6 +438,48 @@ def save_artifacts(symbol: str, results: list[ProfileScore]) -> None:
             d["rejection_reasons"] = "; ".join(d.get("rejection_reasons", []))
             writer.writerow({k: d.get(k, "") for k in _CSV_FIELDS})
     log.info("Profile summary (CSV) → %s", csv_path)
+
+    # ── Production deployment artifact (winner only) ──────────────────────────
+    winner = pick_winner(ranked)
+    if winner is not None:
+        from src.deployment import write_deployment_artifact
+        from src.backtest.profile_eval import _profile_to_cfg_overrides
+        try:
+            profiles = load_profiles(symbol)
+            winner_profile = profiles.get(winner.profile_name, {})
+        except Exception:
+            winner_profile = {}
+        exec_overrides = _profile_to_cfg_overrides(winner_profile)
+        metrics = {
+            "profitable_folds":      winner.profitable_folds,
+            "n_folds":               winner.n_folds,
+            "avg_pf":                winner.avg_pf,
+            "t_stat":                winner.t_stat,
+            "pnl_cv":                winner.pnl_cv,
+            "avg_sharpe":            winner.avg_sharpe,
+            "avg_expectancy":        winner.avg_expectancy,
+            "total_pnl":             winner.total_pnl,
+            "composite_score":       winner.composite_score,
+            "block1_total_pnl":      winner.block1_total_pnl,
+            "block2_total_pnl":      winner.block2_total_pnl,
+            "trend_profitable_folds": winner.trend_profitable_folds,
+            "chop_dominated_folds":  winner.chop_dominated_folds,
+        }
+        dep_path = write_deployment_artifact(
+            symbol=symbol,
+            profile_name=winner.profile_name,
+            profile_config=winner_profile,
+            exec_cfg_overrides=exec_overrides,
+            metrics=metrics,
+        )
+        log.info(
+            "Production artifact → %s  [profile=%s  composite=%.3f]",
+            dep_path, winner.profile_name, winner.composite_score,
+        )
+    else:
+        log.warning(
+            "[%s] No accepted winner — production deployment artifact NOT written.", symbol
+        )
 
 
 # ── Main evaluation entry-point ───────────────────────────────────────────────

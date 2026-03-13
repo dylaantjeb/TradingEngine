@@ -72,10 +72,24 @@ _DEFAULTS = {
 }
 
 
-def _load_cfg(symbol: str) -> tuple[dict, dict]:
-    """Return (run_cfg, contract_specs_for_symbol)."""
+def _load_cfg(symbol: str, cfg_overrides: dict | None = None) -> tuple[dict, dict]:
+    """
+    Return (run_cfg, contract_specs_for_symbol).
+
+    Parameters
+    ----------
+    cfg_overrides : Optional dict of exec-layer overrides applied on top of
+                    universe.yaml after all sections are merged.  Keys match
+                    the same flat cfg keys used by the backtest engine
+                    (session_blocks, atr_min_ticks, trend_filter_enabled, etc.).
+                    Pass the result of ``get_exec_cfg_overrides(symbol)`` here
+                    to guarantee live-paper and backtest use identical config.
+    """
     if not _UNIVERSE_CFG_PATH.exists():
-        return dict(_DEFAULTS), {}
+        cfg = dict(_DEFAULTS)
+        if cfg_overrides:
+            cfg.update(cfg_overrides)
+        return cfg, {}
     with open(_UNIVERSE_CFG_PATH) as f:
         u = yaml.safe_load(f) or {}
 
@@ -99,6 +113,17 @@ def _load_cfg(symbol: str) -> tuple[dict, dict]:
     for k, v in ps.items():
         if k != "method":
             cfg[k] = v
+
+    # Apply execution-layer overrides last — these take precedence over all
+    # universe.yaml values.  Used to inject the accepted production profile's
+    # session_blocks, ATR limits, trend filter, throttles, etc.
+    if cfg_overrides:
+        cfg.update(cfg_overrides)
+        log.info(
+            "[%s] cfg_overrides applied (%d keys): %s",
+            symbol, len(cfg_overrides), sorted(cfg_overrides.keys()),
+        )
+
     specs = u.get("contract_specs", {}).get(symbol, {})
     return cfg, specs
 
@@ -129,18 +154,27 @@ def _in_blackout(ts: pd.Timestamp, windows: list) -> bool:
     return False
 
 
-def run_paper(symbol: str, csv_path: Path, bar_delay: float = 0.0) -> None:
+def run_paper(
+    symbol: str,
+    csv_path: Path,
+    bar_delay: float = 0.0,
+    cfg_overrides: dict | None = None,
+) -> None:
     """
     Stream `csv_path` bar-by-bar and simulate paper trading with 1-bar fill delay.
 
     Parameters
     ----------
-    symbol    : Symbol name (used to load artifacts + contract specs).
-    csv_path  : Raw OHLCV CSV from `fetch` (must have open column).
-    bar_delay : Optional sleep between bars in seconds (0 = max speed).
+    symbol        : Symbol name (used to load artifacts + contract specs).
+    csv_path      : Raw OHLCV CSV from `fetch` (must have open column).
+    bar_delay     : Optional sleep between bars in seconds (0 = max speed).
+    cfg_overrides : Optional exec-layer config overrides applied on top of
+                    universe.yaml.  Pass ``get_exec_cfg_overrides(symbol)``
+                    from ``src.deployment`` to run with the exact accepted
+                    production profile config.
     """
     model, scaler, feature_names, inv_label_map, schema_threshold = _load_artifacts(symbol)
-    cfg, specs = _load_cfg(symbol)
+    cfg, specs = _load_cfg(symbol, cfg_overrides=cfg_overrides)
 
     tick_size         = float(specs.get("tick_size", cfg.get("tick_size", 0.25)))
     multiplier        = float(specs.get("multiplier", cfg.get("multiplier", 50)))
