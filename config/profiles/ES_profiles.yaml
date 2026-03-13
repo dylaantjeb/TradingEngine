@@ -22,13 +22,17 @@ profiles:
 
   trend_conservative:
     description: >
-      High-confidence trend entries only. Long EMA, steep slope requirement,
-      tight session windows. Fewer trades, higher precision target.
+      High-confidence trend entries only. Long EMA, steep slope requirement.
+      Trades Block 1 only (US open / European close overlap) — the most
+      directional window for ES. Block 2 (US afternoon) removed: lower
+      volume and tighter ranges produce more chop-regime blocks relative
+      to trend entries, inflating chop_dominated_folds.
+      Higher atr_min_ticks (8) pre-filters low-vol/quiet bars before the
+      regime classifier is even consulted, further reducing chop exposure.
     threshold_candidates: [0.70, 0.75]
     session_blocks:
-      - [12.5, 16.0]   # Block 1: 12:30–16:00 UTC (US open)
-      - [18.0, 21.5]   # Block 2: 18:00–21:30 UTC (US afternoon)
-    atr_min_ticks: 6
+      - [12.5, 16.0]   # Block 1 only: 12:30–16:00 UTC (US open)
+    atr_min_ticks: 8   # raised from 6 — pre-filters choppy low-vol bars
     atr_max_ticks: 120
     trend_filter_enabled: true
     trend_filter_ema_period: 50
