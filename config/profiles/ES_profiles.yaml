@@ -1,0 +1,167 @@
+# ES Execution Profiles
+# =====================
+# Each profile defines EXECUTION-LAYER parameters only.
+# No feature engineering, model family, or cost model changes.
+#
+# Keys understood by evaluate_all_profiles():
+#   threshold_candidates   – list of confidence thresholds to sweep
+#   session_blocks         – [[h_start, h_end], ...] in decimal UTC hours
+#   atr_min_ticks          – minimum ATR in ticks to allow entry
+#   atr_max_ticks          – maximum ATR in ticks to allow entry
+#   trend_filter_enabled   – true/false
+#   trend_filter_ema_period – EMA lookback for trend direction
+#   trend_slope_min_atr_frac – min |EMA_slope| / ATR_pts to allow entry
+#   cooldown_bars_after_exit – bars to wait after any exit
+#   cooldown_bars_after_loss – bars to wait after a losing trade
+#   max_trades_per_day     – hard cap on new entries per calendar day
+#   min_holding_bars       – minimum bars before exit is allowed
+
+profiles:
+
+  # ── Trend profiles ─────────────────────────────────────────────────────────
+
+  trend_conservative:
+    description: >
+      High-confidence trend entries only. Long EMA, steep slope requirement,
+      tight session windows. Fewer trades, higher precision target.
+    threshold_candidates: [0.70, 0.75]
+    session_blocks:
+      - [12.5, 16.0]   # Block 1: 12:30–16:00 UTC (US open)
+      - [18.0, 21.5]   # Block 2: 18:00–21:30 UTC (US afternoon)
+    atr_min_ticks: 6
+    atr_max_ticks: 120
+    trend_filter_enabled: true
+    trend_filter_ema_period: 50
+    trend_slope_min_atr_frac: 0.25
+    cooldown_bars_after_exit: 8
+    cooldown_bars_after_loss: 12
+    max_trades_per_day: 4
+    min_holding_bars: 5
+
+  trend_balanced:
+    description: >
+      Balanced trend-following. Medium EMA, moderate slope gate.
+      Standard session blocks, moderate trade frequency.
+    threshold_candidates: [0.65, 0.70, 0.75]
+    session_blocks:
+      - [12.5, 16.0]
+      - [18.0, 21.5]
+    atr_min_ticks: 4
+    atr_max_ticks: 150
+    trend_filter_enabled: true
+    trend_filter_ema_period: 20
+    trend_slope_min_atr_frac: 0.15
+    cooldown_bars_after_exit: 5
+    cooldown_bars_after_loss: 8
+    max_trades_per_day: 6
+    min_holding_bars: 3
+
+  trend_aggressive:
+    description: >
+      Trend-following with lower threshold and shorter EMA. More signals,
+      lower per-trade precision. Good for trending markets.
+    threshold_candidates: [0.65, 0.70]
+    session_blocks:
+      - [12.5, 16.0]
+      - [18.0, 21.5]
+    atr_min_ticks: 3
+    atr_max_ticks: 200
+    trend_filter_enabled: true
+    trend_filter_ema_period: 10
+    trend_slope_min_atr_frac: 0.08
+    cooldown_bars_after_exit: 3
+    cooldown_bars_after_loss: 5
+    max_trades_per_day: 10
+    min_holding_bars: 2
+
+  # ── Regime profiles ─────────────────────────────────────────────────────────
+
+  regime_strict:
+    description: >
+      Strict regime confirmation. High threshold, both session blocks required,
+      strong slope gate. Only trade in clear trending regimes.
+    threshold_candidates: [0.70, 0.75]
+    session_blocks:
+      - [12.5, 16.0]
+      - [18.0, 21.5]
+    atr_min_ticks: 6
+    atr_max_ticks: 100
+    trend_filter_enabled: true
+    trend_filter_ema_period: 30
+    trend_slope_min_atr_frac: 0.20
+    cooldown_bars_after_exit: 10
+    cooldown_bars_after_loss: 15
+    max_trades_per_day: 3
+    min_holding_bars: 6
+
+  regime_balanced:
+    description: >
+      Balanced regime filter. Moderate threshold, full session coverage,
+      standard slope gate. Designed for stable OOS performance.
+    threshold_candidates: [0.65, 0.70, 0.75]
+    session_blocks:
+      - [12.5, 16.0]
+      - [18.0, 21.5]
+    atr_min_ticks: 5
+    atr_max_ticks: 130
+    trend_filter_enabled: true
+    trend_filter_ema_period: 20
+    trend_slope_min_atr_frac: 0.15
+    cooldown_bars_after_exit: 5
+    cooldown_bars_after_loss: 8
+    max_trades_per_day: 6
+    min_holding_bars: 4
+
+  regime_loose:
+    description: >
+      Relaxed regime conditions. Lower threshold, wider ATR band, minimal slope gate.
+      Allows entries in borderline regime conditions. Higher trade frequency.
+    threshold_candidates: [0.65, 0.70]
+    session_blocks:
+      - [12.5, 16.0]
+      - [18.0, 21.5]
+    atr_min_ticks: 3
+    atr_max_ticks: 180
+    trend_filter_enabled: true
+    trend_filter_ema_period: 10
+    trend_slope_min_atr_frac: 0.05
+    cooldown_bars_after_exit: 3
+    cooldown_bars_after_loss: 5
+    max_trades_per_day: 10
+    min_holding_bars: 2
+
+  # ── Session-specialised profiles ─────────────────────────────────────────────
+
+  early_session_only:
+    description: >
+      Trades only in Block 1 (12:30–16:00 UTC), the US open / European close
+      overlap. Higher volatility, stronger directional moves typical.
+    threshold_candidates: [0.65, 0.70, 0.75]
+    session_blocks:
+      - [12.5, 16.0]   # Block 1 only
+    atr_min_ticks: 5
+    atr_max_ticks: 200
+    trend_filter_enabled: true
+    trend_filter_ema_period: 20
+    trend_slope_min_atr_frac: 0.12
+    cooldown_bars_after_exit: 5
+    cooldown_bars_after_loss: 8
+    max_trades_per_day: 6
+    min_holding_bars: 3
+
+  late_session_only:
+    description: >
+      Trades only in Block 2 (18:00–21:30 UTC), the US afternoon session.
+      Typically lower volatility; uses tighter slope gate.
+    threshold_candidates: [0.65, 0.70, 0.75]
+    session_blocks:
+      - [18.0, 21.5]   # Block 2 only
+    atr_min_ticks: 4
+    atr_max_ticks: 150
+    trend_filter_enabled: true
+    trend_filter_ema_period: 20
+    trend_slope_min_atr_frac: 0.18
+    cooldown_bars_after_exit: 5
+    cooldown_bars_after_loss: 8
+    max_trades_per_day: 5
+    min_holding_bars: 3

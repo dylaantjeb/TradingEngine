@@ -163,6 +163,8 @@ def run_walk_forward(
     n_trials: int = 0,
     select_by: str = "f1",
     save_report: bool = True,
+    exec_cfg_overrides: Optional[dict] = None,
+    threshold_candidates: Optional[list] = None,
 ) -> WalkForwardSummary:
     """
     Run walk-forward / OOS validation.
@@ -176,9 +178,13 @@ def run_walk_forward(
     step_bars     : Step between folds (default = test_bars).
     min_train_bars: Expanding: minimum initial training size.
     split_pct     : Split mode: fraction for training (default 0.8).
-    n_trials      : Optuna trials per fold (0 = fast fixed hyperparameters).
-    select_by     : 'f1' | 'trading' — model selection objective per fold.
-    save_report   : Write JSON report to artifacts/reports/.
+    n_trials             : Optuna trials per fold (0 = fast fixed hyperparameters).
+    select_by            : 'f1' | 'trading' — model selection objective per fold.
+    save_report          : Write JSON report to artifacts/reports/.
+    exec_cfg_overrides   : Dict of execution-layer overrides applied on top of
+                           universe.yaml config (e.g. session_blocks, atr_min_ticks).
+    threshold_candidates : Override confidence threshold sweep list per fold.
+                           Passed to _select_best_threshold and Optuna objective.
     """
     if mode not in ("rolling", "expanding", "split"):
         raise ValueError(f"mode must be 'rolling', 'expanding', or 'split', got {mode!r}")
@@ -219,6 +225,9 @@ def run_walk_forward(
     # ── Engine config ──────────────────────────────────────────────────────
     from src.backtest.engine import _load_cfg
     cfg   = _load_cfg(symbol)
+    if exec_cfg_overrides:
+        cfg = dict(cfg)
+        cfg.update(exec_cfg_overrides)
     specs = _load_specs(symbol)
     starting_equity = float(cfg.get("starting_equity", 100_000.0))
 
@@ -259,6 +268,7 @@ def run_walk_forward(
         try:
             model, scaler, inv_label_map, conf_threshold = _train_on_slice(
                 train_df, feature_names, n_trials, select_by,
+                threshold_candidates=threshold_candidates,
             )
         except Exception as exc:
             log.warning("Fold %d  training failed: %s — skipping", fold_idx, exc)
@@ -420,6 +430,7 @@ def _train_on_slice(
     feature_names: list[str],
     n_trials: int = 0,
     select_by: str = "f1",
+    threshold_candidates: Optional[list] = None,
 ) -> tuple:
     """
     Train XGBoost + RobustScaler on train_df in memory.
@@ -470,6 +481,7 @@ def _train_on_slice(
         model, conf_threshold = _optuna_train(
             X_scaled, y_enc, y_raw, int_inv_map, n_trials, select_by,
             val_index=X_df.index,
+            threshold_candidates=threshold_candidates,
         )
     else:
         # Conservative fixed hyperparameters for OOS robustness
@@ -500,6 +512,7 @@ def _train_on_slice(
             conf_threshold  = _select_best_threshold(
                 inner_proba, y_inner_val_raw, int_inv_map,
                 n_val_bars=len(X_inner_val),
+                candidates=threshold_candidates,
             )
         else:
             conf_threshold = 0.65
@@ -515,6 +528,7 @@ def _optuna_train(
     n_trials: int,
     select_by: str = "f1",
     val_index=None,
+    threshold_candidates: Optional[list] = None,
 ) -> tuple:
     """
     Optuna hyperparameter search within a training slice.
@@ -588,7 +602,8 @@ def _optuna_train(
             return f1
 
         # Trading: threshold as Optuna parameter with same gate logic as train.py
-        threshold = trial.suggest_categorical("conf_threshold", _THRESHOLD_CANDIDATES)
+        _t_candidates = threshold_candidates if threshold_candidates is not None else _THRESHOLD_CANDIDATES
+        threshold = trial.suggest_categorical("conf_threshold", _t_candidates)
         proba = m.predict_proba(X_val)
         conf  = np.max(proba, axis=1)
         sig   = np.array([int_inv_map.get(int(e), 0) for e in np.argmax(proba, axis=1)])
@@ -657,6 +672,7 @@ def _optuna_train(
         proba          = model.predict_proba(X_val)
         conf_threshold = _select_best_threshold(
             proba, y_val_raw, int_inv_map, n_val_bars=n_val,
+            candidates=threshold_candidates,
         )
 
     return model, conf_threshold

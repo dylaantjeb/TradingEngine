@@ -152,10 +152,19 @@ def run_backtest(
     max_trades_per_day: int | None = None,
     slippage_ticks_per_side: float | None = None,
     commission_per_side_usd: float | None = None,
+    cfg_overrides: dict | None = None,
+    save_report: bool = True,
 ) -> dict[str, Any]:
     """
     Load model + features for `symbol`, run hardened backtest, persist report.
     Returns metrics dict.
+
+    Parameters
+    ----------
+    cfg_overrides : Dict of execution-layer overrides applied after _build_run_cfg.
+                    Use this to inject profile-specific params without modifying
+                    universe.yaml.
+    save_report   : If False, skip writing the JSON report to disk.
     """
     try:
         import joblib
@@ -173,6 +182,9 @@ def run_backtest(
             "commission_per_side_usd": commission_per_side_usd,
         },
     )
+    if cfg_overrides:
+        cfg = dict(cfg)
+        cfg.update(cfg_overrides)
 
     delay = int(cfg["execution_delay_bars"])
     if delay == 0:
@@ -562,21 +574,22 @@ def run_backtest(
             )
 
     # ── Save report ─────────────────────────────────────────────────────────────
-    report_dir  = Path("artifacts/reports")
-    report_dir.mkdir(parents=True, exist_ok=True)
-    report_path = report_dir / f"{symbol}_backtest.json"
+    if save_report:
+        report_dir  = Path("artifacts/reports")
+        report_dir.mkdir(parents=True, exist_ok=True)
+        report_path = report_dir / f"{symbol}_backtest.json"
 
-    report = {
-        "symbol":          symbol,
-        "run_at":          datetime.utcnow().isoformat(),
-        "cfg":             {k: str(v) for k, v in cfg.items()},
-        "metrics":         metrics,
-        "filter_counters": cost_summary.get("filter_counters", {}),
-        "trades":          trades[:500],
-        "equity_curve":    equity_curve.round(2).tolist(),
-    }
-    report_path.write_text(json.dumps(report, indent=2, default=str))
-    log.info("Report saved to %s", report_path)
+        report = {
+            "symbol":          symbol,
+            "run_at":          datetime.utcnow().isoformat(),
+            "cfg":             {k: str(v) for k, v in cfg.items()},
+            "metrics":         metrics,
+            "filter_counters": cost_summary.get("filter_counters", {}),
+            "trades":          trades[:500],
+            "equity_curve":    equity_curve.round(2).tolist(),
+        }
+        report_path.write_text(json.dumps(report, indent=2, default=str))
+        log.info("Report saved to %s", report_path)
 
     return metrics
 

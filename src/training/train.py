@@ -623,9 +623,10 @@ def _select_best_threshold(
     y_raw: np.ndarray,
     inv_label_map: dict,
     n_val_bars: int,
+    candidates: list[float] | None = None,
 ) -> float:
     """
-    Sweep _THRESHOLD_CANDIDATES and return the one that maximises trading
+    Sweep threshold candidates and return the one that maximises trading
     quality while passing all four hard gates.
 
     Falls back to _DEFAULT_THRESHOLD (0.65) when no candidate passes.
@@ -637,18 +638,21 @@ def _select_best_threshold(
     inv_label_map : Mapping from encoded class → original label.
                     Accepts both int-keyed and str-keyed dicts.
     n_val_bars    : Total validation bars (denominator for coverage).
+    candidates    : Override threshold list. Uses _THRESHOLD_CANDIDATES when None.
 
     Returns
     -------
-    Selected threshold float from _THRESHOLD_CANDIDATES.
+    Selected threshold float from candidates (or _THRESHOLD_CANDIDATES).
     """
     # Normalise keys so _compute_trading_stats always finds them
     norm_map = {int(k): v for k, v in inv_label_map.items()}
 
+    sweep = candidates if candidates is not None else _THRESHOLD_CANDIDATES
+
     best_tq = -float("inf")
     best_t  = _DEFAULT_THRESHOLD
 
-    for t in _THRESHOLD_CANDIDATES:
+    for t in sweep:
         stats = _compute_trading_stats(
             proba, y_raw, norm_map, min_conf=t, n_val_bars=n_val_bars,
         )
