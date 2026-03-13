@@ -159,6 +159,33 @@ def cmd_walk_forward(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_evaluate_profiles(args: argparse.Namespace) -> None:
+    """Evaluate all execution profiles and determine if strategy is READY."""
+    from src.backtest.profile_eval import (
+        evaluate_all_profiles,
+        print_scoreboard,
+        save_artifacts,
+        pick_winner,
+    )
+
+    results = evaluate_all_profiles(
+        symbol=args.symbol,
+        n_trials=args.trials,
+        select_by=getattr(args, "select_by", "f1"),
+        train_bars=args.train_bars,
+        test_bars=args.test_bars,
+        run_backtest=not getattr(args, "no_backtest", True),
+    )
+
+    print_scoreboard(results, symbol=args.symbol)
+    save_artifacts(args.symbol, results)
+
+    winner = pick_winner(results)
+    if winner is None:
+        import sys
+        sys.exit(2)   # non-zero exit → CI/CD can detect NO WINNER
+
+
 def cmd_explain_signal(args: argparse.Namespace) -> None:
     """Explain the signal for the most recent bar in a CSV file."""
     import pandas as pd
@@ -371,6 +398,35 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_wf.set_defaults(func=cmd_walk_forward)
+
+    # ── evaluate-profiles ──────────────────────────────────────────────────────
+    p_ep = sub.add_parser(
+        "evaluate-profiles",
+        help="Batch-evaluate all execution profiles and rank them",
+    )
+    p_ep.add_argument("--symbol", required=True, help="Symbol (must have processed data)")
+    p_ep.add_argument(
+        "--trials", type=int, default=20,
+        help="Optuna trials per fold per profile (0 = fast fixed params, default 20)",
+    )
+    p_ep.add_argument(
+        "--train-bars", dest="train_bars", type=int, default=10_000,
+        help="Walk-forward training window in bars (default 10000)",
+    )
+    p_ep.add_argument(
+        "--test-bars", dest="test_bars", type=int, default=2_000,
+        help="Walk-forward test window in bars (default 2000)",
+    )
+    p_ep.add_argument(
+        "--select-by", dest="select_by", default="f1",
+        choices=["f1", "trading"],
+        help="Per-fold model selection objective (default f1)",
+    )
+    p_ep.add_argument(
+        "--no-backtest", dest="no_backtest", action="store_true",
+        help="Skip standalone backtest per profile (default: skip)",
+    )
+    p_ep.set_defaults(func=cmd_evaluate_profiles)
 
     # ── explain-signal ─────────────────────────────────────────────────────────
     p_exp = sub.add_parser(
