@@ -216,9 +216,15 @@ def _evaluate_profile(
     max_dd      = max(dd_values, default=0.0)
     total_pnl   = sum(pnl_values)
 
-    # CV and t-stat from aggregate if available, else compute
-    pnl_cv   = float(agg.get("pnl_cv",   _safe_cv(pnl_values)))
-    t_stat   = float(agg.get("t_stat",   _safe_tstat(pnl_values)))
+    # CV and t-stat: prefer aggregate pre-computed value, fall back to local calc.
+    # Must use _coalesce_metric — both keys can exist in the dict with value None:
+    #   "pnl_cv"     → None when mean_pnl <= 0  (walk_forward._aggregate line ~1057)
+    #   "t_stat_pnl" → None when n < 2 or std == 0  (walk_forward._aggregate line ~1062)
+    # dict.get(key, default) only uses the default when the key is absent; a
+    # present-but-None value passes straight through and crashes float(None).
+    # Note: the aggregate key is "t_stat_pnl", not "t_stat".
+    pnl_cv = _coalesce_metric(agg.get("pnl_cv"),      _safe_cv(pnl_values))
+    t_stat = _coalesce_metric(agg.get("t_stat_pnl"),  _safe_tstat(pnl_values))
     pct_prof = profitable_folds / n_folds if n_folds else 0.0
 
     # Session block totals
@@ -479,6 +485,19 @@ def evaluate_all_profiles(
 
 
 # ── Helper maths ─────────────────────────────────────────────────────────────
+
+def _coalesce_metric(value: Any, fallback: float) -> float:
+    """Return `fallback` when `value` is None, otherwise cast to float.
+
+    Needed because dict.get(key, default) only uses the default when the key is
+    *absent*; when the key exists with an explicit None value (as _aggregate does
+    for pnl_cv when mean_pnl ≤ 0 and for t_stat_pnl when n < 2), .get() returns
+    None and float(None) raises TypeError.
+    """
+    if value is None:
+        return fallback
+    return float(value)
+
 
 def _safe_cv(values: list[float]) -> float:
     if len(values) < 2:
