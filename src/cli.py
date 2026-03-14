@@ -426,6 +426,140 @@ def cmd_explain_signal(args: argparse.Namespace) -> None:
     print(f"{'='*60}\n")
 
 
+def cmd_run_production(args: argparse.Namespace) -> None:
+    """
+    Run the production engine with the rules-first architecture and FundedGuard.
+
+    This command is the ONLY correct way to run the funded-account strategy in
+    production or final paper-test mode.  It refuses to start if:
+
+      - config/production_<SYMBOL>.yaml does not exist
+      - The deployment artifact does not exist or is not in a deployable state
+      - Any health check fails
+
+    Architecture:
+      EMA momentum rules (PRIMARY) → ML veto (≥0.65 conf + direction match) →
+      FundedGuard ($500 daily halt / $300 soft / $3000 max DD)
+
+    Usage:
+      python -m src.cli run-production --symbol ES --input data/raw/ES_M1.csv
+    """
+    import yaml
+
+    symbol = args.symbol
+    prod_cfg_path = Path(f"config/production_{symbol}.yaml")
+
+    # ── 1. Require production config ─────────────────────────────────────────
+    if not prod_cfg_path.exists():
+        log.error(
+            "[%s] Production config not found: %s\n"
+            "  Create config/production_%s.yaml before running run-production.\n"
+            "  See config/production_ES.yaml for the canonical template.",
+            symbol, prod_cfg_path, symbol,
+        )
+        sys.exit(1)
+
+    with open(prod_cfg_path) as f:
+        prod_cfg = yaml.safe_load(f) or {}
+
+    # Flatten the nested production config into the overrides dict that
+    # run_paper / health checks expect.
+    _sig   = prod_cfg.get("signal",    {})
+    _vol   = prod_cfg.get("volatility",{})
+    _ml    = prod_cfg.get("ml_veto",   {})
+    _trade = prod_cfg.get("trade",     {})
+    _thr   = prod_cfg.get("throttles", {})
+    _costs = prod_cfg.get("costs",     {})
+    _risk  = prod_cfg.get("risk",      {})
+    _sess  = prod_cfg.get("session",   {})
+    _cont  = prod_cfg.get("contract",  {})
+
+    # Build session blocks from start/end strings
+    def _parse_hour(t: str) -> float:
+        h, m = map(int, t.split(":"))
+        return h + m / 60.0
+
+    _s_start = _parse_hour(_sess.get("start_utc", "13:30"))
+    _s_end   = _parse_hour(_sess.get("end_utc",   "16:00"))
+
+    cfg_overrides: dict = {
+        # Session
+        "session_blocks":             [[_s_start, _s_end]],
+        # Signal config (stored nested so paper_engine can read them)
+        "signal":                     _sig,
+        "signal_ema_period":          int(_sig.get("ema_period", 20)),
+        "signal_slope_lookback_bars": int(_sig.get("slope_lookback_bars", 5)),
+        "signal_min_slope_atr_frac":  float(_sig.get("min_slope_atr_frac", 0.12)),
+        # Volatility
+        "atr_min_ticks":              float(_vol.get("atr_min_ticks", 5)),
+        "atr_max_ticks":              float(_vol.get("atr_max_ticks", 150)),
+        # ML veto
+        "min_long_confidence":        float(_ml.get("min_confidence", 0.65)),
+        "min_short_confidence":       float(_ml.get("min_confidence", 0.65)),
+        # Trend filter kept on (rules signal provides direction; EMA filter aligns)
+        "trend_filter_enabled":       True,
+        "trend_filter_ema_period":    int(_sig.get("ema_period", 20)),
+        "trend_slope_min_atr_frac":   float(_sig.get("min_slope_atr_frac", 0.12)),
+        # Trade params
+        "execution_delay_bars":       int(_trade.get("execution_delay_bars", 1)),
+        "atr_stop_multiplier":        float(_trade.get("atr_stop_multiplier", 2.0)),
+        "atr_target_multiplier":      float(_trade.get("atr_target_multiplier", 3.0)),
+        # Throttles
+        "max_trades_per_day":         int(_thr.get("max_trades_per_day", 4)),
+        "cooldown_bars_after_exit":   int(_thr.get("cooldown_bars_after_exit", 1)),
+        "cooldown_bars_after_loss":   int(_thr.get("cooldown_bars_after_loss", 3)),
+        "min_holding_bars":           int(_thr.get("min_holding_bars", 1)),
+        # Costs
+        "commission_per_side_usd":    float(_costs.get("commission_per_side_usd", 1.50)),
+        "slippage_ticks_per_side":    float(_costs.get("slippage_ticks_per_side", 1.0)),
+        "spread_ticks":               float(_costs.get("spread_ticks", 1.0)),
+        # Risk (nested — FundedGuard reads this dict directly)
+        "risk":                       _risk,
+        "starting_equity":            float(_risk.get("starting_equity_usd", 50000.0)),
+        "max_daily_loss_usd":         float(_risk.get("daily_loss_hard_usd", 500.0)),
+        "max_total_drawdown_usd":     float(_risk.get("max_drawdown_usd", 3000.0)),
+        "max_consecutive_losses":     int  (_risk.get("max_consecutive_losses", 3)),
+        # Contract
+        "tick_size":                  float(_cont.get("tick_size", 0.25)),
+        "multiplier":                 float(_cont.get("multiplier", 50)),
+        "fixed_contracts":            int  (_risk.get("contracts", 1)),
+        "max_contracts":              int  (_risk.get("max_contracts", 2)),
+    }
+
+    # ── 2. Require valid deployment artifact + health checks ─────────────────
+    from src.deployment import assert_health_or_abort
+    assert_health_or_abort(symbol, cfg_overrides, require_artifact=True, mode="run-production")
+
+    # ── 3. Research-mode warning ──────────────────────────────────────────────
+    log.info(
+        "[%s] run-production: rules-first engine active\n"
+        "  Signal:    EMA(%d) momentum + slope quality gate (min_frac=%.2f)\n"
+        "  ML veto:   conf >= %.2f + direction match required\n"
+        "  Session:   %s – %s UTC (%.1f – %.1f)\n"
+        "  FundedGuard: hard=$%.0f  soft=$%.0f  trail_dd=$%.0f  max_dd=$%.0f",
+        symbol,
+        int(_sig.get("ema_period", 20)),
+        float(_sig.get("min_slope_atr_frac", 0.12)),
+        float(_ml.get("min_confidence", 0.65)),
+        _sess.get("start_utc", "13:30"), _sess.get("end_utc", "16:00"),
+        _s_start, _s_end,
+        float(_risk.get("daily_loss_hard_usd", 500)),
+        float(_risk.get("daily_loss_soft_usd", 300)),
+        float(_risk.get("trailing_drawdown_usd", 2000)),
+        float(_risk.get("max_drawdown_usd", 3000)),
+    )
+
+    # ── 4. Run ────────────────────────────────────────────────────────────────
+    from src.live.paper_engine import run_paper
+    run_paper(
+        symbol           = symbol,
+        csv_path         = Path(args.input),
+        bar_delay        = getattr(args, "bar_delay", 0.0),
+        cfg_overrides    = cfg_overrides,
+        use_rules_signal = True,
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Parser
 # ──────────────────────────────────────────────────────────────────────────────
@@ -719,6 +853,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Account equity for position-size calculation (default $100,000)",
     )
     p_exp.set_defaults(func=cmd_explain_signal)
+
+    # ── run-production ─────────────────────────────────────────────────────────
+    p_rp = sub.add_parser(
+        "run-production",
+        help=(
+            "Run the rules-first production engine with FundedGuard governance. "
+            "Requires config/production_<SYMBOL>.yaml and a valid deployment artifact."
+        ),
+    )
+    p_rp.add_argument("--symbol", required=True, help="Symbol, e.g. ES")
+    p_rp.add_argument(
+        "--input", required=True,
+        help="Path to OHLCV CSV to stream (e.g. data/raw/ES_M1.csv)",
+    )
+    p_rp.add_argument(
+        "--bar-delay", dest="bar_delay", type=float, default=0.0,
+        help="Optional sleep between bars in seconds (0 = max speed, default 0)",
+    )
+    p_rp.set_defaults(func=cmd_run_production)
 
     return parser
 
