@@ -397,43 +397,10 @@ def run_backtest(
         ema_series = _raw_ema - _raw_ema.shift(5)   # slope = delta over 5 bars
         log.info("Trend filter enabled: EMA(%d) slope", ema_period)
 
-    # ── ATR volatility regime ────────────────────────────────────────────────────
-    # volatility_regime = ATR / rolling_mean(ATR, 100)
-    # Skip trading when regime < 0.8 to avoid low-volatility chop.
-    atr_regime_series = (
-        atr_ticks_series / atr_ticks_series.rolling(100, min_periods=20).mean()
-    ).fillna(1.0)  # default 1.0 (pass) when history is insufficient
-
-    # ── Regime classifier ────────────────────────────────────────────────────────
-    # Classify each bar: trend (1) = tradeable, chop (0) = blocked,
-    # low_vol (-1) = blocked.  New entries are only allowed in trend regime.
-    # Uses: ATR regime, |EMA(20) slope| / ATR, vol_regime_20_60 feature.
-    _regime_ema20      = close_prices.ewm(span=20, adjust=False).mean()
-    _regime_slope_abs  = (_regime_ema20 - _regime_ema20.shift(5)).abs().reindex(common_idx).fillna(0.0)
-    _atr_pts           = (atr_ticks_series * tick_size).replace(0, np.nan)
-    _trend_str         = (_regime_slope_abs / _atr_pts).fillna(0.0)
-    if "vol_regime_20_60" in features.columns:
-        _vol_regime = features["vol_regime_20_60"].reindex(common_idx).fillna(1.0)
-    else:
-        _vol_regime = pd.Series(1.0, index=common_idx)
-    _is_low_vol    = (atr_regime_series < 0.8) | (_vol_regime < 0.7)
-    _is_trend      = (~_is_low_vol) & (_trend_str >= 0.08)
-    regime_series  = pd.Series(
-        np.where(_is_trend, 1, np.where(_is_low_vol, -1, 0)), index=common_idx,
-    )
-    _rn_trend  = int((regime_series == 1).sum())
-    _rn_chop   = int((regime_series == 0).sum())
-    _rn_lv     = int((regime_series == -1).sum())
-    _rn_total  = len(regime_series)
-    log.info(
-        "[%s] Regime distribution: trend=%d (%.1f%%) | chop=%d (%.1f%%) | low_vol=%d (%.1f%%)",
-        symbol,
-        _rn_trend,  100 * _rn_trend / max(_rn_total, 1),
-        _rn_chop,   100 * _rn_chop  / max(_rn_total, 1),
-        _rn_lv,     100 * _rn_lv    / max(_rn_total, 1),
-    )
-
     # ── Simulate trades ─────────────────────────────────────────────────────────
+    # Regime classifier removed: ATR filter + trend filter are sufficient.
+    # The 3-layer regime stack (ATR regime + vol_regime_20_60 + EMA slope)
+    # caused zero-trade folds by requiring all three to agree simultaneously.
     trades, equity_curve, cost_summary = _simulate_trades(
         signals            = sig_series,
         open_prices        = open_prices,
@@ -445,8 +412,8 @@ def run_backtest(
         conf_series        = conf_series,
         close_prices       = close_prices,
         ema_series         = ema_series,
-        atr_regime_series  = atr_regime_series,
-        regime_series      = regime_series,
+        atr_regime_series  = pd.Series(1.0, index=common_idx),  # disabled
+        regime_series      = pd.Series(1,   index=common_idx),   # always pass
     )
 
     # ── Metrics ─────────────────────────────────────────────────────────────────

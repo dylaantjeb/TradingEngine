@@ -309,6 +309,11 @@ def run_paper(
         ema_all = (_raw_ema_s - _raw_ema_s.shift(5)).values
         log.info("Trend filter enabled: EMA(%d) slope", trend_ema_period)
 
+    # Regime classifier removed — ATR filter + trend filter are sufficient.
+    # Pass-through arrays: every bar passes this stage.
+    _atr_regime_all = np.ones(len(all_features), dtype=np.float32)
+    _regime_all     = np.ones(len(all_features), dtype=np.int8)
+
     # ── Rules-first signal path (pre-compute) ────────────────────────────────
     _rules_sig_all: Optional[np.ndarray] = None
     _rules_ema_all: Optional[np.ndarray] = None   # EMA values (not slope) for bar signal

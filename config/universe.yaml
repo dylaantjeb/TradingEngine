@@ -1,102 +1,84 @@
 # Trading universe configuration.
-# The backtest command iterates over all symbols listed here.
+# ================================
+# Single symbol. Single session window. Funded-account defaults.
 #
-# Philosophy: fewer, higher-quality trades over many unstable ones.
-# Every threshold below is biased towards funded-account safety.
+# Philosophy: survival first. Every default below is biased towards
+# funded-account safety, not maximum PnL.
 
 symbols:
   - ES
 
-# ── Execution hardening ────────────────────────────────────────────────────────
+# ── Execution ─────────────────────────────────────────────────────────────────
 execution:
-  execution_delay_bars: 1       # 0 = same-bar (leaky, debug only); 1 = next-bar fill
+  execution_delay_bars: 1   # always 1 — next-bar fills only
 
-# ── Cost model ─────────────────────────────────────────────────────────────────
+# ── Cost model ────────────────────────────────────────────────────────────────
 cost_model:
   commission_per_side_usd: 1.50
-  slippage_ticks_per_side: 0.5
+  slippage_ticks_per_side: 1.0   # conservative: 1 tick per side for ES M1
   spread_ticks: 1.0
 
-# ── Filters ────────────────────────────────────────────────────────────────────
+# ── Session ───────────────────────────────────────────────────────────────────
+# US equity open window only. Block 2 (afternoon) removed — consistently
+# underperforms and adds noise. Entries blocked outside this window.
 filters:
-  # ES CME Globex — two explicit trading blocks (UTC).
-  # Block 1 = pre-open + morning: 12:30–16:00 UTC (07:30–11:00 ET summer).
-  # Block 2 = afternoon/close:    18:00–21:30 UTC (13:00–16:30 ET summer).
-  # Signals outside both blocks are hard-blocked (no trades).
   session_blocks:
-    - [12.5, 16.0]   # Block 1: 12:30–16:00 UTC
-    - [18.0, 21.5]   # Block 2: 18:00–21:30 UTC
-  # Legacy single-window fallback (used when session_blocks is empty).
-  session_start_utc_hour: 12.5
-  session_end_utc_hour:   21.5
-  # ATR filter: only trade when volatility is meaningful but not runaway
-  atr_min_ticks: 4              # restored from 6 — 6 was filtering too aggressively
-  atr_max_ticks: 150            # raised from 100 — allow moderately elevated vola
+    - [13.5, 16.0]   # 13:30-16:00 UTC = NYSE open
+  session_start_utc_hour: 13.5   # fallback for legacy single-window path
+  session_end_utc_hour:   16.0
+  atr_min_ticks: 8     # require real movement at entry
+  atr_max_ticks: 100   # cap extreme volatility
   news_blackout_windows: []
 
-# ── Signal confidence gating ────────────────────────────────────────────────────
-# The schema threshold (saved by train.py) overrides these at runtime.
-# These values serve only as a last-resort fallback when no schema is loaded.
+# ── Signal confidence gate ────────────────────────────────────────────────────
+# ML veto only. Schema threshold (set during training) overrides these.
 confidence:
   min_long_confidence: 0.60
   min_short_confidence: 0.60
 
-# ── Structural trend filter ─────────────────────────────────────────────────────
-# Long signals blocked when close < EMA(ema_period).
-# Short signals blocked when close > EMA(ema_period).
+# ── Trend filter ──────────────────────────────────────────────────────────────
+# EMA100(M1) ≈ EMA20(M5). Slope gate ensures real trend, not drift.
 trend_filter:
   enabled: true
-  ema_period: 20
-  min_slope_atr_frac: 0.15   # min |EMA_slope| / ATR_pts to allow entry (0 = disabled)
+  ema_period: 100
+  min_slope_atr_frac: 0.15
 
-# ── Prop-firm style risk limits ─────────────────────────────────────────────────
-# Conservative limits matching typical 10% max-drawdown funded-account rules.
+# ── Funded-account risk limits ────────────────────────────────────────────────
+# Calibrated for a $50k funded account with 1% daily loss limit.
 risk_limits:
-  starting_equity: 100000.0
-  max_daily_loss_usd: 1000.0     # raised from 800 — less hair-trigger daily halt
-  max_daily_loss_pct: 0.02       # raised from 0.015
-  max_total_drawdown_usd: 3000.0 # raised from 2500
-  max_total_drawdown_pct: 0.06   # raised from 0.05
-  max_consecutive_losses: 4      # raised from 3 — 3 was halting too easily
-  cooldown_bars_after_loss: 5    # reduced from 20 — 20 M1 bars = 20 min dead time
+  starting_equity: 50000.0
+  max_daily_loss_usd: 500.0      # 1% of $50k — hard funded-account limit
+  max_daily_loss_pct: 0.01
+  max_total_drawdown_usd: 2000.0 # 4% of $50k
+  max_total_drawdown_pct: 0.04
+  max_consecutive_losses: 2      # stop after 2 losses — no revenge trading
+  cooldown_bars_after_loss: 20   # 20-min hard pause after any loss
 
-# ── Trade frequency throttles ──────────────────────────────────────────────────
-# Previous values caused extreme suppression:
-#   min_holding=8 + cooldown_exit=10 + cooldown_loss=20 = 38-bar dead-zone/cycle.
-# With 300 session bars/day and 38-bar cycles, only ~8 trades/day are physically
-# possible — then max_trades_per_day=4 caps it further.
-# New values reduce the dead-zone to ~11 bars, allowing ~38 trades/day (before cap).
+# ── Trade frequency throttles ─────────────────────────────────────────────────
+# 2 trades/day maximum. This is not a frequency game.
 throttles:
-  max_trades_per_day: 6          # raised from 4
-  min_holding_bars: 3            # reduced from 8 — 8 min was blocking reversal signals
-  cooldown_bars_after_exit: 3    # reduced from 10 — 10 min dead time was too long
+  max_trades_per_day: 2
+  min_holding_bars: 3
+  cooldown_bars_after_exit: 5
   max_concurrent_positions: 1
 
-# ── Position sizing ─────────────────────────────────────────────────────────────
-# Fixed 1 contract. Do not change to risk-based until strategy is FUNDED-READY.
+# ── Position sizing ───────────────────────────────────────────────────────────
 position_sizing:
   method: fixed
   fixed_contracts: 1
-  risk_per_trade_usd: 500.0
-  risk_per_trade_pct: 0.01
-  atr_stop_multiplier: 1.5
-  max_contracts: 1               # hard cap at 1 — no pyramiding during validation
+  risk_per_trade_usd: 250.0     # 0.5% of $50k per trade
+  risk_per_trade_pct: 0.005
+  atr_stop_multiplier: 2.0      # stop = 2×ATR
+  atr_target_multiplier: 2.2    # target = 2.2×ATR (R:R = 1.1 — boring but real)
+  max_contracts: 1              # no pyramiding during validation
 
-# ── Contract specs ─────────────────────────────────────────────────────────────
+# ── Contract specs ────────────────────────────────────────────────────────────
 contract_specs:
   ES:
     multiplier: 50
     tick_size: 0.25
     tick_value: 12.50
-  NQ:
-    multiplier: 20
-    tick_size: 0.25
-    tick_value: 5.00
   MES:
     multiplier: 5
     tick_size: 0.25
     tick_value: 1.25
-  MNQ:
-    multiplier: 2
-    tick_size: 0.25
-    tick_value: 0.50

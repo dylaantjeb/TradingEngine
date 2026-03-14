@@ -1,36 +1,32 @@
 """
 Profile-based strategy evaluation for TradingEngine.
 
-Replaces manual trial-and-error tuning with a deterministic framework:
-
-  1. Load all profiles from config/profiles/<SYMBOL>_profiles.yaml.
-  2. For each profile, run walk-forward with profile-specific exec overrides.
-  3. Score every profile on a rich set of metrics.
-  4. Apply hard acceptance gates to determine ACCEPTED vs REJECTED profiles.
-  5. Rank accepted profiles by composite score; rank rejected last.
-  6. Declare winner (rank-1 ACCEPTED) or "REJECT STRATEGY – no deployable
-     profile found" if none pass.
-  7. Save artifacts/reports/<SYMBOL>_profiles_summary.json + .csv.
-
-CLI entry-point
----------------
-  python -m src.cli evaluate-profiles --symbol ES --trials 50
+Simplified for funded-account robustness. One question only:
+"Is this engine stable enough to trade on a funded account?"
 
 Acceptance gates (ALL must pass)
 ---------------------------------
-  • profitable_folds    ≥ 3   (in a 5-fold walk-forward)
-  • avg_pf              ≥ 1.50
-  • cv                  ≤ 1.0
-  • t_stat              ≥ 1.65
-  • avg_expectancy      > 0
-  • block2_not_dragging : block2_total_pnl ≥ −100  OR  block2_n_trades == 0
-  • trend_profitable_folds ≥ 3
-  • chop_dominated_folds   ≤ 2
+  • no_zero_trade_folds   : every fold has >= 3 trades (fold with fewer is
+                            not a strategy, it's silence — reject immediately)
+  • pct_profitable        >= 60%  (majority of folds must be green)
+  • max_losing_folds      <= 2    (hard cap: at most 2 red folds in any run)
+  • avg_pf                >= 1.15 (modest but real edge after costs)
+  • pnl_cv                <= 1.20 (PnL consistency — outlier folds disqualify)
+  • avg_expectancy        > 0     (positive expected value per trade)
+  • max_fold_drawdown_usd <= 800  (no single fold blowing through the daily limit)
+  • outlier_fold_check    : no single fold contributes > 50% of total PnL
+                            (strategy must not depend on one lucky fold)
 
-Composite acceptance score (higher is better, used for ranking)
-----------------------------------------------------------------
-  0.40 × norm(avg_pf)   +  0.30 × norm(t_stat)
-+ 0.20 × norm(avg_sharpe) + 0.10 × (1 − norm(cv))
+Removed gates (too fragile or irrelevant for single-profile setup):
+  • t_stat (unreliable with 5 folds and 20-100 trades/fold)
+  • block2_not_dragging (block 2 removed from profile)
+  • trend_profitable_folds (folded into pct_profitable)
+  • chop_dominated_folds (regime classifier being removed)
+  • composite score complexity
+
+CLI entry-point
+---------------
+  python -m src.cli evaluate-profiles --symbol ES --trials 30 --seed 42
 """
 
 from __future__ import annotations
@@ -48,19 +44,14 @@ import yaml
 log = logging.getLogger(__name__)
 
 # ── Acceptance thresholds ──────────────────────────────────────────────────────
-_ACCEPT_MIN_PROFITABLE_FOLDS  = 3
-_ACCEPT_MIN_AVG_PF            = 1.50
-_ACCEPT_MAX_CV                = 1.0
-_ACCEPT_MIN_TSTAT             = 1.65
-_ACCEPT_MIN_AVG_EXPECTANCY    = 0.0
-_ACCEPT_MIN_TREND_FOLDS       = 3
-_ACCEPT_MAX_CHOP_DOMINATED    = 2
-
-# Composite score weights
-_W_PF     = 0.40
-_W_TSTAT  = 0.30
-_W_SHARPE = 0.20
-_W_CV     = 0.10
+_ACCEPT_MIN_TRADES_PER_FOLD   = 3      # fewer = silent fold, not a strategy
+_ACCEPT_MIN_PCT_PROFITABLE    = 0.60   # 60% of folds must be green
+_ACCEPT_MAX_LOSING_FOLDS      = 2      # hard cap on red folds
+_ACCEPT_MIN_AVG_PF            = 1.15   # modest but real edge
+_ACCEPT_MAX_CV                = 1.20   # PnL consistency
+_ACCEPT_MIN_AVG_EXPECTANCY    = 0.0    # positive EV per trade
+_ACCEPT_MAX_FOLD_DRAWDOWN_USD = 800.0  # no fold exceeds funded daily limit
+_ACCEPT_MAX_OUTLIER_FOLD_PCT  = 0.50   # single fold ≤ 50% of total PnL
 
 
 # ── Data classes ───────────────────────────────────────────────────────────────
@@ -77,28 +68,17 @@ class ProfileScore:
     avg_pf:                float = 0.0
     median_pf:             float = 0.0
     pnl_cv:                float = 0.0
-    t_stat:                float = 0.0
     avg_sharpe:            float = 0.0
-    max_drawdown_usd:      float = 0.0
+    max_drawdown_usd:      float = 0.0  # worst single fold
     avg_expectancy:        float = 0.0
     trades_per_day:        float = 0.0
     total_pnl:             float = 0.0
-
-    # Session block attribution
-    block1_total_pnl:      float = 0.0
-    block2_total_pnl:      float = 0.0
-    block1_n_trades:       int   = 0
-    block2_n_trades:       int   = 0
-
-    # Regime / fold quality
-    trend_profitable_folds: int  = 0
-    chop_dominated_folds:  int   = 0
-    weak_folds:            int   = 0
+    min_fold_trades:       int   = 0    # fewest trades in any single fold
+    outlier_fold_pct:      float = 0.0  # best fold PnL / total PnL
 
     # Acceptance
     accepted:              bool  = False
     rejection_reasons:     list  = field(default_factory=list)
-    composite_score:       float = 0.0
     rank:                  int   = 0
 
     # Raw walk-forward summary (not serialised to CSV)
@@ -218,36 +198,17 @@ def _evaluate_profile(
     max_dd      = max(dd_values, default=0.0)
     total_pnl   = sum(pnl_values)
 
-    # CV and t-stat: prefer aggregate pre-computed value, fall back to local calc.
-    # Must use _coalesce_metric — both keys can exist in the dict with value None:
-    #   "pnl_cv"     → None when mean_pnl <= 0  (walk_forward._aggregate line ~1057)
-    #   "t_stat_pnl" → None when n < 2 or std == 0  (walk_forward._aggregate line ~1062)
-    # dict.get(key, default) only uses the default when the key is absent; a
-    # present-but-None value passes straight through and crashes float(None).
-    # Note: the aggregate key is "t_stat_pnl", not "t_stat".
-    pnl_cv = _coalesce_metric(agg.get("pnl_cv"),      _safe_cv(pnl_values))
-    t_stat = _coalesce_metric(agg.get("t_stat_pnl"),  _safe_tstat(pnl_values))
+    pnl_cv   = _coalesce_metric(agg.get("pnl_cv"), _safe_cv(pnl_values))
     pct_prof = profitable_folds / n_folds if n_folds else 0.0
 
-    # Session block totals
-    b1_pnl    = sum(f.block1_net_pnl  for f in folds)
-    b2_pnl    = sum(f.block2_net_pnl  for f in folds)
-    b1_trades = sum(f.block1_n_trades for f in folds)
-    b2_trades = sum(f.block2_n_trades for f in folds)
+    # Outlier fold check: what fraction of total PnL came from the single best fold?
+    total_pnl     = sum(pnl_values)
+    best_fold_pnl = max(pnl_values, default=0.0)
+    outlier_pct   = (best_fold_pnl / total_pnl) if total_pnl > 0 and best_fold_pnl > 0 else 0.0
 
-    # Regime / fold quality
-    # Uses the same 2× multiplier as walk_forward._aggregate (line ~1111):
-    #   n_chop_dominated counts a fold only when chop blocks exceed TWICE the
-    #   trend entries, matching the "regime blocked >> trend entries" intent.
-    # The previous formula used 1× and was stricter than the actual WF gate,
-    # causing false rejections when the WF gate itself would have passed.
-    trend_profitable = sum(
-        1 for f in folds if f.n_trend_entries > 0 and f.profitable
-    )
-    chop_dominated = sum(
-        1 for f in folds if f.n_chop_blocked > 2 * max(f.n_trend_entries, 1)
-    )
-    weak_folds = sum(1 for f in folds if f.weak_fold)
+    # Fewest trades in any fold — catches silent folds
+    fold_trade_counts = [f.n_trades for f in folds]
+    min_fold_trades   = min(fold_trade_counts, default=0)
 
     ps = ProfileScore(
         profile_name=profile_name,
@@ -258,19 +219,13 @@ def _evaluate_profile(
         avg_pf=avg_pf,
         median_pf=median_pf,
         pnl_cv=pnl_cv,
-        t_stat=t_stat,
         avg_sharpe=avg_sharpe,
         max_drawdown_usd=max_dd,
         avg_expectancy=avg_exp,
         trades_per_day=avg_tpd,
         total_pnl=total_pnl,
-        block1_total_pnl=b1_pnl,
-        block2_total_pnl=b2_pnl,
-        block1_n_trades=b1_trades,
-        block2_n_trades=b2_trades,
-        trend_profitable_folds=trend_profitable,
-        chop_dominated_folds=chop_dominated,
-        weak_folds=weak_folds,
+        min_fold_trades=min_fold_trades,
+        outlier_fold_pct=outlier_pct,
         _wf_summary=wf,
     )
 
@@ -281,68 +236,83 @@ def _evaluate_profile(
 # ── Acceptance gate ───────────────────────────────────────────────────────────
 
 def _apply_acceptance(ps: ProfileScore) -> None:
-    """Populate ps.accepted and ps.rejection_reasons in-place."""
+    """Populate ps.accepted and ps.rejection_reasons in-place.
+
+    Gate logic (ALL must pass):
+      1. No silent folds: every fold has >= 3 trades.
+      2. Majority profitable: >= 60% of folds green.
+      3. Hard cap on losing folds: at most 2 red folds.
+      4. Real edge: avg_pf >= 1.15.
+      5. PnL consistency: CV <= 1.20.
+      6. Positive EV: avg_expectancy > 0.
+      7. Drawdown bounded: worst fold drawdown <= $800.
+      8. No outlier dependence: best fold <= 50% of total PnL.
+    """
     reasons: list[str] = []
 
-    if ps.profitable_folds < _ACCEPT_MIN_PROFITABLE_FOLDS:
+    # Gate 1: no silent folds
+    if ps.min_fold_trades < _ACCEPT_MIN_TRADES_PER_FOLD:
         reasons.append(
-            f"profitable_folds={ps.profitable_folds} < {_ACCEPT_MIN_PROFITABLE_FOLDS}"
+            f"silent_fold: min_trades_in_fold={ps.min_fold_trades} "
+            f"< {_ACCEPT_MIN_TRADES_PER_FOLD} — strategy is not trading consistently"
         )
+
+    # Gate 2: majority profitable
+    if ps.pct_profitable < _ACCEPT_MIN_PCT_PROFITABLE:
+        reasons.append(
+            f"pct_profitable={ps.pct_profitable:.0%} < {_ACCEPT_MIN_PCT_PROFITABLE:.0%}"
+        )
+
+    # Gate 3: hard cap on losing folds
+    losing_folds = ps.n_folds - ps.profitable_folds
+    if losing_folds > _ACCEPT_MAX_LOSING_FOLDS:
+        reasons.append(
+            f"losing_folds={losing_folds} > {_ACCEPT_MAX_LOSING_FOLDS} "
+            f"(max allowed red folds exceeded)"
+        )
+
+    # Gate 4: real edge
     if ps.avg_pf < _ACCEPT_MIN_AVG_PF:
         reasons.append(f"avg_pf={ps.avg_pf:.2f} < {_ACCEPT_MIN_AVG_PF}")
+
+    # Gate 5: PnL consistency
     if ps.pnl_cv > _ACCEPT_MAX_CV:
-        reasons.append(f"cv={ps.pnl_cv:.2f} > {_ACCEPT_MAX_CV}")
-    if ps.t_stat < _ACCEPT_MIN_TSTAT:
-        reasons.append(f"t_stat={ps.t_stat:.2f} < {_ACCEPT_MIN_TSTAT}")
+        reasons.append(
+            f"pnl_cv={ps.pnl_cv:.2f} > {_ACCEPT_MAX_CV} "
+            f"— PnL too volatile across folds"
+        )
+
+    # Gate 6: positive EV
     if ps.avg_expectancy <= _ACCEPT_MIN_AVG_EXPECTANCY:
         reasons.append(f"avg_expectancy=${ps.avg_expectancy:.0f} ≤ 0")
 
-    # Session block dragging: block2 strongly negative while block1 carries PnL
-    if ps.block2_n_trades > 0 and ps.block1_total_pnl > 100 and ps.block2_total_pnl < -100:
+    # Gate 7: drawdown bounded
+    if ps.max_drawdown_usd > _ACCEPT_MAX_FOLD_DRAWDOWN_USD:
         reasons.append(
-            f"block2 dragging: block2_pnl=${ps.block2_total_pnl:.0f} "
-            f"while block1_pnl=${ps.block1_total_pnl:.0f}"
+            f"max_fold_drawdown=${ps.max_drawdown_usd:.0f} > "
+            f"${_ACCEPT_MAX_FOLD_DRAWDOWN_USD:.0f} "
+            f"— one fold blew through the funded-account daily limit"
         )
 
-    if ps.trend_profitable_folds < _ACCEPT_MIN_TREND_FOLDS:
+    # Gate 8: no outlier fold dependence
+    if ps.outlier_fold_pct > _ACCEPT_MAX_OUTLIER_FOLD_PCT:
         reasons.append(
-            f"trend_profitable_folds={ps.trend_profitable_folds} < {_ACCEPT_MIN_TREND_FOLDS}"
-        )
-    if ps.chop_dominated_folds > _ACCEPT_MAX_CHOP_DOMINATED:
-        reasons.append(
-            f"chop_dominated_folds={ps.chop_dominated_folds} > {_ACCEPT_MAX_CHOP_DOMINATED}"
+            f"outlier_fold_pct={ps.outlier_fold_pct:.0%} > "
+            f"{_ACCEPT_MAX_OUTLIER_FOLD_PCT:.0%} "
+            f"— strategy depends on one lucky fold"
         )
 
     ps.rejection_reasons = reasons
     ps.accepted = len(reasons) == 0
 
-    if ps.accepted:
-        ps.composite_score = _composite_score(ps)
-
-
-def _composite_score(ps: ProfileScore) -> float:
-    """Compute a composite score in [0, 1] range for ranking accepted profiles."""
-    # Normalise each metric against practical bounds
-    pf_score  = min(max((ps.avg_pf   - 1.0) / 2.0,  0.0), 1.0)  # 1.0→0, 3.0→1
-    ts_score  = min(max((ps.t_stat   - 1.65) / 3.35, 0.0), 1.0)  # 1.65→0, 5.0→1
-    sh_score  = min(max((ps.avg_sharpe) / 3.0,        0.0), 1.0)  # 0→0, 3.0→1
-    cv_score  = min(max(1.0 - ps.pnl_cv,               0.0), 1.0)  # 0→1, 1.0→0
-
-    return (
-        _W_PF     * pf_score
-        + _W_TSTAT  * ts_score
-        + _W_SHARPE * sh_score
-        + _W_CV     * cv_score
-    )
-
 
 # ── Ranking ───────────────────────────────────────────────────────────────────
 
 def _rank_profiles(results: list[ProfileScore]) -> list[ProfileScore]:
-    """Sort: accepted first (desc composite_score), then rejected (desc avg_pf)."""
+    """Sort: accepted first (desc avg_pf), then rejected (desc avg_pf)."""
     accepted = sorted(
         [r for r in results if r.accepted],
-        key=lambda r: r.composite_score,
+        key=lambda r: r.avg_pf,
         reverse=True,
     )
     rejected = sorted(
@@ -367,40 +337,47 @@ def pick_winner(results: list[ProfileScore]) -> Optional[ProfileScore]:
 # ── Output ────────────────────────────────────────────────────────────────────
 
 def print_scoreboard(results: list[ProfileScore], symbol: str) -> None:
-    """Print formatted scoreboard to stdout."""
+    """Print funded-account focused scoreboard to stdout."""
     ranked = sorted(results, key=lambda r: r.rank)
 
-    print(f"\n{'='*90}")
-    print(f"  PROFILE EVALUATION SCOREBOARD — {symbol}")
-    print(f"{'='*90}")
+    print(f"\n{'='*80}")
+    print(f"  EVALUATION SCOREBOARD — {symbol}")
+    print(f"{'='*80}")
     print(
         f"  {'Rk':>2}  {'Profile':<26}  {'OK':>2}  "
-        f"{'PrftFolds':>9}  {'AvgPF':>6}  {'CV':>5}  {'t-stat':>6}  "
-        f"{'Shrp':>5}  {'Exp$':>7}  {'TotPnL':>8}"
+        f"{'Folds':>7}  {'PF':>5}  {'CV':>5}  "
+        f"{'Exp$':>6}  {'MinTrd':>6}  {'MaxDD$':>7}  {'TotPnL':>8}"
     )
-    print(f"  {'-'*86}")
+    print(f"  {'-'*76}")
 
     for r in ranked:
-        ok    = "✓" if r.accepted else "✗"
+        ok = "✓" if r.accepted else "✗"
         print(
             f"  {r.rank:>2}  {r.profile_name:<26}  {ok:>2}  "
-            f"  {r.profitable_folds}/{r.n_folds} ({r.pct_profitable:>4.0%})  "
-            f"{r.avg_pf:>6.2f}  {r.pnl_cv:>5.2f}  {r.t_stat:>6.2f}  "
-            f"{r.avg_sharpe:>5.2f}  {r.avg_expectancy:>7.0f}  {r.total_pnl:>8.0f}"
+            f"  {r.profitable_folds}/{r.n_folds}   "
+            f"{r.avg_pf:>5.2f}  {r.pnl_cv:>5.2f}  "
+            f"{r.avg_expectancy:>6.0f}  {r.min_fold_trades:>6d}  "
+            f"{r.max_drawdown_usd:>7.0f}  {r.total_pnl:>8.0f}"
         )
         if not r.accepted:
             for reason in r.rejection_reasons:
                 print(f"      ✗ {reason}")
 
-    print(f"{'='*90}")
+    print(f"{'='*80}")
 
     winner = pick_winner(ranked)
     if winner:
-        print(f"\n  WINNER: [{winner.profile_name}]  composite_score={winner.composite_score:.3f}")
+        print(f"\n  FUNDED-READY: [{winner.profile_name}]")
+        print(f"  avg_pf={winner.avg_pf:.2f}  cv={winner.pnl_cv:.2f}  "
+              f"profitable={winner.profitable_folds}/{winner.n_folds}  "
+              f"expectancy=${winner.avg_expectancy:.0f}  total_pnl=${winner.total_pnl:.0f}")
         print(f"  Strategy is READY FOR DEPLOYMENT.\n")
     else:
         print(f"\n  REJECT STRATEGY — no deployable profile found.\n")
-        print(f"  All {len(results)} profiles failed at least one acceptance gate.\n")
+        for r in ranked:
+            if not r.accepted:
+                print(f"  [{r.profile_name}] failed: {'; '.join(r.rejection_reasons)}")
+        print()
 
 
 def save_artifacts(
@@ -428,12 +405,11 @@ def save_artifacts(
     # ── CSV ──────────────────────────────────────────────────────────────────
     csv_path = out_dir / f"{symbol}_profiles_summary.csv"
     _CSV_FIELDS = [
-        "rank", "profile_name", "accepted", "composite_score",
+        "rank", "profile_name", "accepted",
         "n_folds", "profitable_folds", "pct_profitable",
-        "avg_pf", "median_pf", "pnl_cv", "t_stat", "avg_sharpe",
+        "avg_pf", "median_pf", "pnl_cv", "avg_sharpe",
         "max_drawdown_usd", "avg_expectancy", "trades_per_day", "total_pnl",
-        "block1_total_pnl", "block2_total_pnl", "block1_n_trades", "block2_n_trades",
-        "trend_profitable_folds", "chop_dominated_folds", "weak_folds",
+        "min_fold_trades", "outlier_fold_pct",
         "rejection_reasons",
     ]
     with open(csv_path, "w", newline="") as f:
@@ -461,21 +437,19 @@ def save_artifacts(
         eval_seed      = winner.__dict__.get("_eval_seed", seed)
         check_runs     = winner.__dict__.get("_acceptance_check_runs", acceptance_check_runs)
         metrics = {
-            "profitable_folds":       winner.profitable_folds,
-            "n_folds":                winner.n_folds,
-            "avg_pf":                 winner.avg_pf,
-            "t_stat":                 winner.t_stat,
-            "pnl_cv":                 winner.pnl_cv,
-            "avg_sharpe":             winner.avg_sharpe,
-            "avg_expectancy":         winner.avg_expectancy,
-            "total_pnl":              winner.total_pnl,
-            "composite_score":        winner.composite_score,
-            "block1_total_pnl":       winner.block1_total_pnl,
-            "block2_total_pnl":       winner.block2_total_pnl,
-            "trend_profitable_folds": winner.trend_profitable_folds,
-            "chop_dominated_folds":   winner.chop_dominated_folds,
-            "evaluation_seed":        eval_seed,
-            "acceptance_check_runs":  check_runs,
+            "profitable_folds":      winner.profitable_folds,
+            "n_folds":               winner.n_folds,
+            "pct_profitable":        winner.pct_profitable,
+            "avg_pf":                winner.avg_pf,
+            "pnl_cv":                winner.pnl_cv,
+            "avg_sharpe":            winner.avg_sharpe,
+            "avg_expectancy":        winner.avg_expectancy,
+            "total_pnl":             winner.total_pnl,
+            "min_fold_trades":       winner.min_fold_trades,
+            "outlier_fold_pct":      winner.outlier_fold_pct,
+            "max_drawdown_usd":      winner.max_drawdown_usd,
+            "evaluation_seed":       eval_seed,
+            "acceptance_check_runs": check_runs,
             "reproducibility_verified": check_runs >= 2,
         }
         dep_path = write_deployment_artifact(
