@@ -158,20 +158,23 @@ profiles:
 
   early_session_only:
     description: >
-      Trades only in Block 1 (12:30–16:00 UTC), the US open / European close
-      overlap. Higher volatility, stronger directional moves typical.
-    threshold_candidates: [0.65, 0.70, 0.75]
+      Trades only in the US equity open window (13:30–16:00 UTC).
+      Cooldowns and holding floor reduced to allow the pipeline to
+      fill more trades per fold. Threshold search widened to 0.60
+      so lower-confidence but still-filtered signals are considered
+      during Optuna sweep; the regime + trend gates still guard quality.
+    threshold_candidates: [0.60, 0.65, 0.70, 0.75]
     session_blocks:
-      - [12.5, 16.0]   # Block 1 only
+      - [13.5, 16.0]   # 13:30–16:00 UTC (US equity open)
     atr_min_ticks: 5
     atr_max_ticks: 200
     trend_filter_enabled: true
     trend_filter_ema_period: 20
     trend_slope_min_atr_frac: 0.12
-    cooldown_bars_after_exit: 5
-    cooldown_bars_after_loss: 8
+    cooldown_bars_after_exit: 1
+    cooldown_bars_after_loss: 2
     max_trades_per_day: 6
-    min_holding_bars: 3
+    min_holding_bars: 1
 
   late_session_only:
     description: >
