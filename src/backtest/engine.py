@@ -154,6 +154,7 @@ def run_backtest(
     commission_per_side_usd: float | None = None,
     cfg_overrides: dict | None = None,
     save_report: bool = True,
+    use_rules_signal: bool = False,
 ) -> dict[str, Any]:
     """
     Load model + features for `symbol`, run hardened backtest, persist report.
@@ -161,10 +162,14 @@ def run_backtest(
 
     Parameters
     ----------
-    cfg_overrides : Dict of execution-layer overrides applied after _build_run_cfg.
-                    Use this to inject profile-specific params without modifying
-                    universe.yaml.
-    save_report   : If False, skip writing the JSON report to disk.
+    cfg_overrides     : Dict of execution-layer overrides applied after _build_run_cfg.
+                        Use this to inject profile-specific params without modifying
+                        universe.yaml.
+    save_report       : If False, skip writing the JSON report to disk.
+    use_rules_signal  : If True, use EMA momentum rules as the PRIMARY signal.
+                        XGBoost is then used only as a confidence VETO — it can
+                        block entries but cannot generate them.
+                        If False (default), the existing ML-primary path is used.
     """
     try:
         import joblib
@@ -306,11 +311,53 @@ def run_backtest(
         common_idx = features.index
         log.warning("No common index between features and prices; using features index only")
 
-    sig_series    = pd.Series(signal, index=features.index).reindex(common_idx)
+    ml_sig_series = pd.Series(signal, index=features.index).reindex(common_idx)
     conf_series   = pd.Series(confidence, index=features.index).reindex(common_idx)
     open_prices   = prices["open"].reindex(common_idx) if "open" in prices.columns \
                     else prices["close"].reindex(common_idx)
     close_prices  = prices["close"].reindex(common_idx)
+
+    # ── Dual-confirmation signal path (rules-first, ML-veto) ─────────────────
+    # When use_rules_signal=True:
+    #   1. Compute EMA momentum rules signal (PRIMARY).
+    #   2. Pass it only if ML confidence >= threshold AND ML direction agrees.
+    #   3. ML cannot generate entries — only block them.
+    if use_rules_signal:
+        from src.strategy.rules_signal import generate_rules_signal
+        _prod_cfg = cfg_overrides or {}
+        _ema_p    = int(_prod_cfg.get("signal", {}).get("ema_period", 20)
+                        if isinstance(_prod_cfg.get("signal"), dict)
+                        else cfg.get("signal_ema_period", 20))
+        _slb      = int(_prod_cfg.get("signal", {}).get("slope_lookback_bars", 5)
+                        if isinstance(_prod_cfg.get("signal"), dict)
+                        else cfg.get("signal_slope_lookback_bars", 5))
+        _msfrac   = float(_prod_cfg.get("signal", {}).get("min_slope_atr_frac", 0.12)
+                          if isinstance(_prod_cfg.get("signal"), dict)
+                          else cfg.get("signal_min_slope_atr_frac", 0.12))
+        _ml_min   = float(cfg.get("min_long_confidence", 0.65))
+        _atr_pts  = (features["atr_14"].reindex(common_idx) * close_prices).fillna(0)
+        rules_sig = generate_rules_signal(
+            close              = close_prices,
+            atr_pts            = _atr_pts,
+            ema_period         = _ema_p,
+            slope_lookback     = _slb,
+            min_slope_atr_frac = _msfrac,
+        )
+        # ML veto: require conf >= threshold AND direction agreement
+        ml_veto_pass = (
+            (conf_series >= _ml_min)
+            & ((rules_sig == 0) | (ml_sig_series == rules_sig))
+        )
+        sig_series = rules_sig.where(ml_veto_pass, other=pd.Series(0, index=common_idx))
+        sig_series = sig_series.astype(np.int8)
+        _n_rules   = int((rules_sig != 0).sum())
+        _n_vetoed  = int((rules_sig != 0) & ~ml_veto_pass).sum()
+        log.info(
+            "[%s] Rules-first mode: %d rules signals → %d vetoed by ML → %d passed",
+            symbol, _n_rules, _n_vetoed, int((sig_series != 0).sum()),
+        )
+    else:
+        sig_series = ml_sig_series
 
     # Pre-filter confidence coverage diagnostic: how many bars would trade
     # before session/ATR/trend filters are applied.

@@ -26,6 +26,8 @@ import yaml
 
 from src.features.builder import build_features, MIN_ROWS
 from src.backtest.engine import _in_session_blocks
+from src.strategy.rules_signal import generate_rules_signal
+from src.risk.funded_guard import FundedGuard, GovState
 
 log = logging.getLogger(__name__)
 
@@ -159,19 +161,23 @@ def run_paper(
     csv_path: Path,
     bar_delay: float = 0.0,
     cfg_overrides: dict | None = None,
+    use_rules_signal: bool = False,
 ) -> None:
     """
     Stream `csv_path` bar-by-bar and simulate paper trading with 1-bar fill delay.
 
     Parameters
     ----------
-    symbol        : Symbol name (used to load artifacts + contract specs).
-    csv_path      : Raw OHLCV CSV from `fetch` (must have open column).
-    bar_delay     : Optional sleep between bars in seconds (0 = max speed).
-    cfg_overrides : Optional exec-layer config overrides applied on top of
-                    universe.yaml.  Pass ``get_exec_cfg_overrides(symbol)``
-                    from ``src.deployment`` to run with the exact accepted
-                    production profile config.
+    symbol           : Symbol name (used to load artifacts + contract specs).
+    csv_path         : Raw OHLCV CSV from `fetch` (must have open column).
+    bar_delay        : Optional sleep between bars in seconds (0 = max speed).
+    cfg_overrides    : Optional exec-layer config overrides applied on top of
+                       universe.yaml.  Pass ``get_exec_cfg_overrides(symbol)``
+                       from ``src.deployment`` to run with the exact accepted
+                       production profile config.
+    use_rules_signal : If True, use EMA momentum rules as PRIMARY signal with
+                       ML as a confidence veto and FundedGuard for governance.
+                       If False (default), use the standard ML-primary path.
     """
     model, scaler, feature_names, inv_label_map, schema_threshold = _load_artifacts(symbol)
     cfg, specs = _load_cfg(symbol, cfg_overrides=cfg_overrides)
@@ -302,6 +308,61 @@ def run_paper(
         _raw_ema_s = raw_close_aligned.ewm(span=trend_ema_period, adjust=False).mean()
         ema_all = (_raw_ema_s - _raw_ema_s.shift(5)).values
         log.info("Trend filter enabled: EMA(%d) slope", trend_ema_period)
+
+    # ── Rules-first signal path (pre-compute) ────────────────────────────────
+    _rules_sig_all: Optional[np.ndarray] = None
+    _rules_ema_all: Optional[np.ndarray] = None   # EMA values (not slope) for bar signal
+    _rules_slope_all: Optional[np.ndarray] = None  # slope values for bar signal
+    if use_rules_signal:
+        _prod_sig_cfg = {}
+        if cfg_overrides and isinstance(cfg_overrides.get("signal"), dict):
+            _prod_sig_cfg = cfg_overrides["signal"]
+        _rs_ema_p  = int(_prod_sig_cfg.get("ema_period", cfg.get("signal_ema_period", 20)))
+        _rs_slb    = int(_prod_sig_cfg.get("slope_lookback_bars", cfg.get("signal_slope_lookback_bars", 5)))
+        _rs_msfrac = float(_prod_sig_cfg.get("min_slope_atr_frac", cfg.get("signal_min_slope_atr_frac", 0.12)))
+        _atr_pts_s = pd.Series(atr_ticks_all, index=all_features.index) * tick_size
+        _rules_ema_series   = raw_close_aligned.ewm(span=_rs_ema_p, adjust=False).mean()
+        _rules_slope_series = _rules_ema_series - _rules_ema_series.shift(_rs_slb)
+        _rules_ema_all   = _rules_ema_series.values
+        _rules_slope_all = _rules_slope_series.values
+        _rules_sig_series = generate_rules_signal(
+            close              = raw_close_aligned,
+            atr_pts            = _atr_pts_s,
+            ema_period         = _rs_ema_p,
+            slope_lookback     = _rs_slb,
+            min_slope_atr_frac = _rs_msfrac,
+        )
+        _rules_sig_all = _rules_sig_series.values.astype(np.int8)
+        _ml_min_conf   = float(cfg.get("min_long_confidence", 0.65))
+        _n_rules_sigs  = int((_rules_sig_all != 0).sum())
+        log.info(
+            "[%s] Rules-first mode: EMA(%d) slope_lb=%d min_slope_frac=%.2f  "
+            "%d rules signals in dataset",
+            symbol, _rs_ema_p, _rs_slb, _rs_msfrac, _n_rules_sigs,
+        )
+
+    # ── FundedGuard setup ─────────────────────────────────────────────────────
+    _guard: Optional[FundedGuard] = None
+    if use_rules_signal:
+        _risk_cfg = {}
+        if cfg_overrides and isinstance(cfg_overrides.get("risk"), dict):
+            _risk_cfg = cfg_overrides["risk"]
+        _guard = FundedGuard(
+            daily_loss_hard_usd    = float(_risk_cfg.get("daily_loss_hard_usd",    cfg.get("max_daily_loss_usd",       500.0))),
+            daily_loss_soft_usd    = float(_risk_cfg.get("daily_loss_soft_usd",    cfg.get("daily_loss_soft_usd",      300.0))),
+            trailing_drawdown_usd  = float(_risk_cfg.get("trailing_drawdown_usd",  cfg.get("trailing_drawdown_usd",   2000.0))),
+            max_drawdown_usd       = float(_risk_cfg.get("max_drawdown_usd",       cfg.get("max_total_drawdown_usd",  3000.0))),
+            max_consecutive_losses = int  (_risk_cfg.get("max_consecutive_losses", cfg.get("max_consecutive_losses",      3))),
+            starting_equity        = float(_risk_cfg.get("starting_equity_usd",    cfg.get("starting_equity",       50000.0))),
+        )
+        log.info(
+            "[%s] FundedGuard active: hard=$%.0f soft=$%.0f trail_dd=$%.0f "
+            "max_dd=$%.0f max_consec=%d",
+            symbol,
+            _guard.daily_loss_hard_usd, _guard.daily_loss_soft_usd,
+            _guard.trailing_drawdown_usd, _guard.max_drawdown_usd,
+            _guard.max_consecutive_losses,
+        )
 
     # ATR volatility regime: ATR / rolling_mean(ATR, 100) — skip if < 0.8
     _atr_series = pd.Series(atr_ticks_all, index=all_features.index)
@@ -466,6 +527,10 @@ def run_paper(
                     ts, drawdown,
                 )
 
+        # FundedGuard: delegate to state machine when active
+        if _guard is not None:
+            _guard.on_exit(net_pnl)
+
     try:
         raw_list = list(raw_df.iterrows())
         n_raw    = len(raw_list)
@@ -552,13 +617,31 @@ def run_paper(
                 pending_target = None
 
             # ── STEP 2: Get signal + apply 10-filter pipeline ─────────────────
+            # Tick the FundedGuard day boundary before making decisions
+            if _guard is not None:
+                _guard.on_bar(ts)
+
             if ts in feat_ts_set:
-                raw_sig    = int(signal_all[feat_cursor])
+                _ml_sig    = int(signal_all[feat_cursor])
                 confidence = float(conf_all[feat_cursor])
                 atr_ticks  = float(atr_ticks_all[feat_cursor])
                 ema_val    = float(ema_all[feat_cursor]) if ema_all is not None else float("nan")
                 atr_regime = float(_atr_regime_all[feat_cursor])
                 regime_val = int(_regime_all[feat_cursor])
+
+                # Rules-first: compute dual-confirmation signal
+                if use_rules_signal and _rules_sig_all is not None:
+                    _r_sig = int(_rules_sig_all[feat_cursor])
+                    # ML veto: pass rules signal only if ML confidence >= threshold
+                    # AND ML direction agrees (or is flat)
+                    _ml_veto_ok = (
+                        confidence >= _ml_min_conf
+                        and (_r_sig == 0 or _ml_sig == _r_sig)
+                    )
+                    raw_sig = _r_sig if _ml_veto_ok else 0
+                else:
+                    raw_sig = _ml_sig
+
                 feat_cursor += 1
             else:
                 raw_sig    = 0
@@ -687,7 +770,7 @@ def run_paper(
                 if not trend_ok:
                     sig = 0
 
-            # Filter 6: Risk gate
+            # Filter 6: Risk gate (legacy + FundedGuard)
             risk_blocked = False
             if kill_switch_active or daily_halt:
                 if position == 0:
@@ -696,6 +779,18 @@ def run_paper(
                 elif sig * position < 0:  # reversal
                     risk_blocked = True
                     sig = 0
+            # FundedGuard gate (supplements legacy risk when active)
+            if not risk_blocked and _guard is not None and sig != 0 and sig != position:
+                _allowed, _reason = _guard.validate_entry(
+                    bar_ts             = ts,
+                    atr_ticks          = atr_ticks,
+                    atr_min_ticks      = float(cfg.get("atr_min_ticks", 5.0)),
+                    max_trades_per_day = max_tpd,
+                )
+                if not _allowed:
+                    risk_blocked = True
+                    sig = 0
+                    log.debug("[%s] FundedGuard blocked entry: %s", ts, _reason)
             _check("risk_gate", not risk_blocked)
 
             # Filter 7: Loss cooldown
@@ -768,6 +863,8 @@ def run_paper(
                             flt["n_in_block1"] += 1
                         elif _block_idx == 2:
                             flt["n_in_block2"] += 1
+                        if _guard is not None:
+                            _guard.on_entry()
 
             # ── Per-bar diagnostics (debug level) ─────────────────────────────
             if log.isEnabledFor(logging.DEBUG):
@@ -917,6 +1014,19 @@ def run_paper(
             "The delay=1 bar fill or position logic may be losing orders.",
             symbol, _nex, _nq, 100*_nex/max(_nq, 1),
         )
+
+    # ── FundedGuard session summary ───────────────────────────────────────────
+    if _guard is not None:
+        _gs = _guard.session_summary()
+        log.info(
+            "[%s] FundedGuard session: state=%s  daily_pnl=%.2f  "
+            "drawdown=%.2f  consec_losses=%d  trades_today=%d",
+            symbol,
+            _gs["state"], _gs["daily_pnl"], _gs["drawdown"],
+            _gs["consecutive_losses"], _gs["trades_today"],
+        )
+        if _gs["state_history"]:
+            log.info("[%s] FundedGuard state transitions: %s", symbol, _gs["state_history"])
 
     _print_summary(symbol, trades, equity, gross_pnl_total, total_cost_total, bar_count)
 
