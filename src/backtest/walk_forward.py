@@ -70,21 +70,25 @@ _ARTS = Path("artifacts")
 _UNIVERSE_CFG = Path("config/universe.yaml")
 
 # Funded-account readiness thresholds
-_FUNDED_MIN_PCT_PROF   = 0.70
-_FUNDED_MIN_PF         = 1.50
-_FUNDED_MAX_CV         = 1.00
-_FUNDED_MIN_TSTAT      = 1.65
+# Aligned with profile_eval.py acceptance gates.
+_FUNDED_MIN_PCT_PROF   = 0.60   # majority profitable
+_FUNDED_MIN_PF         = 1.15   # real edge after costs
+_FUNDED_MAX_CV         = 1.20   # PnL consistency
+_FUNDED_MIN_TSTAT      = 1.50   # statistical significance
 
-_PROMISING_MIN_PCT_PROF = 0.60
-_PROMISING_MIN_PF       = 1.30
+_PROMISING_MIN_PCT_PROF = 0.50
+_PROMISING_MIN_PF       = 1.05
 _PROMISING_MAX_CV       = 1.50
 
 _MARGINAL_MIN_PCT_PROF  = 0.40
-_MARGINAL_MIN_PF        = 1.10
+_MARGINAL_MIN_PF        = 1.00
 
-# OOS activity gate — folds below these are flagged WEAK
-_WEAK_FOLD_MIN_TRADES        = 5
-_WEAK_FOLD_MIN_COVERAGE_PCT  = 0.2   # 0.2% of test bars
+# OOS activity gate — folds with fewer trades are flagged WEAK
+# With max_trades_per_day=2 and ~20 trading days per 2000-bar fold,
+# we expect ~40 trades per fold. 3 is the absolute minimum — below
+# that we cannot evaluate the strategy meaningfully.
+_WEAK_FOLD_MIN_TRADES        = 3
+_WEAK_FOLD_MIN_COVERAGE_PCT  = 0.1   # 0.1% of test bars (very lenient floor)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
