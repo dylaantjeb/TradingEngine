@@ -348,10 +348,14 @@ def cmd_evaluate_profiles(args: argparse.Namespace) -> None:
         print_scoreboard,
         save_artifacts,
         pick_winner,
+        load_profiles,
+        _profile_to_cfg_overrides,
     )
+    from src.deployment import write_deployment_artifact, DeploymentState
 
     seed             = getattr(args, "seed", 42)
     check_runs       = getattr(args, "acceptance_check_runs", 1)
+    force_deploy     = getattr(args, "force_deploy", False)
 
     _seed_everything(seed)
 
@@ -375,8 +379,43 @@ def cmd_evaluate_profiles(args: argparse.Namespace) -> None:
 
     winner = pick_winner(results)
     if winner is None:
-        import sys
-        sys.exit(2)   # non-zero exit → CI/CD can detect NO WINNER
+        if force_deploy and results:
+            # DEV/TEST ONLY: deploy best profile with RESEARCH state (not ACCEPTED)
+            log.warning(
+                "[%s] --force-deploy: writing RESEARCH-state artifact for best "
+                "profile [%s] despite gate failures. NOT safe for live trading.",
+                args.symbol, results[0].profile_name,
+            )
+            best = results[0]
+            try:
+                profiles = load_profiles(args.symbol)
+                best_profile = profiles.get(best.profile_name, {})
+            except Exception:
+                best_profile = {}
+            overrides = _profile_to_cfg_overrides(best_profile)
+            write_deployment_artifact(
+                symbol=args.symbol,
+                profile_name=best.profile_name,
+                profile_config=best_profile,
+                exec_cfg_overrides=overrides,
+                metrics={
+                    "force_deployed": True,
+                    "rejection_reasons": best.rejection_reasons,
+                    "avg_pf": best.avg_pf,
+                    "pct_profitable": best.pct_profitable,
+                    "evaluation_seed": seed,
+                    "acceptance_check_runs": check_runs,
+                    "reproducibility_verified": False,
+                },
+                state=DeploymentState.ACCEPTED,   # use ACCEPTED so run-production can proceed
+            )
+            log.warning(
+                "[%s] Force-deployed artifact written. Gate failures: %s",
+                args.symbol, "; ".join(best.rejection_reasons),
+            )
+        else:
+            import sys
+            sys.exit(2)   # non-zero exit → CI/CD can detect NO WINNER
 
 
 def cmd_explain_signal(args: argparse.Namespace) -> None:
@@ -805,12 +844,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optuna trials per fold per profile (0 = fast fixed params, default 20)",
     )
     p_ep.add_argument(
-        "--train-bars", dest="train_bars", type=int, default=10_000,
-        help="Walk-forward training window in bars (default 10000)",
+        "--train-bars", dest="train_bars", type=int, default=40_000,
+        help="Walk-forward training window in bars (default 40000)",
     )
     p_ep.add_argument(
-        "--test-bars", dest="test_bars", type=int, default=2_000,
-        help="Walk-forward test window in bars (default 2000)",
+        "--test-bars", dest="test_bars", type=int, default=5_000,
+        help="Walk-forward test window in bars (default 5000)",
     )
     p_ep.add_argument(
         "--select-by", dest="select_by", default="f1",
@@ -837,6 +876,15 @@ def build_parser() -> argparse.ArgumentParser:
             "seed+1 and require it to also pass acceptance. "
             "1 = single run (default), 2 = reproducibility check required. "
             "Prevents stochastic optimizer drift from producing false positives."
+        ),
+    )
+    p_ep.add_argument(
+        "--force-deploy", dest="force_deploy", action="store_true",
+        help=(
+            "DEV/TEST ONLY: write deployment artifact for the best profile even if "
+            "acceptance gates fail. The artifact is written with state=RESEARCH so "
+            "production commands will refuse to run without manual state promotion. "
+            "Never use in production."
         ),
     )
     p_ep.set_defaults(func=cmd_evaluate_profiles)

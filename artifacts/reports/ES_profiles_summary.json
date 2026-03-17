@@ -1,0 +1,29 @@
+[
+  {
+    "profile_name": "es_pullback_scalper",
+    "description": "Trend pullback scalper. M1 execution with M5 trend context via EMA100(M1). Session restricted to US equity open (13:30-16:00 UTC) \u2014 the only window where ES has reliable directional bias, volume, and follow-through. Max 2 trades per day. Hard stop after 2 daily losses. ATR floor 8 ticks ensures meaningful volatility at entry. Cooldown 20 bars after loss = 20-minute pause, letting regime reset. ML is a confidence veto only (threshold 0.60-0.65); it cannot generate entries.",
+    "n_folds": 6,
+    "profitable_folds": 2,
+    "pct_profitable": 0.3333333333333333,
+    "avg_pf": 0.9938166666666666,
+    "median_pf": 0.4493,
+    "pnl_cv": 5.345380149956682,
+    "avg_sharpe": -1.46896,
+    "max_drawdown_usd": 0.0,
+    "avg_expectancy": -54.56833333333333,
+    "trades_per_day": 0.17833333333333334,
+    "total_pnl": -1196.0,
+    "min_fold_trades": 0,
+    "outlier_fold_pct": 0.0,
+    "accepted": false,
+    "rejection_reasons": [
+      "silent_fold: min_trades_in_fold=0 < 3 \u2014 strategy is not trading consistently",
+      "pct_profitable=33% < 60%",
+      "losing_folds=4 > 2 (max allowed red folds exceeded)",
+      "avg_pf=0.99 < 1.15",
+      "pnl_cv=5.35 > 2.0 \u2014 PnL too volatile across folds",
+      "avg_expectancy=$-55 \u2264 0"
+    ],
+    "rank": 1
+  }
+]

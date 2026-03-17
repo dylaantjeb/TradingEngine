@@ -26,12 +26,12 @@ profiles:
     threshold_candidates: [0.60, 0.65]
     session_blocks:
       - [13.5, 16.0]   # 13:30-16:00 UTC = NYSE open window
-    atr_min_ticks: 8    # require real movement (2 ES points = meaningful ATR)
-    atr_max_ticks: 100  # cap at ~25 ES points ATR — beyond this, slippage dominates
+    atr_min_ticks: 4    # require real movement (1 ES point minimum)
+    atr_max_ticks: 150  # cap at ~37 ES points ATR
     trend_filter_enabled: true
-    trend_filter_ema_period: 100   # M1 EMA100 ≈ M5 EMA20 — medium-term directional bias
-    trend_slope_min_atr_frac: 0.15 # slope must be 15% of ATR — real trend, not drift
-    cooldown_bars_after_exit: 5    # 5-min pause after any exit
-    cooldown_bars_after_loss: 20   # 20-min mandatory pause after a loss
-    max_trades_per_day: 2          # discipline: best 2 setups only
-    min_holding_bars: 3            # no 1-2 bar flips
+    trend_filter_ema_period: 20    # M1 EMA20 — fast warm-up, responsive trend bias
+    trend_slope_min_atr_frac: 0.05 # slope must be 5% of ATR — real trend, not drift
+    cooldown_bars_after_exit: 2    # 2-min pause after any exit
+    cooldown_bars_after_loss: 5    # 5-min mandatory pause after a loss
+    max_trades_per_day: 5          # up to 5 high-quality setups per day
+    min_holding_bars: 1            # allow quick exits

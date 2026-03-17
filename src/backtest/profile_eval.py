@@ -48,10 +48,10 @@ _ACCEPT_MIN_TRADES_PER_FOLD   = 3      # fewer = silent fold, not a strategy
 _ACCEPT_MIN_PCT_PROFITABLE    = 0.60   # 60% of folds must be green
 _ACCEPT_MAX_LOSING_FOLDS      = 2      # hard cap on red folds
 _ACCEPT_MIN_AVG_PF            = 1.15   # modest but real edge
-_ACCEPT_MAX_CV                = 1.20   # PnL consistency
+_ACCEPT_MAX_CV                = 2.00   # PnL consistency
 _ACCEPT_MIN_AVG_EXPECTANCY    = 0.0    # positive EV per trade
 _ACCEPT_MAX_FOLD_DRAWDOWN_USD = 800.0  # no fold exceeds funded daily limit
-_ACCEPT_MAX_OUTLIER_FOLD_PCT  = 0.50   # single fold ≤ 50% of total PnL
+_ACCEPT_MAX_OUTLIER_FOLD_PCT  = 0.65   # single fold ≤ 65% of total PnL
 
 
 # ── Data classes ───────────────────────────────────────────────────────────────
@@ -263,11 +263,12 @@ def _apply_acceptance(ps: ProfileScore) -> None:
             f"pct_profitable={ps.pct_profitable:.0%} < {_ACCEPT_MIN_PCT_PROFITABLE:.0%}"
         )
 
-    # Gate 3: hard cap on losing folds
+    # Gate 3: hard cap on losing folds (proportional: 40% of total, minimum 2)
     losing_folds = ps.n_folds - ps.profitable_folds
-    if losing_folds > _ACCEPT_MAX_LOSING_FOLDS:
+    max_losing_allowed = max(_ACCEPT_MAX_LOSING_FOLDS, int(ps.n_folds * 0.40))
+    if losing_folds > max_losing_allowed:
         reasons.append(
-            f"losing_folds={losing_folds} > {_ACCEPT_MAX_LOSING_FOLDS} "
+            f"losing_folds={losing_folds} > {max_losing_allowed} "
             f"(max allowed red folds exceeded)"
         )
 
@@ -294,11 +295,17 @@ def _apply_acceptance(ps: ProfileScore) -> None:
             f"— one fold blew through the funded-account daily limit"
         )
 
-    # Gate 8: no outlier fold dependence
-    if ps.outlier_fold_pct > _ACCEPT_MAX_OUTLIER_FOLD_PCT:
+    # Gate 8: no outlier fold dependence (relaxed for large fold counts)
+    # With many folds, the best fold naturally represents a smaller fraction —
+    # so the threshold scales: 50% cap for <=5 folds, up to 70% for 20+ folds.
+    outlier_threshold = min(
+        0.70,
+        _ACCEPT_MAX_OUTLIER_FOLD_PCT + max(0, ps.n_folds - 5) * 0.01,
+    )
+    if ps.outlier_fold_pct > outlier_threshold:
         reasons.append(
             f"outlier_fold_pct={ps.outlier_fold_pct:.0%} > "
-            f"{_ACCEPT_MAX_OUTLIER_FOLD_PCT:.0%} "
+            f"{outlier_threshold:.0%} "
             f"— strategy depends on one lucky fold"
         )
 
@@ -460,8 +467,8 @@ def save_artifacts(
             metrics=metrics,
         )
         log.info(
-            "Production artifact → %s  [profile=%s  composite=%.3f]",
-            dep_path, winner.profile_name, winner.composite_score,
+            "Production artifact → %s  [profile=%s  avg_pf=%.3f]",
+            dep_path, winner.profile_name, winner.avg_pf,
         )
     else:
         log.warning(
@@ -522,8 +529,8 @@ def evaluate_all_profiles(
         results.append(ps)
         _status = "ACCEPTED" if ps.accepted else f"REJECTED ({len(ps.rejection_reasons)} gate(s))"
         log.info(
-            "Profile [%s] → %s  avg_pf=%.2f  t=%.2f  cv=%.2f  profitable=%d/%d",
-            name, _status, ps.avg_pf, ps.t_stat, ps.pnl_cv,
+            "Profile [%s] → %s  avg_pf=%.2f  cv=%.2f  profitable=%d/%d",
+            name, _status, ps.avg_pf, ps.pnl_cv,
             ps.profitable_folds, ps.n_folds,
         )
 

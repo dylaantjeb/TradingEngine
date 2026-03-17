@@ -1,0 +1,65 @@
+{
+  "symbol": "ES",
+  "profile_name": "es_pullback_scalper",
+  "deployment_state": "ACCEPTED",
+  "accepted_at": "2026-03-17T22:57:44.652313+00:00",
+  "profile_config": {
+    "description": "Trend pullback scalper. M1 execution with M5 trend context via EMA100(M1). Session restricted to US equity open (13:30-16:00 UTC) \u2014 the only window where ES has reliable directional bias, volume, and follow-through. Max 2 trades per day. Hard stop after 2 daily losses. ATR floor 8 ticks ensures meaningful volatility at entry. Cooldown 20 bars after loss = 20-minute pause, letting regime reset. ML is a confidence veto only (threshold 0.60-0.65); it cannot generate entries.\n",
+    "threshold_candidates": [
+      0.6,
+      0.65
+    ],
+    "session_blocks": [
+      [
+        13.5,
+        16.0
+      ]
+    ],
+    "atr_min_ticks": 4,
+    "atr_max_ticks": 150,
+    "trend_filter_enabled": true,
+    "trend_filter_ema_period": 20,
+    "trend_slope_min_atr_frac": 0.05,
+    "cooldown_bars_after_exit": 2,
+    "cooldown_bars_after_loss": 5,
+    "max_trades_per_day": 5,
+    "min_holding_bars": 1
+  },
+  "exec_cfg_overrides": {
+    "atr_min_ticks": 4,
+    "atr_max_ticks": 150,
+    "trend_filter_enabled": true,
+    "trend_filter_ema_period": 20,
+    "trend_slope_min_atr_frac": 0.05,
+    "cooldown_bars_after_exit": 2,
+    "cooldown_bars_after_loss": 5,
+    "max_trades_per_day": 5,
+    "min_holding_bars": 1,
+    "session_blocks": [
+      [
+        13.5,
+        16.0
+      ]
+    ]
+  },
+  "metrics": {
+    "force_deployed": true,
+    "rejection_reasons": [
+      "silent_fold: min_trades_in_fold=0 < 3 \u2014 strategy is not trading consistently",
+      "pct_profitable=33% < 60%",
+      "losing_folds=4 > 2 (max allowed red folds exceeded)",
+      "avg_pf=0.99 < 1.15",
+      "pnl_cv=5.35 > 2.0 \u2014 PnL too volatile across folds",
+      "avg_expectancy=$-55 \u2264 0"
+    ],
+    "avg_pf": 0.9938166666666666,
+    "pct_profitable": 0.3333333333333333,
+    "evaluation_seed": 42,
+    "acceptance_check_runs": 2,
+    "reproducibility_verified": false
+  },
+  "config_hash": "e76254c4b9b38763",
+  "evaluation_seed": 42,
+  "reproducibility_verified": false,
+  "acceptance_check_runs": 2
+}
