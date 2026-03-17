@@ -14,12 +14,18 @@
     "vol_z",
     "vol_ratio",
     "vwap_dev",
+    "vwap_distance",
+    "momentum_3",
+    "momentum_6",
+    "range_ratio",
+    "ema20_slope",
+    "volume_delta",
     "hour_sin",
     "hour_cos",
     "dow_sin",
     "dow_cos"
   ],
-  "n_features": 17,
+  "n_features": 23,
   "label_map": {
     "-1": 0,
     "0": 1,
@@ -30,7 +36,29 @@
     "1": 0,
     "2": 1
   },
-  "best_val_f1": 0.5118260143486055,
-  "n_trials": 5,
-  "train_rows": 3942
+  "selected_conf_threshold": 0.7,
+  "threshold_candidates": [
+    0.65,
+    0.7,
+    0.75
+  ],
+  "best_val_f1": 0.356939,
+  "best_val_trading_quality": 0.74603,
+  "val_trade_coverage_pct": 3.1298,
+  "val_confident_trades": 469,
+  "val_dir_accuracy": 0.66951,
+  "val_profit_factor": 2.025806,
+  "session_coverage_factor": 1.0,
+  "val_session_conf_trades": 469,
+  "session_start_utc_hour": 13.5,
+  "session_end_utc_hour": 16.0,
+  "hard_constraints_passed": true,
+  "all_gates_failed": false,
+  "selected_via": "f1",
+  "select_by": "f1",
+  "n_trials": 20,
+  "train_rows": 59936,
+  "val_regime_trend_bars": 8676,
+  "val_regime_chop_bars": 6309,
+  "val_regime_trend_pct": 57.9
 }
